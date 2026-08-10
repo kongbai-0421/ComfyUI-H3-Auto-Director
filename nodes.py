@@ -352,6 +352,9 @@ class H3AutoDirectorPlan:
                 raise ValueError("H3 segment duration must be between 4 and 15 seconds")
             row["audio_restart"] = bool(row.get("audio_restart", False))
             row["continue_video"] = bool(row.get("continue_video", bool(continuation_mode) and len(normalized) > 0))
+            # Reference images condition the full clip; H3 has no per-image
+            # duration input, so discard this legacy UI field on every save.
+            row.pop("image_duration", None)
             row["references"] = list(row.get("references", []))
             _validate_reference_limits(row["references"], f"第 {len(normalized) + 1} 段参考素材")
             normalized.append(row)

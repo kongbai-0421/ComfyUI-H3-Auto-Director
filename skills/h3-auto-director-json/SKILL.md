@@ -22,7 +22,6 @@ field:
   "duration": 4,
   "audio_restart": false,
   "continue_video": false,
-  "image_duration": 1,
   "references": []
 }
 ```
@@ -32,7 +31,6 @@ Use these defaults:
 - `duration`: `5` unless the user gives a duration. Keep every value between `4` and `15` seconds.
 - `audio_restart`: `false`; set `true` only at a user-requested or clearly justified audio reset point.
 - `continue_video`: `false` for the first segment; `true` for later segments unless the user requests independent scenes or disables continuation.
-- `image_duration`: `1` unless the user gives another positive value.
 - `references`: use `[]` unless the user supplies a local file path for the asset. Never invent filenames, paths, URLs, reference images, videos, or audio.
 
 The plugin's reference arrays and ComfyUI sockets are zero-based, but MiniMax H3

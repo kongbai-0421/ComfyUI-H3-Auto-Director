@@ -56,7 +56,6 @@ function normalizeSegment(value) {
     duration: Number(seg.duration) || 5,
     audio_restart: !!seg.audio_restart,
     continue_video: seg.continue_video !== false,
-    image_duration: Number(seg.image_duration) > 0 ? Number(seg.image_duration) : 1,
     references: Array.isArray(seg.references) ? seg.references.map((ref) => {
       if (typeof ref === "string") return { type: "image", name: ref, path: ref, duration: 1 };
       return { ...ref, duration: Number(ref?.duration) > 0 ? Number(ref.duration) : 1 };
@@ -362,7 +361,7 @@ function openEditor(node) {
   segmentCountPanel.appendChild(makeButton("应用片段数量", () => {
     const target = Math.max(1, Math.min(999, Math.floor(Number(segmentCountInput.value) || segments.length)));
     if (!confirmSegmentReduction(segments, target)) { segmentCountInput.value = String(segments.length); notice.textContent = "已取消减少片段。"; return; }
-    while (segments.length < target) segments.push({ prompt: "", duration: 5, audio_restart: false, continue_video: true, image_duration: 1, references: [] });
+    while (segments.length < target) segments.push({ prompt: "", duration: 5, audio_restart: false, continue_video: true, references: [] });
     if (segments.length > target) segments.length = target;
     segmentCountInput.value = String(target); directInput.value = JSON.stringify(segments, null, 2); render(); notice.textContent = `片段数量已设置为 ${target}。`;
   }));

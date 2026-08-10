@@ -6,6 +6,7 @@
 - Keep ordinary per-segment encoding behavior unchanged unless the task explicitly changes it.
 - H3 prompt JSON must leave `references` empty unless the user supplies an exact local asset file path. Never invent paths, URLs, filenames, or labels.
 - H3 prompt reference labels are 1-based (`<Picture 1>`, `<Video 1>`, `<Audio 1>`); only internal ComfyUI socket names remain 0-based (`ref_image_0`, etc.). Audio labels follow H3 presentation order.
+- Do not add an `image_duration` segment field: H3 reference images condition the entire clip and do not accept a per-image duration.
 - Python node changes require restarting the ComfyUI instance that actually loads this custom node.
 - Reference uploads support a persisted default-path switch and Python/browser picker mode. Python mode opens the native Windows dialog on the ComfyUI machine and imports into `input/h3_refs/*`; keep the browser picker as a fallback.
 - Do not modify example or user workflows unless the user explicitly requests workflow changes.
