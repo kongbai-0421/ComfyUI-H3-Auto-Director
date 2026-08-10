@@ -11,6 +11,7 @@ import copy
 from collections import OrderedDict
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -23,10 +24,14 @@ from pathlib import Path
 import folder_paths
 import nodes
 import torch
+import node_helpers
+import comfy.model_management as model_management
 
 try:
+    from comfy_extras import nodes_minimax_h3 as _minimax_h3
     from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo as _H3ReferenceToVideo
 except ImportError:
+    _minimax_h3 = None
     _H3ReferenceToVideo = None
 
 try:
@@ -592,15 +597,103 @@ class H3AutoDirectorCachedReferenceToVideo:
             ref_video_audios=ref_groups[2], ref_audios=ref_groups[3])
         return result[0], result[1]
 
+    @staticmethod
+    def _prepare_references(vae, audio_vae, width, height, length, ref_image_size, refs):
+        """Encode all Ref2VA assets before the batch text-encoder session."""
+        if _H3ReferenceToVideo is None or _minimax_h3 is None:
+            raise RuntimeError("当前 ComfyUI 未提供 MiniMaxH3ReferenceToVideo 核心节点")
+        latent, frame_count = _minimax_h3._empty_av_latent(int(width), int(height), int(length))
+        ref_groups = _resolve_reference_groups(refs)
+        ref_items = []
+        ref_blocks = []
+
+        for image in ref_groups[0].values():
+            if image is None:
+                continue
+            source_height, source_width = image.shape[1], image.shape[2]
+            if ref_image_size == "match":
+                scale = min(1.0, math.sqrt((width * height) / (source_width * source_height)))
+            else:
+                scale = min(1.0, _minimax_h3.REF_IMAGE_SHORT_EDGE / min(source_width, source_height))
+            target_width = max(_minimax_h3.CANVAS_MULTIPLE,
+                               round(source_width * scale / _minimax_h3.CANVAS_MULTIPLE) * _minimax_h3.CANVAS_MULTIPLE)
+            target_height = max(_minimax_h3.CANVAS_MULTIPLE,
+                                round(source_height * scale / _minimax_h3.CANVAS_MULTIPLE) * _minimax_h3.CANVAS_MULTIPLE)
+            resized = _minimax_h3._resize(image[:1], target_width, target_height, "disabled")
+            ref_items.append({"type": "image", "data": resized})
+            ref_blocks.append({"kind": "image", "latent_h": target_height // 16,
+                               "latent_w": target_width // 16, "latent": vae.encode(resized)})
+
+        video_audios = ref_groups[2]
+        for name, video_frames in ref_groups[1].items():
+            if video_frames is None:
+                continue
+            source_height, source_width = video_frames.shape[1], video_frames.shape[2]
+            canvas_width, canvas_height = _minimax_h3.adapt_canvas(source_width, source_height)
+            if source_width * source_height < canvas_width * canvas_height:
+                canvas_width = max(_minimax_h3.CANVAS_MULTIPLE,
+                                   round(source_width / _minimax_h3.CANVAS_MULTIPLE) * _minimax_h3.CANVAS_MULTIPLE)
+                canvas_height = max(_minimax_h3.CANVAS_MULTIPLE,
+                                    round(source_height / _minimax_h3.CANVAS_MULTIPLE) * _minimax_h3.CANVAS_MULTIPLE)
+            frames = _minimax_h3._resize(video_frames, canvas_width, canvas_height, "disabled")
+            if frames.shape[0] > frame_count:
+                frames = frames[:frame_count]
+            frame_total = frames.shape[0]
+            if frame_total < 5:
+                raise ValueError("MiniMax H3 参考视频至少需要 5 帧（24 fps 下约 0.2 秒）")
+            while frame_total % 17 != 5:
+                frame_total -= 1
+            frames = frames[:frame_total]
+            video_latent = vae.encode(frames)
+            audio_latent, audio_length = (None, 0)
+            soundtrack = video_audios.get("ref_video_audio_" + name.rsplit("_", 1)[-1])
+            if soundtrack is not None:
+                audio_latent, audio_length = _H3ReferenceToVideo._encode_ref_audio(audio_vae, soundtrack)
+                ref_items.append({"type": "audio"})
+            sample_indices = list(range(0, frames.shape[0], _minimax_h3.FPS // 2))
+            ref_items.append({"type": "video", "data": frames[sample_indices],
+                              "timestamps": [index / 2.0 for index in range(len(sample_indices))]})
+            ref_blocks.append({"kind": "video_audio" if audio_length else "video",
+                               "latent_t": video_latent.shape[2], "latent_h": canvas_height // 16,
+                               "latent_w": canvas_width // 16, "ref_audio_t": audio_length,
+                               "latent": video_latent, "audio_latent": audio_latent})
+
+        for audio in ref_groups[3].values():
+            if audio is None:
+                continue
+            audio_latent, audio_length = _H3ReferenceToVideo._encode_ref_audio(audio_vae, audio)
+            ref_items.append({"type": "audio"})
+            ref_blocks.append({"kind": "audio", "ref_audio_t": audio_length,
+                               "audio_latent": audio_latent})
+        return latent, ref_items, ref_blocks
+
+    @staticmethod
+    def _encode_prepared_prompt(clip, prompt, latent, ref_items, ref_blocks):
+        tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
+        conditioning = clip.encode_from_tokens_scheduled(tokens)
+        if ref_blocks:
+            conditioning = node_helpers.conditioning_set_values(conditioning, {"minimax_refs": ref_blocks})
+        return conditioning, latent
+
     @classmethod
     def _build_cache(cls, plan, clip, vae, audio_vae, width, height, ref_image_size, context_length):
-        cache = {}
+        prepared = {}
+        segment_count = len(plan.get("segments", []))
+        LOG.info("H3 Auto Director: 正在预编码 %d 段参考素材，随后将连续缓存全部文本向量", segment_count)
         for generation_index in range(1, len(plan.get("segments", [])) + 1):
-            seg = _segment(plan, generation_index)
             length = _cache_frame_count(plan, generation_index, context_length)
-            cache[generation_index] = cls._encode_one(
-                clip, vae, audio_vae, str(seg.get("prompt", "")), width, height, length,
-                ref_image_size, _cache_segment_references(plan, generation_index))
+            prepared[generation_index] = cls._prepare_references(
+                vae, audio_vae, width, height, length, ref_image_size,
+                _cache_segment_references(plan, generation_index))
+
+        LOG.info("H3 Auto Director: 参考素材预编码完成，开始连续缓存 %d 段文本向量", segment_count)
+        cache = {}
+        for generation_index, prepared_segment in prepared.items():
+            seg = _segment(plan, generation_index)
+            cache[generation_index] = cls._encode_prepared_prompt(
+                clip, str(seg.get("prompt", "")), *prepared_segment)
+        model_management.unload_model_and_clones(clip.patcher, unload_additional_models=False, all_devices=True)
+        LOG.info("H3 Auto Director: 全部文本向量缓存完成，已卸载文本编码器")
         return cache
 
     @classmethod

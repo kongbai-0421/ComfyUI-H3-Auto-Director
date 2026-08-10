@@ -33,14 +33,15 @@ Use these defaults:
 - `audio_restart`: `false`; set `true` only at a user-requested or clearly justified audio reset point.
 - `continue_video`: `false` for the first segment; `true` for later segments unless the user requests independent scenes or disables continuation.
 - `image_duration`: `1` unless the user gives another positive value.
-- `references`: always `[]` by default. Never invent filenames, paths, URLs, reference images, videos, or audio.
+- `references`: use `[]` unless the user supplies a local file path for the asset. Never invent filenames, paths, URLs, reference images, videos, or audio.
 
-The plugin uses zero-based reference labels and zero-based array order. When
-the user supplies assets, preserve their exact paths and assign labels by type:
+The plugin uses zero-based reference labels and zero-based array order. Only
+when the user supplies a local file path, preserve that exact path and assign labels by type:
 `<Picture 0>`, `<Picture 1>`, `<Video 0>`, `<Audio 0>`. Image, video, and audio
-indices are independent. Do not create a reference entry merely because the
-user mentions an object or says “reference”; an actual asset path or explicit
-asset mapping is required.
+indices are independent. If the user provides no local file path, every
+segment's `references` must remain `[]`. Do not create a reference entry from
+a visual description, an attachment name, “reference” wording, an uploaded
+preview, a URL, or an inferred asset mapping.
 
 ## Prompt Requirements
 
@@ -60,7 +61,7 @@ Use the official Ref2VA relationship markers in `retention_analysis`:
 `weak_reference`. Use `fully_copy`, `partially_copy`, `reference`, or
 `weak_reference` for audio entries.
 
-If there are no references, define the target subjects directly without
+If the user provides no local file paths, define the target subjects directly without
 inventing `<Picture>`, `<Video>`, or `<Audio>` labels. If references exist,
 define each label before using it, keep its meaning stable in all six sections,
 and state precisely what is preserved versus transferred.
@@ -99,7 +100,7 @@ logic consistent across segments unless the user requests a change. Use
 `audio_restart: true` at a deliberate musical, scene, or sound-design boundary;
 otherwise describe continuous ambience and music across the cut.
 
-When no audio asset is supplied, generate `overall_soundscape` and
+When the user supplies no local audio file path, generate `overall_soundscape` and
 `non_diegetic_music` descriptions but keep `references` empty. Do not add an
 audio reference just because the prompt mentions music or sound effects.
 
@@ -109,7 +110,7 @@ Before emitting the result:
 
 1. Confirm the result parses as one JSON array.
 2. Confirm every segment has a non-empty `prompt`, valid duration, boolean audio and continuation flags, and a list-valued `references` field.
-3. Confirm all references have explicit user-provided paths and valid types (`image`, `video`, or `audio`).
+3. Confirm `references` is `[]` for every segment unless the user supplied local file paths. Confirm every non-empty reference has an exact user-provided local file path and a valid type (`image`, `video`, or `audio`).
 4. Confirm no segment exceeds 12 total references, 9 images, 3 videos, or 3 independent audios.
 5. Confirm every prompt has all six sections in the required order.
 6. Confirm no prose, Markdown fence, or trailing comma appears outside the JSON.
