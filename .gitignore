@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.DS_Store
+
+# ComfyUI runtime output and local reference uploads
+output/
+input/h3_refs/
+
+# Local editor and test files
+.vscode/
+.idea/
+*.log
