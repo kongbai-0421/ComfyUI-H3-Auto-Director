@@ -37,8 +37,13 @@ The plugin's reference arrays and ComfyUI sockets are zero-based, but MiniMax H3
 prompt labels are one-based. Only when the user supplies a local file path,
 preserve that exact path and assign prompt labels by type: `<Picture 1>`,
 `<Picture 2>`, `<Video 1>`, `<Audio 1>`. Image and video indices are
-independent. Audio labels follow the audio presentation order: video soundtracks
-first, then standalone audio references. If the user provides no local file path, every
+independent. A video reference's embedded soundtrack is detected by the plugin
+automatically and is enabled by default. Set `video_audio_enabled` to `false`
+on that video reference only when the user asks to pass video frames without its
+soundtrack; do not invent a `has_audio` field because detection is automatic.
+Audio labels follow H3 presentation order: enabled video soundtracks first, then
+standalone audio references. Disabling a video soundtrack removes its `<Audio N>`
+label and shifts later standalone audio labels down. If the user provides no local file path, every
 segment's `references` must remain `[]`. Do not create a reference entry from
 a visual description, an attachment name, “reference” wording, an uploaded
 preview, a URL, or an inferred asset mapping.
@@ -110,7 +115,7 @@ Before emitting the result:
 
 1. Confirm the result parses as one JSON array.
 2. Confirm every segment has a non-empty `prompt`, valid duration, boolean audio and continuation flags, and a list-valued `references` field.
-3. Confirm `references` is `[]` for every segment unless the user supplied local file paths. Confirm every non-empty reference has an exact user-provided local file path and a valid type (`image`, `video`, or `audio`).
+3. Confirm `references` is `[]` for every segment unless the user supplied local file paths. Confirm every non-empty reference has an exact user-provided local file path and a valid type (`image`, `video`, or `audio`). For video references, `video_audio_enabled` is optional and must be boolean when present; omit it for the default enabled behavior.
 4. Confirm no segment exceeds 12 total references, 9 images, 3 videos, or 3 independent audios.
 5. Confirm every prompt has all six sections in the required order.
 6. Confirm no prose, Markdown fence, or trailing comma appears outside the JSON.
