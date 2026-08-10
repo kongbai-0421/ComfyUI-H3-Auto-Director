@@ -1,0 +1,4 @@
+interface:
+  display_name: "H3 Auto Director JSON"
+  short_description: "Generate H3 segment JSON prompts"
+  default_prompt: "Use $h3-auto-director-json to create a valid H3 Auto Director segments JSON array from this brief."

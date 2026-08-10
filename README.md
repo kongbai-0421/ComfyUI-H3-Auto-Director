@@ -148,6 +148,12 @@ output/h3_project/<项目文件夹名称>/
 
 缓存只存在于当前 ComfyUI 进程，重启后需要重新编码。显存不足时建议关闭该选项，或先卸载不需要的 VLM、LoRA 和辅助模型。
 
+## JSON 提示词技能
+
+仓库包含可供其他模型直接调用的技能：`skills/h3-auto-director-json/SKILL.md`。它会输出能直接粘贴到项目计划节点“片段配置”的 JSON 数组；默认不生成或虚构任何图片、视频、音频素材，每段的 `references` 都为空数组。
+
+技能强制每个片段使用 MiniMax H3 Ref2VA 官方六段式描述：`subject_definitions`、`summary`、`retention_analysis`、`detailed_description`、`overall_soundscape` 和 `non_diegetic_music`。除非用户明确要求极简动作，否则每段都会包含完整镜头、动作过程、环境、镜头运动、声音与收束姿势，而不是只输出“跑步”等简略动作标签。
+
 ### 8. 保存与排错
 
 - 中间片段节点必须接收未裁剪的 AV latent、裁剪后的画面和对应音频。
