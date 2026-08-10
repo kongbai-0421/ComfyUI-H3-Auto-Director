@@ -484,6 +484,8 @@ def _resolve_reference_groups(refs):
             images.append(_load_reference_image(name))
         elif kind == "video":
             frames, soundtrack = _load_reference_video(name)
+            if ref.get("video_audio_enabled", True) is False:
+                soundtrack = None
             videos.append(frames)
             video_audios.append(soundtrack)
         elif kind == "audio":

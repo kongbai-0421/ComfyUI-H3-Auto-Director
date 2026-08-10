@@ -4,6 +4,7 @@ from pathlib import Path
 import ctypes
 import os
 import shutil
+import subprocess
 
 import folder_paths
 
@@ -25,6 +26,68 @@ _TYPE_CONFIG = {
         "label": "音频",
     },
 }
+
+
+def _find_ffprobe():
+    configured = os.environ.get("FFPROBE_PATH", "").strip().strip('"')
+    candidates = [configured] if configured else []
+    found = shutil.which("ffprobe")
+    if found:
+        candidates.append(found)
+    ffmpeg = os.environ.get("FFMPEG_PATH", "").strip().strip('"')
+    if ffmpeg:
+        candidates.append(str(Path(ffmpeg).with_name("ffprobe" + Path(ffmpeg).suffix)))
+    for value in candidates:
+        if value and Path(value).is_file():
+            return str(Path(value))
+    return None
+
+
+def _find_ffmpeg():
+    configured = os.environ.get("FFMPEG_PATH", "").strip().strip('"')
+    if configured and Path(configured).is_file():
+        return configured
+    return shutil.which("ffmpeg")
+
+
+def _video_has_audio(path):
+    """Return whether a local video contains an audio stream."""
+    ffprobe = _find_ffprobe()
+    if ffprobe:
+        try:
+            result = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True, timeout=20,
+            )
+            if result.returncode == 0:
+                return bool(result.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        return False
+    try:
+        result = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path)],
+                                capture_output=True, text=True, timeout=20)
+        return "Audio:" in result.stderr
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _resolve_input_file(value):
+    clean = str(value or "").strip().strip('"').replace("\\", "/")
+    if clean.startswith("input/"):
+        clean = clean[6:]
+    path = (Path(folder_paths.get_input_directory()) / clean).resolve()
+    root = Path(folder_paths.get_input_directory()).resolve()
+    if root not in path.parents or not path.is_file():
+        raise ValueError("视频参考素材必须位于 ComfyUI/input 目录内")
+    return path
+
+
+def probe_video_file(path):
+    return {"has_audio": _video_has_audio(_resolve_input_file(path))}
 
 
 def _initial_directory(value, destination):
@@ -121,5 +184,6 @@ def select_and_import_files(file_type, initial_dir="", use_default_path=True):
             "name": target.name,
             "path": f"h3_refs/{config['folder']}/{target.name}",
             "originalName": source.name,
+            **({"has_audio": _video_has_audio(target), "video_audio_enabled": True} if file_type == "video" else {}),
         })
     return results

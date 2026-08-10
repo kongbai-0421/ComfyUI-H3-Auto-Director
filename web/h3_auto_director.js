@@ -19,6 +19,7 @@ const MAX_TOTAL_REFS = 12;
 const DIR_KEY = "h3-auto-director-picker-dirs";
 const PICKER_OPTIONS_KEY = "h3-auto-director-picker-options";
 const UPLOAD_DIRS = { image: "h3_refs/images", video: "h3_refs/videos", audio: "h3_refs/audio" };
+const VIDEO_AUDIO_PROBES = new WeakSet();
 
 function widget(node, name) {
   return (node.widgets || []).find((item) => item.name === name);
@@ -133,6 +134,18 @@ async function selectDirectoryWithPython(initialDir) {
   return String(result.directory || "");
 }
 
+async function probeVideoAudio(path) {
+  const response = await fetch("/h3_auto_director/video_info", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  let result = {};
+  try { result = await response.json(); } catch (_) { /* handled below */ }
+  if (!response.ok) throw new Error(result.error || `视频音轨检测失败（${response.status}）`);
+  return result.has_audio === true;
+}
+
 async function uploadOne(file, type) {
   const form = new FormData();
   form.append("image", file, file.name);
@@ -145,7 +158,12 @@ async function uploadOne(file, type) {
   if (!response.ok) throw new Error(`${file.name} 上传失败（${response.status}）`);
   const result = await response.json();
   const path = [result.subfolder, result.name].filter(Boolean).join("/");
-  return { type, name: result.name, path, originalName: file.name };
+  const ref = { type, name: result.name, path, originalName: file.name };
+  if (type === "video") {
+    ref.has_audio = await probeVideoAudio(path).catch(() => false);
+    ref.video_audio_enabled = true;
+  }
+  return ref;
 }
 
 function countRefs(segment, type) {
@@ -154,6 +172,10 @@ function countRefs(segment, type) {
 
 function totalRefs(segment) {
   return (segment.references || []).length;
+}
+
+function videoAudioRefs(segment) {
+  return (segment.references || []).filter((ref) => ref.type === "video" && ref.has_audio === true && ref.video_audio_enabled !== false);
 }
 
 function segmentHasContent(segment) {
@@ -377,7 +399,12 @@ function openEditor(node) {
   const referencePromptNumber = (seg, ref, type) => {
     const refs = (seg.references || []).filter((item) => item.type === type);
     const index = refs.indexOf(ref);
-    return index + 1;
+    return type === "audio" ? videoAudioRefs(seg).length + index + 1 : index + 1;
+  };
+
+  const videoAudioPromptNumber = (seg, ref) => {
+    const videos = (seg.references || []).filter((item) => item.type === "video");
+    return videos.slice(0, videos.indexOf(ref) + 1).filter((item) => item.has_audio === true && item.video_audio_enabled !== false).length;
   };
 
   const createRefCard = (seg, ref, type, renderRefs) => {
@@ -398,6 +425,14 @@ function openEditor(node) {
       if (type === "image") {
         const image = document.createElement("img"); image.src = mediaUrl(ref); image.alt = ref.originalName || ref.name; image.style.cssText = "width:100%;height:100%;object-fit:contain"; preview.appendChild(image);
       } else if (type === "video") {
+        if (ref.has_audio === undefined && !VIDEO_AUDIO_PROBES.has(ref)) {
+          VIDEO_AUDIO_PROBES.add(ref);
+          probeVideoAudio(ref.path).then((hasAudio) => {
+            ref.has_audio = hasAudio;
+            if (ref.video_audio_enabled === undefined) ref.video_audio_enabled = true;
+            renderRefs();
+          }).catch(() => { ref.has_audio = false; renderRefs(); });
+        }
         // Use a canvas-extracted first frame as the stable thumbnail. Keeping
         // the video element hidden avoids animated previews and layout jumps.
         const thumbnail = document.createElement("img");
@@ -447,6 +482,32 @@ function openEditor(node) {
     return card;
   };
 
+  const createVideoAudioCard = (seg, videoRef, renderRefs) => {
+    const number = videoAudioPromptNumber(seg, videoRef);
+    const card = document.createElement("div");
+    card.style.cssText = "display:grid;grid-template-columns:1fr 30px;gap:8px;align-items:center;padding:8px;background:#171b20;border:1px solid #424b55;border-radius:5px";
+    const info = document.createElement("div");
+    info.style.cssText = "min-width:0;display:flex;flex-direction:column;gap:5px";
+    const title = document.createElement("div");
+    title.textContent = `视频音频 ${number}`;
+    title.style.cssText = "font-weight:700;color:#f0f3f6";
+    info.appendChild(title);
+    const meta = document.createElement("div");
+    meta.textContent = `提示词标签：<Audio ${number}> | 来源：${videoRef.originalName || videoRef.name || "视频参考"}`;
+    meta.style.cssText = "font-size:11px;color:#aeb7c1";
+    info.appendChild(meta);
+    const toggle = document.createElement("label");
+    toggle.style.cssText = "display:flex;align-items:center;gap:5px;font-size:11px;color:#d6dde5;white-space:nowrap";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = videoRef.video_audio_enabled !== false;
+    checkbox.title = "关闭后只传递视频画面";
+    checkbox.onchange = () => { videoRef.video_audio_enabled = checkbox.checked; renderRefs(); };
+    toggle.append(checkbox, "传递音频");
+    card.append(info, toggle);
+    return card;
+  };
+
   const render = () => {
     segmentCountInput.value = String(segments.length);
     list.innerHTML = "";
@@ -474,7 +535,11 @@ function openEditor(node) {
           if (!refs.length) return;
           const group = document.createElement("div"); group.style.cssText = "display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:7px";
           const heading = document.createElement("div"); heading.textContent = type === "image" ? "图片参考（提示词标签从 <Picture 1> 起始编号）" : type === "video" ? "视频参考（提示词标签从 <Video 1> 起始编号）" : "音频参考（按上传顺序使用 <Audio 1>、<Audio 2>…）"; heading.style.cssText = "grid-column:1/-1;color:#c7d0da;font-size:12px"; group.appendChild(heading);
-          refs.forEach((ref) => group.appendChild(createRefCard(seg, ref, type, () => { summary.textContent = `多模态参考素材（${totalRefs(seg)}/${MAX_TOTAL_REFS} / 图片${countRefs(seg, "image")}/9，视频${countRefs(seg, "video")}/3，音频${countRefs(seg, "audio")}/3）`; renderRefs(); }))); refList.appendChild(group);
+          refs.forEach((ref) => {
+            group.appendChild(createRefCard(seg, ref, type, () => { summary.textContent = `多模态参考素材（${totalRefs(seg)}/${MAX_TOTAL_REFS} / 图片${countRefs(seg, "image")}/9，视频${countRefs(seg, "video")}/3，音频${countRefs(seg, "audio")}/3）`; renderRefs(); }));
+            if (type === "video" && ref.has_audio === true) group.appendChild(createVideoAudioCard(seg, ref, renderRefs));
+          });
+          refList.appendChild(group);
         });
       };
       const addFiles = async (type, files) => {
