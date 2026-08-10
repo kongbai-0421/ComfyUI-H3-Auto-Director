@@ -96,6 +96,18 @@ function formatDuration(value) {
   return Number.isFinite(Number(value)) && Number(value) > 0 ? `${Number(value).toFixed(2)} 秒` : "读取时长中…";
 }
 
+async function selectFilesWithPython(type, initialDir) {
+  const response = await fetch("/h3_auto_director/select_files", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ type, initial_dir: initialDir || "" }),
+  });
+  let result = {};
+  try { result = await response.json(); } catch (_) { /* handled below */ }
+  if (!response.ok) throw new Error(result.error || `Python文件选择失败（${response.status}）`);
+  return Array.isArray(result.files) ? result.files : [];
+}
+
 async function uploadOne(file, type) {
   const form = new FormData();
   form.append("image", file, file.name);
@@ -420,6 +432,19 @@ function openEditor(node) {
           render();
         } catch (error) { notice.textContent = error.message || String(error); }
       };
+      const addPythonFiles = async (type) => {
+        try {
+          notice.textContent = "正在打开 Python 系统文件选择器…";
+          const selected = await selectFilesWithPython(type, dirs[type]);
+          const remaining = MAX_REFS[type] - countRefs(seg, type);
+          const totalRemaining = MAX_TOTAL_REFS - totalRefs(seg);
+          if (selected.length > totalRemaining) throw new Error(`第 ${index + 1} 段参考素材总数最多 ${MAX_TOTAL_REFS} 个，已拒绝本次选择。`);
+          if (selected.length > remaining) throw new Error(`第 ${index + 1} 段的${type === "image" ? "图片" : type === "video" ? "视频" : "音频"}最多 ${MAX_REFS[type]} 个，已拒绝本次选择。`);
+          seg.references.push(...selected);
+          notice.textContent = selected.length ? `第 ${index + 1} 段已按选择顺序导入 ${selected.length} 个${type === "image" ? "图片" : type === "video" ? "视频" : "音频"}。` : "未选择文件。";
+          render();
+        } catch (error) { notice.textContent = error.message || String(error); }
+      };
       ["image", "video", "audio"].forEach((type) => {
         const input = document.createElement("input"); input.type = "file"; input.multiple = true; input.accept = type === "image" ? "image/*" : type === "video" ? "video/*" : "audio/*"; input.style.display = "none"; input.onchange = () => { addFiles(type, input.files); input.value = ""; }; details.appendChild(input);
         const openPicker = async () => {
@@ -433,7 +458,8 @@ function openEditor(node) {
           }
           input.click();
         };
-        const button = makeButton(type === "image" ? "+ 添加图片" : type === "video" ? "+ 添加视频" : "+ 添加音频", openPicker, `最多 ${MAX_REFS[type]} 个`); button.style.marginRight = "6px"; details.appendChild(button);
+        const pythonButton = makeButton(type === "image" ? "+ Python选择图片" : type === "video" ? "+ Python选择视频" : "+ Python选择音频", () => addPythonFiles(type), `使用 ComfyUI Python 打开系统文件选择器，最多 ${MAX_REFS[type]} 个`); pythonButton.style.marginRight = "6px"; details.appendChild(pythonButton);
+        const browserButton = makeButton("浏览器选择", openPicker, `使用浏览器文件选择器，最多 ${MAX_REFS[type]} 个`); browserButton.style.marginRight = "6px"; details.appendChild(browserButton);
       });
       renderRefs(); details.appendChild(refList); row.appendChild(details); list.appendChild(row);
     });
