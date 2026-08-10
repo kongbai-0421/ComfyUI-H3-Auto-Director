@@ -17,6 +17,7 @@ const H3_NODE_CLASSES = new Set([NODE, SEGMENT_NODE, REFERENCE_NODE, CACHED_REFE
 const MAX_REFS = { image: 9, video: 3, audio: 3 };
 const MAX_TOTAL_REFS = 12;
 const DIR_KEY = "h3-auto-director-picker-dirs";
+const PICKER_OPTIONS_KEY = "h3-auto-director-picker-options";
 const UPLOAD_DIRS = { image: "h3_refs/images", video: "h3_refs/videos", audio: "h3_refs/audio" };
 
 function widget(node, name) {
@@ -33,6 +34,19 @@ function readDirectories() {
 
 function writeDirectories(dirs) {
   localStorage.setItem(DIR_KEY, JSON.stringify(dirs));
+}
+
+function readPickerOptions() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PICKER_OPTIONS_KEY) || "{}");
+    return { useDefaultPath: saved.useDefaultPath !== false, mode: saved.mode === "browser" ? "browser" : "python" };
+  } catch (_) {
+    return { useDefaultPath: true, mode: "python" };
+  }
+}
+
+function writePickerOptions(options) {
+  localStorage.setItem(PICKER_OPTIONS_KEY, JSON.stringify(options));
 }
 
 function normalizeSegment(value) {
@@ -96,16 +110,28 @@ function formatDuration(value) {
   return Number.isFinite(Number(value)) && Number(value) > 0 ? `${Number(value).toFixed(2)} 秒` : "读取时长中…";
 }
 
-async function selectFilesWithPython(type, initialDir) {
+async function selectFilesWithPython(type, initialDir, useDefaultPath) {
   const response = await fetch("/h3_auto_director/select_files", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ type, initial_dir: initialDir || "" }),
+    body: JSON.stringify({ type, initial_dir: initialDir || "", use_default_path: !!useDefaultPath }),
   });
   let result = {};
   try { result = await response.json(); } catch (_) { /* handled below */ }
   if (!response.ok) throw new Error(result.error || `Python文件选择失败（${response.status}）`);
   return Array.isArray(result.files) ? result.files : [];
+}
+
+async function selectDirectoryWithPython(initialDir) {
+  const response = await fetch("/h3_auto_director/select_directory", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ initial_dir: initialDir || "" }),
+  });
+  let result = {};
+  try { result = await response.json(); } catch (_) { /* handled below */ }
+  if (!response.ok) throw new Error(result.error || `Python目录选择失败（${response.status}）`);
+  return String(result.directory || "");
 }
 
 async function uploadOne(file, type) {
@@ -236,6 +262,7 @@ function openEditor(node) {
   let segments = readSegments(node);
   if (!segments.length) segments = [{ prompt: "", duration: 5, audio_restart: false, references: [] }];
   const dirs = readDirectories();
+  const pickerOptions = readPickerOptions();
   const pickerHandles = {};
 
   const shade = document.createElement("div");
@@ -250,9 +277,21 @@ function openEditor(node) {
   const dirPanel = document.createElement("div");
   dirPanel.style.cssText = "display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;padding:10px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px";
   const dirTitle = document.createElement("div");
-  dirTitle.textContent = "文件选择器默认目录（上传保存目录固定为 h3_refs/*；可用“选择起始目录”让文件选择器从指定目录打开）";
+  dirTitle.textContent = "默认打开路径只影响文件选择器，导入后的素材固定保存到 h3_refs/*。Python 模式在 ComfyUI 所在机器打开系统对话框。";
   dirTitle.style.cssText = "grid-column:1/-1;font-size:12px;color:#aeb7c1";
   dirPanel.appendChild(dirTitle);
+  const pickerControls = document.createElement("div");
+  pickerControls.style.cssText = "grid-column:1/-1;display:flex;align-items:center;gap:14px;font-size:12px";
+  const defaultLabel = document.createElement("label"); defaultLabel.style.cssText = "display:flex;align-items:center;gap:6px";
+  const defaultToggle = document.createElement("input"); defaultToggle.type = "checkbox"; defaultToggle.checked = pickerOptions.useDefaultPath;
+  defaultToggle.onchange = () => { pickerOptions.useDefaultPath = defaultToggle.checked; writePickerOptions(pickerOptions); };
+  defaultLabel.append(defaultToggle, "使用默认打开路径");
+  const modeLabel = document.createElement("label"); modeLabel.style.cssText = "display:flex;align-items:center;gap:6px"; modeLabel.append("文件选择方式");
+  const modeSelect = document.createElement("select"); modeSelect.style.cssText = "background:#15191d;color:#eee;border:1px solid #59636e;padding:4px";
+  modeSelect.innerHTML = "<option value=\"python\">Python 原生（推荐）</option><option value=\"browser\">浏览器调用</option>";
+  modeSelect.value = pickerOptions.mode;
+  modeSelect.onchange = () => { pickerOptions.mode = modeSelect.value; writePickerOptions(pickerOptions); };
+  modeLabel.appendChild(modeSelect); pickerControls.append(defaultLabel, modeLabel); dirPanel.appendChild(pickerControls);
   ["image", "video", "audio"].forEach((type) => {
     const label = document.createElement("label");
     label.style.cssText = "display:flex;align-items:center;gap:6px;font-size:12px";
@@ -262,7 +301,17 @@ function openEditor(node) {
     input.style.cssText = "min-width:0;flex:1;background:#15191d;color:#eee;border:1px solid #59636e;padding:5px";
     input.oninput = () => { dirs[type] = cleanSubfolder(input.value); writeDirectories(dirs); };
     const choose = makeButton("选择起始目录", async () => {
-      if (typeof window.showDirectoryPicker !== "function") { notice.textContent = "当前浏览器不支持设置文件选择器起始目录，将使用系统记忆的上次目录。"; return; }
+      if (!pickerOptions.useDefaultPath) { notice.textContent = "已关闭默认打开路径；开启后才能设置。"; return; }
+      if (pickerOptions.mode === "python") {
+        try {
+          const directory = await selectDirectoryWithPython(dirs[type]);
+          if (!directory) { notice.textContent = "未选择目录。"; return; }
+          dirs[type] = directory.replace(/\\/g, "/"); input.value = dirs[type]; writeDirectories(dirs);
+          notice.textContent = `${type === "image" ? "图片" : type === "video" ? "视频" : "音频"}默认打开目录已设置。`;
+        } catch (error) { notice.textContent = `设置起始目录失败：${error.message || error}`; }
+        return;
+      }
+      if (typeof window.showDirectoryPicker !== "function") { notice.textContent = "当前浏览器不支持设置文件选择器起始目录。"; return; }
       try {
         pickerHandles[type] = await window.showDirectoryPicker({ mode: "read" });
         dirs[type] = pickerHandles[type].name || dirs[type]; input.value = dirs[type]; writeDirectories(dirs);
@@ -435,7 +484,7 @@ function openEditor(node) {
       const addPythonFiles = async (type) => {
         try {
           notice.textContent = "正在打开 Python 系统文件选择器…";
-          const selected = await selectFilesWithPython(type, dirs[type]);
+          const selected = await selectFilesWithPython(type, dirs[type], pickerOptions.useDefaultPath);
           const remaining = MAX_REFS[type] - countRefs(seg, type);
           const totalRemaining = MAX_TOTAL_REFS - totalRefs(seg);
           if (selected.length > totalRemaining) throw new Error(`第 ${index + 1} 段参考素材总数最多 ${MAX_TOTAL_REFS} 个，已拒绝本次选择。`);
@@ -448,7 +497,7 @@ function openEditor(node) {
       ["image", "video", "audio"].forEach((type) => {
         const input = document.createElement("input"); input.type = "file"; input.multiple = true; input.accept = type === "image" ? "image/*" : type === "video" ? "video/*" : "audio/*"; input.style.display = "none"; input.onchange = () => { addFiles(type, input.files); input.value = ""; }; details.appendChild(input);
         const openPicker = async () => {
-          if (pickerHandles[type] && typeof window.showOpenFilePicker === "function") {
+          if (pickerOptions.useDefaultPath && pickerHandles[type] && typeof window.showOpenFilePicker === "function") {
             try {
               const kinds = type === "image" ? [{ description: "图片", accept: { "image/*": [".png", ".jpg", ".jpeg", ".webp", ".bmp"] } }] : type === "video" ? [{ description: "视频", accept: { "video/*": [".mp4", ".mov", ".webm", ".mkv"] } }] : [{ description: "音频", accept: { "audio/*": [".wav", ".mp3", ".flac", ".ogg", ".m4a"] } }];
               const handles = await window.showOpenFilePicker({ multiple: true, startIn: pickerHandles[type], types: kinds, excludeAcceptAllOption: false });
@@ -458,8 +507,8 @@ function openEditor(node) {
           }
           input.click();
         };
-        const pythonButton = makeButton(type === "image" ? "+ Python选择图片" : type === "video" ? "+ Python选择视频" : "+ Python选择音频", () => addPythonFiles(type), `使用 ComfyUI Python 打开系统文件选择器，最多 ${MAX_REFS[type]} 个`); pythonButton.style.marginRight = "6px"; details.appendChild(pythonButton);
-        const browserButton = makeButton("浏览器选择", openPicker, `使用浏览器文件选择器，最多 ${MAX_REFS[type]} 个`); browserButton.style.marginRight = "6px"; details.appendChild(browserButton);
+        const addReference = () => pickerOptions.mode === "python" ? addPythonFiles(type) : openPicker();
+        const button = makeButton(type === "image" ? "+ 添加图片" : type === "video" ? "+ 添加视频" : "+ 添加音频", addReference, "使用上方选择的文件选择方式"); button.style.marginRight = "6px"; details.appendChild(button);
       });
       renderRefs(); details.appendChild(refList); row.appendChild(details); list.appendChild(row);
     });

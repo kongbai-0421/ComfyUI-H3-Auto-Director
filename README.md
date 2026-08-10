@@ -31,7 +31,7 @@ ComfyUI/custom_nodes/ComfyUI-H3-Auto-Director
 
 编辑器还提供“片段数量”数字输入，可一次性增删片段；“直接输入片段配置 JSON”可粘贴数组后应用；“统一片段秒数”会把所有片段的 `duration` 设置为相同值，点击“应用到全部片段”后立即刷新每个片段的时长输入框。
 
-上传目录输入表示 Python 原生文件选择器的起始目录，点击“Python选择图片/视频/音频”后由 ComfyUI 所在机器打开 Windows 原生文件对话框，所有浏览器都可使用。文件会固定复制到 `input/h3_refs/images`、`input/h3_refs/videos` 和 `input/h3_refs/audio`。按钮会启用 Windows Per-Monitor DPI 感知，适配高分辨率和多显示器缩放；“浏览器选择”仅作为备用方式，仍受浏览器安全限制。
+上传设置包含“使用默认打开路径”和“文件选择方式”。默认打开路径开启时，Python 原生模式使用各类型输入框中的目录，浏览器模式使用已授权的目录句柄；关闭时两种模式都使用各自系统记忆的上次目录。Python 原生模式由 ComfyUI 所在机器打开 Windows 原生文件对话框，所有浏览器都可使用。文件会固定复制到 `input/h3_refs/images`、`input/h3_refs/videos` 和 `input/h3_refs/audio`。按钮会启用 Windows Per-Monitor DPI 感知，适配高分辨率和多显示器缩放。
 
 项目计划中的“自动连续生成”控制是否在片段保存后自动排队下一段；“接续模式”控制下一段是否按 `segment_index` 读取上一段的视频和 AV latent 上下文。接续模式开启时，片段节点会读取当前序号对应的提示词、时长和参考素材，并由上下文读取节点加载前一段缓存；关闭时仍可自动生成多段，但每段按独立场景生成，不要求前一段缓存。
 

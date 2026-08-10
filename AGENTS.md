@@ -6,5 +6,5 @@
 - Keep ordinary per-segment encoding behavior unchanged unless the task explicitly changes it.
 - H3 prompt JSON must leave `references` empty unless the user supplies an exact local asset file path. Never invent paths, URLs, filenames, or labels.
 - Python node changes require restarting the ComfyUI instance that actually loads this custom node.
+- Reference uploads support a persisted default-path switch and Python/browser picker mode. Python mode opens the native Windows dialog on the ComfyUI machine and imports into `input/h3_refs/*`; keep the browser picker as a fallback.
 - Do not modify example or user workflows unless the user explicitly requests workflow changes.
-
