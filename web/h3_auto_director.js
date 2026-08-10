@@ -375,13 +375,22 @@ function openEditor(node) {
   notice.style.cssText = "min-height:20px;margin-top:6px;color:#ffbf69;font-size:12px";
   panel.appendChild(notice);
 
-  const createRefCard = (seg, ref, type, typeIndex, renderRefs) => {
+  const referencePromptNumber = (seg, ref, type) => {
+    const refs = (seg.references || []).filter((item) => item.type === type);
+    const index = refs.indexOf(ref);
+    return index + 1;
+  };
+
+  const createRefCard = (seg, ref, type, renderRefs) => {
+    const promptNumber = referencePromptNumber(seg, ref, type);
+    const promptTag = `<${type === "image" ? "Picture" : type === "video" ? "Video" : "Audio"} ${promptNumber}>`;
+    const mediaDetails = () => `提示词标签：${promptTag} | 时长：${formatDuration(ref.duration)}`;
     const card = document.createElement("div");
     card.style.cssText = `position:relative;display:grid;grid-template-columns:${type === "audio" ? "1fr 30px" : "110px 1fr 30px"};gap:8px;align-items:center;padding:6px;background:#15191d;border:1px solid #424b55;border-radius:5px`;
     const preview = document.createElement("div");
     preview.style.cssText = "position:relative;width:104px;height:72px;background:#0d1013;border:1px dashed #59636e;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#8e99a5;font-size:11px;text-align:center";
     const badge = document.createElement("span");
-    badge.textContent = `${type === "image" ? "图片" : type === "video" ? "视频" : "音频"}${typeIndex}`;
+    badge.textContent = `${type === "image" ? "图片" : type === "video" ? "视频" : "音频"}${promptNumber}`;
     badge.style.cssText = "position:absolute;top:3px;right:3px;color:#fff;font-size:11px;font-weight:700;-webkit-text-stroke:2px #000;text-shadow:0 1px 2px #000;paint-order:stroke fill;z-index:2";
     preview.appendChild(badge);
     let mediaMeta = null;
@@ -407,7 +416,7 @@ function openEditor(node) {
         video.onloadedmetadata = () => {
           if (Number.isFinite(video.duration)) {
             ref.duration = video.duration;
-            if (mediaMeta) mediaMeta.textContent = `时长：${formatDuration(ref.duration)}`;
+            if (mediaMeta) mediaMeta.textContent = mediaDetails();
           }
           try { video.currentTime = 0; } catch (_) { /* metadata may not be seekable yet */ }
         };
@@ -418,7 +427,7 @@ function openEditor(node) {
       } else {
         // Audio has no visual thumbnail; keep only its player in the details column.
         audioControl = document.createElement("audio"); audioControl.src = mediaUrl(ref); audioControl.controls = true; audioControl.preload = "metadata"; audioControl.style.cssText = "width:100%";
-        audioControl.onloadedmetadata = () => { if (Number.isFinite(audioControl.duration)) { ref.duration = audioControl.duration; if (mediaMeta) mediaMeta.textContent = `时长：${formatDuration(ref.duration)}`; } };
+        audioControl.onloadedmetadata = () => { if (Number.isFinite(audioControl.duration)) { ref.duration = audioControl.duration; if (mediaMeta) mediaMeta.textContent = mediaDetails(); } };
       }
     } else if (type !== "audio") preview.append("等待上传");
     if (type !== "audio") card.appendChild(preview);
@@ -426,7 +435,7 @@ function openEditor(node) {
     info.style.cssText = "min-width:0;display:flex;flex-direction:column;gap:5px";
     if (audioControl) info.appendChild(audioControl);
     const name = document.createElement("div"); name.textContent = ref.originalName || ref.name || "未命名素材"; name.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap"; info.appendChild(name);
-    const meta = document.createElement("div"); meta.textContent = type === "video" || type === "audio" ? `时长：${formatDuration(ref.duration)}` : `提示词标签：<${type === "image" ? "Picture" : type === "video" ? "Video" : "Audio"} ${typeIndex}>`; meta.style.cssText = "font-size:11px;color:#aeb7c1"; mediaMeta = meta; info.appendChild(meta);
+    const meta = document.createElement("div"); meta.textContent = type === "image" ? `提示词标签：${promptTag}` : mediaDetails(); meta.style.cssText = "font-size:11px;color:#aeb7c1"; mediaMeta = meta; info.appendChild(meta);
     const path = document.createElement("input"); path.type = "text"; path.value = ref.path || ""; path.placeholder = "上传后自动填写，也可手动输入 input 下路径"; path.style.cssText = "width:100%;box-sizing:border-box;background:#0d1013;color:#ddd;border:1px solid #424b55;padding:4px"; path.oninput = () => { ref.path = path.value; ref.name = path.value.split("/").pop(); renderRefs(); }; info.appendChild(path);
     if (type === "image") {
       const imageDuration = document.createElement("label"); imageDuration.textContent = "图片秒数"; imageDuration.style.cssText = "display:flex;align-items:center;gap:6px;font-size:11px;color:#aeb7c1";
@@ -465,8 +474,8 @@ function openEditor(node) {
           const refs = (seg.references || []).filter((ref) => ref.type === type);
           if (!refs.length) return;
           const group = document.createElement("div"); group.style.cssText = "display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:7px";
-          const heading = document.createElement("div"); heading.textContent = type === "image" ? "图片参考（标签按 <Picture 0> 起始编号）" : type === "video" ? "视频参考（标签按 <Video 0> 起始编号）" : "独立音频参考（标签按 <Audio 0> 起始编号）"; heading.style.cssText = "grid-column:1/-1;color:#c7d0da;font-size:12px"; group.appendChild(heading);
-          refs.forEach((ref, typeIndex) => group.appendChild(createRefCard(seg, ref, type, typeIndex, () => { summary.textContent = `多模态参考素材（${totalRefs(seg)}/${MAX_TOTAL_REFS} / 图片${countRefs(seg, "image")}/9，视频${countRefs(seg, "video")}/3，音频${countRefs(seg, "audio")}/3）`; renderRefs(); }))); refList.appendChild(group);
+          const heading = document.createElement("div"); heading.textContent = type === "image" ? "图片参考（提示词标签从 <Picture 1> 起始编号）" : type === "video" ? "视频参考（提示词标签从 <Video 1> 起始编号）" : "音频参考（按上传顺序使用 <Audio 1>、<Audio 2>…）"; heading.style.cssText = "grid-column:1/-1;color:#c7d0da;font-size:12px"; group.appendChild(heading);
+          refs.forEach((ref) => group.appendChild(createRefCard(seg, ref, type, () => { summary.textContent = `多模态参考素材（${totalRefs(seg)}/${MAX_TOTAL_REFS} / 图片${countRefs(seg, "image")}/9，视频${countRefs(seg, "video")}/3，音频${countRefs(seg, "audio")}/3）`; renderRefs(); }))); refList.appendChild(group);
         });
       };
       const addFiles = async (type, files) => {

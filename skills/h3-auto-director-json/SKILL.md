@@ -35,10 +35,12 @@ Use these defaults:
 - `image_duration`: `1` unless the user gives another positive value.
 - `references`: use `[]` unless the user supplies a local file path for the asset. Never invent filenames, paths, URLs, reference images, videos, or audio.
 
-The plugin uses zero-based reference labels and zero-based array order. Only
-when the user supplies a local file path, preserve that exact path and assign labels by type:
-`<Picture 0>`, `<Picture 1>`, `<Video 0>`, `<Audio 0>`. Image, video, and audio
-indices are independent. If the user provides no local file path, every
+The plugin's reference arrays and ComfyUI sockets are zero-based, but MiniMax H3
+prompt labels are one-based. Only when the user supplies a local file path,
+preserve that exact path and assign prompt labels by type: `<Picture 1>`,
+`<Picture 2>`, `<Video 1>`, `<Audio 1>`. Image and video indices are
+independent. Audio labels follow the audio presentation order: video soundtracks
+first, then standalone audio references. If the user provides no local file path, every
 segment's `references` must remain `[]`. Do not create a reference entry from
 a visual description, an attachment name, “reference” wording, an uploaded
 preview, a URL, or an inferred asset mapping.
