@@ -70,6 +70,7 @@ VIDEO_CODECS = {
 }
 QUALITY_CHOICES = ("最高质量", "高质量", "平衡", "快速")
 ENCODER_DEVICES = ("CPU", "GPU")
+COLOR_CORRECTION_CHOICES = ("关闭", "匹配首段", "匹配上段")
 
 
 def _output_root():
@@ -278,6 +279,47 @@ def _load_context_video(path: Path, max_frames=39):
     if not tail:
         raise ValueError("Context video has no frames: %s" % path)
     return torch.from_numpy(__import__("numpy").stack(list(tail))).float() / 255.0
+
+
+def _color_match_to_reference(images, reference, blend=0.75):
+    """Apply one conservative RGB color transform to a whole clip.
+
+    Statistics are measured from the tail of both clips, but the same transform
+    is applied to every frame so the correction cannot introduce frame flicker.
+    """
+    if not torch.is_tensor(images) or not torch.is_tensor(reference):
+        return images
+    if images.ndim != 4 or reference.ndim != 4 or images.shape[-1] < 3 or reference.shape[-1] < 3:
+        return images
+    source = images[..., :3].float()
+    ref = reference[..., :3].float().to(device=source.device)
+    ref = torch.nn.functional.interpolate(
+        ref.permute(0, 3, 1, 2), size=source.shape[1:3], mode="bilinear", align_corners=False
+    ).permute(0, 2, 3, 1)
+    source_sample = source[-min(39, source.shape[0]):].reshape(-1, 3)
+    ref_sample = ref[-min(39, ref.shape[0]):].reshape(-1, 3)
+    source_mean = source_sample.mean(dim=0)
+    ref_mean = ref_sample.mean(dim=0)
+    source_std = source_sample.std(dim=0, unbiased=False).clamp_min(1e-3)
+    ref_std = ref_sample.std(dim=0, unbiased=False)
+    gain = (ref_std / source_std).clamp(0.75, 1.33)
+    offset = ref_mean - source_mean * gain
+    corrected = source * gain + offset
+    corrected = source + (corrected - source) * float(blend)
+    corrected = corrected.clamp(0.0, 1.0)
+    if images.shape[-1] > 3:
+        return torch.cat((corrected, images[..., 3:]), dim=-1)
+    return corrected
+
+
+def _color_reference_path(plan, segment_index, color_correction, output_name, video_format):
+    """Find the saved clip used as the selected color anchor."""
+    anchor_index = 1 if color_correction == "匹配首段" else max(1, int(segment_index) - 1)
+    preferred, _ = _paths(plan, anchor_index, output_name, video_format)
+    if preferred.is_file():
+        return preferred
+    fallback, _ = _paths(plan, anchor_index)
+    return fallback if fallback.is_file() else None
 
 
 def _load_av_latent(path: Path):
@@ -955,6 +997,7 @@ class H3AutoDirectorSaveSegment:
             "video_codec": (list(VIDEO_CODECS), {"default": "h264"}),
             "encoder_device": (list(ENCODER_DEVICES), {"default": "CPU"}),
             "quality": (list(QUALITY_CHOICES), {"default": "最高质量"}),
+            "color_correction": (list(COLOR_CORRECTION_CHOICES), {"default": "关闭"}),
         }, "optional": {"audio": ("AUDIO",)}}
 
     RETURN_TYPES = ("STRING", "STRING")
@@ -963,7 +1006,7 @@ class H3AutoDirectorSaveSegment:
     CATEGORY = "H3 自动导演"
     OUTPUT_NODE = True
 
-    def save(self, plan, segment_index, latent, images, fps, output_root="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量", audio=None):
+    def save(self, plan, segment_index, latent, images, fps, output_root="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量", color_correction="关闭", audio=None):
         try:
             fps = float(fps)
         except (TypeError, ValueError):
@@ -979,8 +1022,24 @@ class H3AutoDirectorSaveSegment:
         parts = list(latent["samples"].unbind()) if hasattr(latent["samples"], "unbind") else list(latent["samples"])
         if len(parts) < 2:
             raise ValueError("Sampler output must be an H3 video/audio latent pair")
+        images_to_save = images
+        segment_number = int(segment_index)
+        correction_mode = str(color_correction)
+        if correction_mode in {"匹配首段", "匹配上段"} and segment_number <= 1:
+            LOG.info("H3 Auto Director: color correction skipped for first segment")
+        elif correction_mode in {"匹配首段", "匹配上段"}:
+            anchor_path = _color_reference_path(plan, segment_number, correction_mode, output_root, video_format)
+            if anchor_path is None:
+                LOG.warning("H3 Auto Director: color correction skipped; anchor for segment %d is missing", segment_number)
+            else:
+                try:
+                    anchor = _load_context_video(anchor_path, max_frames=39)
+                    images_to_save = _color_match_to_reference(images, anchor)
+                    LOG.info("H3 Auto Director: matched segment %d colors to %s", segment_number, anchor_path)
+                except Exception as exc:
+                    LOG.warning("H3 Auto Director: color correction skipped for segment %d: %s", segment_number, exc)
         tmp_video = video_path.with_name(video_path.stem + ".video_tmp" + video_path.suffix)
-        _encode_video_with_fallback(tmp_video, images, fps, video_format, video_codec, encoder_device, quality)
+        _encode_video_with_fallback(tmp_video, images_to_save, fps, video_format, video_codec, encoder_device, quality)
         tmp_wav = video_path.with_suffix(".audio_tmp.wav")
         wav = _write_wav(tmp_wav, audio) if audio is not None else None
         if wav is not None:

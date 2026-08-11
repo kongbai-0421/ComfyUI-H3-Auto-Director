@@ -32,6 +32,7 @@ Use these defaults:
 - `audio_restart`: `false`; set `true` only at a user-requested or clearly justified audio reset point.
 - `continue_video`: `false` for the first segment; `true` for later segments unless the user requests independent scenes or disables continuation.
 - `references`: use `[]` unless the user supplies a local file path for the asset. Never invent filenames, paths, URLs, reference images, videos, or audio.
+- Image references have no independent duration. Never emit `duration` or `image_duration` inside an image reference; the segment-level `duration` controls the complete generated clip. Video and audio metadata may retain `duration` only for display or source-media bookkeeping.
 
 The plugin's reference arrays and ComfyUI sockets are zero-based, but MiniMax H3
 prompt labels are one-based. Only when the user supplies a local file path,

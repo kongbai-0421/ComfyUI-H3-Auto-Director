@@ -58,8 +58,13 @@ function normalizeSegment(value) {
     audio_restart: !!seg.audio_restart,
     continue_video: seg.continue_video !== false,
     references: Array.isArray(seg.references) ? seg.references.map((ref) => {
-      if (typeof ref === "string") return { type: "image", name: ref, path: ref, duration: 1 };
-      return { ...ref, duration: Number(ref?.duration) > 0 ? Number(ref.duration) : 1 };
+      if (typeof ref === "string") return { type: "image", name: ref, path: ref };
+      const normalized = { ...ref };
+      // Image references condition the whole generated segment. They do not
+      // have an independent duration; remove legacy values on load/save.
+      if (normalized.type === "image") delete normalized.duration;
+      else normalized.duration = Number(ref?.duration) > 0 ? Number(ref.duration) : 1;
+      return normalized;
     }) : [],
   };
 }
@@ -232,7 +237,7 @@ function applyChineseLabels(node) {
     clip_index: "片段序号", latent_path: "潜变量路径",
     aspect_ratio: "宽高比", megapixels: "目标像素数（MP）", multiple: "尺寸倍数",
     output_root: nodeClass === SAVE_NODE ? "输出文件名（中间片段，留空使用 H3）" : nodeClass === CONTROLLER_NODE ? "输出文件名（最终视频，留空使用 H3）" : "项目文件夹名称（保存于 output/h3_project 下）",
-    video_format: "视频格式", video_codec: "编码格式", encoder_device: "编码设备", quality: "编码质量",
+    video_format: "视频格式", video_codec: "编码格式", encoder_device: "编码设备", quality: "编码质量", color_correction: "上下文色彩校正",
   };
   const apply = (item) => {
     const label = labels[item?.name];
@@ -267,6 +272,7 @@ function decorateNode(node) {
     video_codec: "编码格式",
     encoder_device: "编码设备",
     quality: "编码质量",
+    color_correction: "上下文色彩校正",
   };
   applyChineseLabels(node);
   if (nodeClass === SAVE_NODE) {
@@ -471,12 +477,6 @@ function openEditor(node) {
     const name = document.createElement("div"); name.textContent = ref.originalName || ref.name || "未命名素材"; name.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap"; info.appendChild(name);
     const meta = document.createElement("div"); meta.textContent = type === "image" ? `提示词标签：${promptTag}` : mediaDetails(); meta.style.cssText = "font-size:11px;color:#aeb7c1"; mediaMeta = meta; info.appendChild(meta);
     const path = document.createElement("input"); path.type = "text"; path.value = ref.path || ""; path.placeholder = "上传后自动填写，也可手动输入 input 下路径"; path.style.cssText = "width:100%;box-sizing:border-box;background:#0d1013;color:#ddd;border:1px solid #424b55;padding:4px"; path.oninput = () => { ref.path = path.value; ref.name = path.value.split("/").pop(); renderRefs(); }; info.appendChild(path);
-    if (type === "image") {
-      const imageDuration = document.createElement("label"); imageDuration.textContent = "图片秒数"; imageDuration.style.cssText = "display:flex;align-items:center;gap:6px;font-size:11px;color:#aeb7c1";
-      const seconds = document.createElement("input"); seconds.type = "number"; seconds.min = "0.1"; seconds.max = "60"; seconds.step = "0.1"; seconds.value = Number(ref.duration) || 1; seconds.style.cssText = "width:70px;background:#0d1013;color:#ddd;border:1px solid #424b55;padding:3px";
-      seconds.oninput = () => { ref.duration = Math.max(0.1, Number(seconds.value) || 1); };
-      imageDuration.appendChild(seconds); info.appendChild(imageDuration);
-    }
     card.appendChild(info);
     card.appendChild(makeButton("×", () => { seg.references.splice(seg.references.indexOf(ref), 1); renderRefs(); }, "删除素材"));
     return card;
@@ -485,7 +485,9 @@ function openEditor(node) {
   const createVideoAudioCard = (seg, videoRef, renderRefs) => {
     const number = videoAudioPromptNumber(seg, videoRef);
     const card = document.createElement("div");
-    card.style.cssText = "display:grid;grid-template-columns:1fr 30px;gap:8px;align-items:center;padding:8px;background:#171b20;border:1px solid #424b55;border-radius:5px";
+    // The toggle contains both a checkbox and a label. A fixed 30px column
+    // squeezed the label outside the card on narrow plan panels.
+    card.style.cssText = "width:100%;box-sizing:border-box;display:grid;grid-template-columns:minmax(0,1fr) minmax(104px,max-content);gap:8px;align-items:center;padding:8px;background:#171b20;border:1px solid #424b55;border-radius:5px;overflow:hidden";
     const info = document.createElement("div");
     info.style.cssText = "min-width:0;display:flex;flex-direction:column;gap:5px";
     const title = document.createElement("div");
@@ -497,13 +499,17 @@ function openEditor(node) {
     meta.style.cssText = "font-size:11px;color:#aeb7c1";
     info.appendChild(meta);
     const toggle = document.createElement("label");
-    toggle.style.cssText = "display:flex;align-items:center;gap:5px;font-size:11px;color:#d6dde5;white-space:nowrap";
+    toggle.style.cssText = "min-width:0;display:flex;align-items:center;justify-content:flex-start;gap:6px;font-size:12px;line-height:1.35;color:#d6dde5;white-space:normal;overflow-wrap:anywhere;cursor:pointer";
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
+    checkbox.style.cssText = "flex:0 0 auto;margin:0";
     checkbox.checked = videoRef.video_audio_enabled !== false;
     checkbox.title = "关闭后只传递视频画面";
     checkbox.onchange = () => { videoRef.video_audio_enabled = checkbox.checked; renderRefs(); };
-    toggle.append(checkbox, "传递音频");
+    const toggleText = document.createElement("span");
+    toggleText.textContent = "传递音频";
+    toggleText.style.cssText = "min-width:0;overflow-wrap:anywhere";
+    toggle.append(checkbox, toggleText);
     card.append(info, toggle);
     return card;
   };
