@@ -31,23 +31,39 @@ Use these defaults:
 - `duration`: `5` unless the user gives a duration. Keep every value between `4` and `15` seconds.
 - `audio_restart`: `false`; set `true` only at a user-requested or clearly justified audio reset point.
 - `continue_video`: `false` for the first segment; `true` for later segments unless the user requests independent scenes or disables continuation.
-- `references`: use `[]` unless the user supplies a local file path for the asset. Never invent filenames, paths, URLs, reference images, videos, or audio.
+- `references`: use `[]` unless the user supplies an exact local file path for the asset. Never invent filenames, paths, URLs, reference images, videos, audio, labels, or numbers.
 - Image references have no independent duration. Never emit `duration` or `image_duration` inside an image reference; the segment-level `duration` controls the complete generated clip. Video and audio metadata may retain `duration` only for display or source-media bookkeeping.
 
 The plugin's reference arrays and ComfyUI sockets are zero-based, but MiniMax H3
-prompt labels are one-based. Only when the user supplies a local file path,
-preserve that exact path and assign prompt labels by type: `<Picture 1>`,
-`<Picture 2>`, `<Video 1>`, `<Audio 1>`. Image and video indices are
-independent. A video reference's embedded soundtrack is detected by the plugin
-automatically and is enabled by default. Set `video_audio_enabled` to `false`
-on that video reference only when the user asks to pass video frames without its
-soundtrack; do not invent a `has_audio` field because detection is automatic.
-Audio labels follow H3 presentation order: enabled video soundtracks first, then
-standalone audio references. Disabling a video soundtrack removes its `<Audio N>`
-label and shifts later standalone audio labels down. If the user provides no local file path, every
-segment's `references` must remain `[]`. Do not create a reference entry from
-a visual description, an attachment name, “reference” wording, an uploaded
-preview, a URL, or an inferred asset mapping.
+prompt labels are one-based. Labels are scoped to each segment and are assigned
+separately by type: `<Picture 1>`, `<Picture 2>`, `<Video 1>`, and `<Audio 1>`.
+Do not carry a label from one segment into another unless that exact reference is
+also present in the other segment. Preserve the user's explicit label-to-file
+mapping exactly. If the user supplies paths but does not specify the material
+numbering or mapping, stop and ask which file is `<Picture N>`, `<Video N>`, or
+`<Audio N>`; do not infer numbering from filenames, upload order, descriptions,
+attachments, or visual appearance.
+
+For every referenced material, use its concrete material label in all six
+sections: define it in `subject_definitions`, list it as its own line in
+`retention_analysis`, and cite it at the point where it acts in `summary`,
+`detailed_description`, `overall_soundscape`, and/or `non_diegetic_music` as
+applicable. A `<Subject N>` may describe content derived from a material, but it
+never replaces the corresponding `<Picture N>`, `<Video N>`, or `<Audio N>` label.
+If a section has no applicable use for a material, state that relationship
+explicitly instead of silently omitting the label.
+
+A video reference creates an audio label only when the user explicitly confirms
+that it has an audio track or supplies an already-confirmed mapping. Otherwise
+do not mention a soundtrack label. When present, enabled video soundtracks are
+numbered first in H3 presentation order, followed by standalone audio files;
+disabling one removes its label and shifts later audio labels down. Do not invent
+`has_audio` metadata. If the user provides no exact local file paths, every
+segment's `references` must remain `[]`; if the prompt still refers to an
+unidentified material, ask the user for its exact path and one-based label before
+returning JSON. Do not create a reference entry from a visual description, an
+attachment name, “reference” wording, an uploaded preview, a URL, or inferred
+asset mapping.
 
 ## Prompt Requirements
 
@@ -67,10 +83,12 @@ Use the official Ref2VA relationship markers in `retention_analysis`:
 `weak_reference`. Use `fully_copy`, `partially_copy`, `reference`, or
 `weak_reference` for audio entries.
 
-If the user provides no local file paths, define the target subjects directly without
-inventing `<Picture>`, `<Video>`, or `<Audio>` labels. If references exist,
-define each label before using it, keep its meaning stable in all six sections,
-and state precisely what is preserved versus transferred.
+If the user provides no local file paths and no material is requested, write a
+text-only plan with `references: []` and no material labels. If the request
+mentions any missing material, ask for its exact local path and explicit one-based
+label before generating JSON. When references exist, every material label must be
+defined before use, remain stable across all six sections, and state precisely
+what is preserved versus transferred.
 
 ## Segment Detail Rule
 
@@ -116,10 +134,13 @@ Before emitting the result:
 
 1. Confirm the result parses as one JSON array.
 2. Confirm every segment has a non-empty `prompt`, valid duration, boolean audio and continuation flags, and a list-valued `references` field.
-3. Confirm `references` is `[]` for every segment unless the user supplied local file paths. Confirm every non-empty reference has an exact user-provided local file path and a valid type (`image`, `video`, or `audio`). For video references, `video_audio_enabled` is optional and must be boolean when present; omit it for the default enabled behavior.
+3. Confirm `references` is `[]` for every segment unless the user supplied exact local file paths and explicit material labels. Confirm every non-empty reference has an exact user-provided local file path, the user-confirmed one-based label, and a valid type (`image`, `video`, or `audio`). For video references, `video_audio_enabled` is optional and must be boolean when present; omit it for the default enabled behavior.
 4. Confirm no segment exceeds 12 total references, 9 images, 3 videos, or 3 independent audios.
 5. Confirm every prompt has all six sections in the required order.
 6. Confirm no prose, Markdown fence, or trailing comma appears outside the JSON.
+
+If the required material path or numbering clarification is missing, do not
+return a partial JSON array. Ask the user a concise clarification question first.
 
 If the user supplies only a story idea and no segment count, infer a sensible
 number of 4-6 second segments from the requested duration, but do not add
