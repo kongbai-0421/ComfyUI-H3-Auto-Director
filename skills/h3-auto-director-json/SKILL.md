@@ -155,6 +155,34 @@ When the user supplies no local audio file path, generate `overall_soundscape` a
 `non_diegetic_music` descriptions but keep `references` empty. Do not add an
 audio reference just because the prompt mentions music or sound effects.
 
+## Runtime Continuation Contract
+
+The JSON flags express a plan; they do not by themselves force a context tensor
+into the sampler. Video continuation is effective only when all of these
+conditions are true: the project-wide video continuation policy is enabled, the
+target segment has `continue_video: true`, its context index is greater than
+zero, and the matching context latent/cache exists in that project's configured
+directory. Audio continuation is evaluated independently from video: the
+project audio policy, the segment's `continue_audio`, the absence of
+`audio_restart`, and a valid prior audio latent must all allow it. An audio reset
+must never silently turn off video continuation.
+
+For compatibility with older project files, a present `video_continuation: null`
+means "not configured" and must inherit the project's `continuation_mode`.
+Do not emit `video_continuation: null` when a caller needs an explicit policy;
+use `true` or `false`. A first segment (context index `0`) never consumes a
+previous context even if its flags are true. When dual sampling is enabled,
+stage one uses the normal continuation condition; stage two uses no context by
+default and only receives a separately aligned context when its explicit
+second-pass context option is enabled. The final second-pass cache is then the
+preferred source for the next segment when available.
+
+If a result looks identical to an independent generation, inspect the node log
+for the segment's resolved video/audio policy, context index and cache paths,
+then verify the Motion Context audit line reports video keyframes and/or audio
+references. Do not infer that continuation was disabled from visual similarity
+alone.
+
 ## TTS Prompt Rules
 
 For a TTS segment, write a complete audio-directed prompt instead of a short

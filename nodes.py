@@ -227,7 +227,15 @@ def _parse_segment_numbers(value, label):
 
 def _video_context_enabled(plan):
     """Retain legacy plans while allowing transfer plans to split AV policies."""
-    return bool(plan.get("video_continuation", plan.get("continuation_mode", True)))
+    # Newer plan writers may persist the optional split policy as null when
+    # it is not explicitly configured.  ``dict.get(key, fallback)`` does not
+    # use the fallback for an existing null value, so bool(None) accidentally
+    # disabled video continuation for otherwise-enabled projects.  Treat null
+    # as absent and inherit the legacy/global continuation switch.
+    value = plan.get("video_continuation")
+    if value is None:
+        value = plan.get("continuation_mode", True)
+    return bool(value)
 
 
 def _use_previous_video_reference(plan, generation_index: int) -> bool:
@@ -1820,6 +1828,14 @@ class H3AutoDirectorSegment:
         physical = (_align_frames_nearest(target + int(context_length))
                     if use_video else _align_frames(target))
         refs = _segment_reference_specs(plan, generation_index)
+        LOG.info(
+            "H3 Auto Director: 第 %d 段解析：视频上下文=%s，音频上下文=%s，"
+            "上下文序号=%d，上一段视频参考=%s，计划视频开关=%s，片段视频开关=%s",
+            generation_index, "开启" if use_video else "关闭", "开启" if use_audio else "关闭",
+            context_index, "开启" if use_previous_ref else "关闭",
+            "开启" if _video_context_enabled(plan) else "关闭",
+            "开启" if bool(seg.get("continue_video", context_index > 0)) else "关闭",
+        )
         return (_previous_video_prompt(seg.get("prompt", ""), refs), physical, use_video, use_audio,
                 json.dumps(refs, ensure_ascii=False), generation_index,
                 "restart" if restart else "continue", str(unique_id or ""), context_index)
@@ -2421,6 +2437,7 @@ class H3AutoDirectorContext:
         video_enabled = _video_context_enabled(plan)
         audio_enabled = bool(plan.get("continuation_mode", True))
         if int(segment_index) <= 0 or not (video_enabled or audio_enabled):
+            LOG.info("H3 Auto Director: 上下文序号 %d 未启用视频/音频上下文，返回空上下文", int(segment_index))
             return (torch.zeros((1, 1, 1, 3), dtype=torch.float32), {"samples": [torch.zeros((1, 24, 2, 1, 1)), torch.zeros((1, 32, 2, 1))]})
         context_stage = 1 if int(context_stage) == 1 else 2
         video_path, latent_path = _paths(plan, int(segment_index), for_context=True, context_stage=context_stage)
@@ -2428,11 +2445,17 @@ class H3AutoDirectorContext:
             # Projects created before dual-context caches existed remain
             # resumable: use the final cache as the one available source.
             video_path, latent_path = _paths(plan, int(segment_index), for_context=True, context_stage=2)
+            LOG.info("H3 Auto Director: 一采上下文 latent 不存在，回退读取二采上下文：%s", latent_path)
         # Stage-one context intentionally stores the latent first.  Its video
         # preview is optional because latent-direct Motion Context does not
         # need a decoded frame stream; stage two keeps the normal video cache.
         if not latent_path.exists() or (video_enabled and context_stage != 1 and not video_path.exists()):
             raise FileNotFoundError("Missing context cache for segment %d: %s / %s" % (int(segment_index), video_path, latent_path))
+        LOG.info(
+            "H3 Auto Director: 加载上下文序号 %d（阶段%d）：视频=%s，音频=%s，视频缓存=%s，latent缓存=%s",
+            int(segment_index), context_stage, "开启" if video_enabled else "关闭",
+            "开启" if audio_enabled else "关闭", video_path, latent_path,
+        )
         frames = (_load_context_video(video_path) if video_enabled and video_path.exists()
                   else torch.zeros((1, 1, 1, 3), dtype=torch.float32))
         context_latent = _load_av_latent(latent_path)
@@ -2586,14 +2609,31 @@ class H3AutoDirectorMotionContext:
         if not use_video_context:
             if bool(use_audio_context) and context_latent is not None:
                 try:
-                    return with_stage2(self._direct_latent_context(conditioning, latent, context_latent, context_length,
-                                                                    True, use_video_context=False))
+                    result = self._direct_latent_context(conditioning, latent, context_latent, context_length,
+                                                         True, use_video_context=False)
+                    LOG.info("H3 Auto Director: 应用音频上下文（无视频 keyframe），音频 ref=%d，ref_audio_t=%d",
+                             sum(1 for entry in result[0] if isinstance(entry, (list, tuple))
+                                 for value in [entry[1]] if isinstance(value, dict)
+                                 for ref in (value.get("minimax_refs") or [])
+                                 if isinstance(ref, dict) and ref.get("audio_latent") is not None),
+                             int(result[1]))
+                    return with_stage2(result)
                 except (ValueError, RuntimeError) as exc:
                     LOG.info("H3 Auto Director: 音频上下文直取不可用，跳过音频上下文：%s", exc)
             return (self._attach_stage2_context(conditioning, stage2_context), 0)
         if bool(use_video_latent) and context_latent is not None:
             try:
-                return with_stage2(self._direct_latent_context(conditioning, latent, context_latent, context_length, use_audio_context))
+                result = self._direct_latent_context(conditioning, latent, context_latent, context_length, use_audio_context)
+                keyframe_count = sum(1 for entry in result[0] if isinstance(entry, (list, tuple))
+                                     for value in [entry[1]] if isinstance(value, dict)
+                                     for kf in (value.get("minimax_keyframes") or []) if isinstance(kf, dict))
+                audio_count = sum(1 for entry in result[0] if isinstance(entry, (list, tuple))
+                                  for value in [entry[1]] if isinstance(value, dict)
+                                  for ref in (value.get("minimax_refs") or [])
+                                  if isinstance(ref, dict) and ref.get("audio_latent") is not None)
+                LOG.info("H3 Auto Director: 应用 latent 直取上下文：视频 keyframe=%d，音频 ref=%d，context_length=%d",
+                         keyframe_count, audio_count, int(result[1]))
+                return with_stage2(result)
             except ValueError as exc:
                 LOG.info("H3 Auto Director: 视频 latent 直取不可用，回退 VAE 上下文编码：%s", exc)
         cls = nodes.NODE_CLASS_MAPPINGS.get("MiniMaxH3MotionContext")
@@ -2603,6 +2643,8 @@ class H3AutoDirectorMotionContext:
         result = inner.apply(conditioning, vae, latent, context_frames, context_length,
                              "video", "head", "disabled", context_length,
                              "timeline", context_latent if use_audio_context else None, None, None)
+        LOG.info("H3 Auto Director: 应用 VAE 视频上下文：裁剪帧数=%d，音频上下文=%s",
+                 int(result[1]), "开启" if use_audio_context else "关闭")
         return (self._attach_stage2_context(_mark_motion_context(result[0]), stage2_context), result[1])
 
 
