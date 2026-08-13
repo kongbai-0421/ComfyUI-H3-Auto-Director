@@ -12,6 +12,44 @@ ComfyUI/custom_nodes/ComfyUI-H3-Auto-Director
 
 重启 ComfyUI。连续视频上下文依赖 `ComfyUI-H3-Motion-Context`，多模态参考依赖 ComfyUI 中的 `MiniMaxH3ReferenceToVideo`、`VHS_LoadVideo`、核心 `LoadAudio` 和 `ResolutionSelector` 节点。
 
+## H3 音频采样切换
+
+插件内置 `H3 自动导演｜音频采样切换` 节点，不需要额外安装
+`ComfyUI-MiniMax-H3-LegacySampling`。它提供两个实现：
+
+- `ComfyUI v0.31.0版本方法`：使用 AV 音频采样方法。
+- `ComfyUI v0.30.0版本方法`：使用兼容旧版行为的 H3 音频采样方法。
+
+旧工作流中保存的旧版本字符串仍会自动转换为对应的新选项。
+
+把它放在 UNET、LoRA、SageAttention 等模型补丁之后，连接到 `BasicGuider` 和
+`BasicScheduler` 的 `model` 输入。`shift_video` 和 `shift_audio` 默认保持
+`12.00 / 3.00`。每次只使用一个音频采样切换节点；它会输出一个模型供后续两路共同使用。
+当前模式会覆盖上游 H3 调度对象，旧版模式还会安装音频输出转换包装器，因此不应再串联核心
+`ModelSamplingMiniMaxH3` 或另一个 Legacy 节点。工作流文件不会因安装插件而自动修改。
+节点名称为“音频采样切换”，两个模式只改变 H3 音频采样时间尺度，视频 `shift_video` 仍由同一节点控制。
+
+## 注意力加速与 Turbo LoRA
+
+`MiniMax H3 Mem Eff Sage Attention Patch`（Sage Attention）与 `SolAttnPatch`
+（Sol-Attn）都是对同一 H3 模型注意力路径的替换。两者必须二选一：一条模型链中只启用其中一个，
+不要串联，也不要同时解除两者的静音/旁路状态。它们不会叠加加速效果，同时启用会覆盖前一个补丁或造成
+不兼容的注意力状态。需要对比时，用相同模型、提示词、素材、种子和采样参数分别运行。
+
+可选的 H3 Turbo 加速 LoRA 可从
+[lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo/tree/main)
+下载。将其放入 ComfyUI LoRA 目录后，通过标准 `LoraLoaderModelOnly` 接到 UNET 模型链。Turbo LoRA
+可能与带独立音频参考或视频音轨参考的附加时间条件不兼容；遇到 `3 vs 2` tensor 错误时，先断开 Turbo
+LoRA 验证基础 H3 流程。
+
+## 可选混合模型
+
+示例工作流中的“`H3 自动导演｜多模态参考模型加载`”默认关闭“启用 H3 混合模型”，此时只加载 `Ref2VA`，与原工作流行为一致。开启后，节点以 `FL2VA` 为画面基础，并只从 `Ref2VA` 覆盖第 25 至 49 个 DiT Block 的 AdaLN 权重，以尝试兼顾多模态素材遵循与 FL2VA 的画面质量。
+
+请使用同一量化系列、键集合一致的模型对。已验证本机 `*_pruned_int8_convrot.safetensors` 的 FL2VA/Ref2VA 可以配对；`*_pruned_w4a8_mixed.safetensors` 两文件的键集合不同，不能混合。开启混合会在工作流开始时卸载已加载模型以释放内存，因此不要把此节点插入自动接续流程中间。该功能属于实验性模型合并，建议用相同提示词、素材、种子和采样参数分别对比纯 Ref2VA 与混合结果。
+
+“MiniMax H3 Experimental Motion Transfer”中的“动作迁移模型加载”也包含相同开关，默认关闭。动作迁移的参考视频、图片、音频传入方式和后续采样链均不变；仅替换扩散模型权重来源。
+
 ## 工作流接法
 
 工作流 `MiniMax H3 Auto Director.json` 已提供一份可直接打开的连线示例：
@@ -24,6 +62,8 @@ ComfyUI/custom_nodes/ComfyUI-H3-Auto-Director
 ```
 
 分辨率由 `ResolutionSelector` 统一输出宽、高并连接到 H3 参考生成节点。片段设置节点与项目计划直接连接到“MiniMax H3 多模态参考生成｜提示词缓存”；该节点会按当前片段自动加载正确的图片、视频、视频音频和独立音频参考素材。片段设置节点的“片段节点ID”直接连接到自动控制器，不需要手动填写 ID。
+
+`MiniMax H3 Experimental Motion Transfer.json` 与 `MiniMax H3 Experimental TTS.json` 均为实验性工作流，仅用于探索动作迁移和 H3 音频生成编排。不保证模型版本兼容性、生成效果、长序列稳定性或生产可用性；请先用短片段和基础模型验证，再用于实际项目。
 
 ## 片段与参考素材
 
@@ -154,13 +194,16 @@ output/h3_project/<项目文件夹名称>/
 
 ## JSON 提示词技能
 
-仓库包含可供其他模型直接调用的技能：`skills/h3-auto-director-json/SKILL.md`。它会输出能直接粘贴到项目计划节点“片段配置”的 JSON 数组；默认不生成或虚构任何图片、视频、音频素材，每段的 `references` 都为空数组。
+仓库包含可供其他模型直接调用的技能：`skills/h3-auto-director-json/SKILL.md`。它会输出能直接粘贴到项目计划节点“片段配置”的 JSON 数组；默认不生成或虚构任何图片、视频、音频素材，每段的 `references` 都为空数组。技能同时覆盖长视频与 TTS：TTS 使用同样的六段式结构，但会围绕音色、语言、台词、发音、停顿、情绪、环境声和音乐写完整音频时间线；可选 `audio_filename` 只能是唯一的 `.wav` 文件名，不能是目录路径。
 
 技能强制每个片段使用 MiniMax H3 Ref2VA 官方六段式描述：`subject_definitions`、`summary`、`retention_analysis`、`detailed_description`、`overall_soundscape` 和 `non_diegetic_music`。除非用户明确要求极简动作，否则每段都会包含完整镜头、动作过程、环境、镜头运动、声音与收束姿势，而不是只输出“跑步”等简略动作标签。
 
 ### 8. 保存与排错
 
 - 中间片段节点必须接收未裁剪的 AV latent、裁剪后的画面和对应音频。
+- 项目目录为 `output/h3_project/<项目名>/`，其中 `context/` 保存未经最终校色的上下文源，`clips/` 保存校色后的中间片段，`cache/` 保存 AV latent，`final/` 保存最终拼接视频。接续模式只读取 `context/`，旧项目没有该目录时自动回退到 `clips/`。
+- 运动上下文节点默认优先从缓存 AV latent 尾部直取视频 latent；当前片段分辨率不一致时自动回退到画面 VAE 编码路径。该选项可在节点的“使用视频 latent”输入中关闭。
+- “拼接最终视频”节点默认只在所有片段存在、最终文件写入成功且大小大于 0 后清理显存；中间片段保存、拼接失败或暂停时不会清理。可通过“最终视频完成后清理显存”关闭。
 - `fps` 使用数字 `24`，不要填入文本。
 - 输出文件名只控制文件名，不改变项目目录；留空使用 `H3`。
 - 找不到 ffmpeg 时设置 `FFMPEG_PATH`，或安装 `imageio-ffmpeg`。
@@ -168,10 +211,27 @@ output/h3_project/<项目文件夹名称>/
 
 ## 来源与鸣谢
 
-本项目的连续视频上下文功能基于并调用 [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) 提供的节点和实现思路，特别感谢 NikoDemon80 的工作。本仓库没有复制其完整源代码；安装和运行上下文功能时仍需单独安装该项目，并遵守其 GPL-3.0 许可证。
+H3 混合模型加载与 FL2VA/Ref2VA 组合方案参考 [ComfyUI-MiniMax-H3-Hybrid](https://github.com/ANe5s/ComfyUI-MiniMax-H3-Hybrid)，感谢 ANe5s 对 MiniMax H3 混合模型加载和权重组合的探索。本项目仅采用兼容性思路并实现独立的模型合并加载路径，没有复制该项目源代码；使用或再发布相关模型、代码时请遵守上游项目的许可证和条款。
+
+本项目的连续视频上下文功能基于并调用 [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) 提供的节点和实现思路，特别感谢 NikoDemon80 的工作。本仓库没有复制其完整源代码；安装和运行上下文功能时仍需单独安装该项目，并遵守其 GPL-3.0 许可证。视频 latent 直取和音频 payload 组合路径也会在其补丁可用时启用。
+
+高级色彩校正的设计参考了 [ComfyUI-CustomNodeKit](https://github.com/user2318/ComfyUI-CustomNodeKit) 的色彩漂移校正思路；H3 版本采用独立的保守实现，并增加场景切换保护。
+
+音频采样切换节点中的旧版音频调度实现参考 [ComfyUI-MiniMax-H3-LegacySampling](https://github.com/starsFriday/ComfyUI-MiniMax-H3-LegacySampling)，感谢 starsFriday 提供的兼容性实现。本仓库已将该实现内置，使用旧版模式时不需要再安装外部节点；重新发布或修改相关代码时请保留上游署名并遵守其许可证。
 
 MiniMax H3 模型与核心节点属于其各自的项目和许可证。本仓库只提供 ComfyUI 编排、项目管理、参考素材解析、缓存、保存和连续排队逻辑。
 
 ## 许可证
 
 本项目代码以 GPL-3.0-or-later 发布，详见 `LICENSE`。第三方依赖、模型、工作流中引用的输入素材和生成视频不包含在本许可证授权范围内。
+# 参考视频迁移与单流冻结
+
+新增 `H3 自动导演｜动作迁移项目计划`，用于把一个参考动作视频按设定秒数切成多个 H3 片段。点击节点中的“编辑动作迁移计划”，即可集中上传参考动作视频、主体图片和独立音频，并设置统一提示词、每段秒数、音频接续、重新生成音频片段、上段视频参考、最终音频来源、一次性提示词缓存和自动连续生成。节点会按 24 fps 计算段数，最后一段使用剩余时长；参考视频窗口不足 H3 的 `17k+5` 帧网格时只在参考编码侧重复尾帧，不会修改该段的请求时长。提示词在所有片段复用，重新生成音频和上段视频参考使用 1-based 片段编号，支持中文逗号、英文逗号混用。
+
+`H3 视频迁移｜按策略解码` 会始终解码画面；“仅不解码 H3 音频（仍联合采样）”开启时不调用 H3 音频 VAE。最终音频来源可以选择 H3 生成音频，或参考视频的完整音频；选择后者时最终拼接节点会在所有片段拼接完成后一次性替换为原视频音轨，避免逐片段截取造成累计误差；它与“传递参考视频音频”相互独立。
+
+新增 `H3 自动导演｜TTS 项目计划` 和 `H3 TTS｜仅解码音频`。TTS 计划支持图片、视频、音频参考素材，其中图片和视频分组默认折叠，音频分组默认展开；每段可设置独立 WAV 文件名、独立关闭音频接续；视频参考素材下方的“传递音频”开关也按视频单独设置，关闭后只传递视频画面。新增片段或刷新列表时会保留各段参考区域的展开/折叠状态，底部操作栏固定在编辑器底部。旧版全局参考素材字段仍可读取，但已从新版节点界面移除。每段 latent 缓存仍按项目固定编号保存。`拼接最终长音频` 可关闭，关闭时只保留各段 WAV；开启时由 `H3 TTS｜拼接最终音频` 生成一个长 WAV。实验示例为 `example_workflows/MiniMax H3 Experimental TTS.json`。H3 核心节点的宽高接口下限为 `32`，且必须是 32 的倍数；因此该 TTS 实验工作流使用 `32 x 32`，只作为不解码画面的音频实验占位，不代表推荐的视频生成画布。
+
+`MiniMax H3 Experimental Motion Transfer.json` 已简化为动作迁移项目计划、动作迁移模型加载、片段设置、迁移条件、双阶段联合采样、解码保存和自动拼接。`H3 自动导演｜双阶段采样` 会先以低分辨率采样，再在像素空间放大并重新编码视频 latent，保留第一阶段音频 latent 后以较低重绘幅度进行第二次联合采样；放大方式支持普通插值、普通放大模型、RTX Video Super Resolution，以及 RTX 失败后回退普通模型/插值。
+
+双阶段采样推荐从第一阶段 6 步、降噪 1.0，第二阶段 8 步、降噪 0.65 开始。动作迁移与长视频自动导演示例均使用同一 `H3 自动导演｜双采样分辨率` 节点：可用“使用预设比例”或“使用自定义比例”两个开关选择模式；自定义模式输入 `宽,高`，同时支持中文逗号，例如 `2,3` 或 `2，3`。节点会实时预览两阶段对齐后的宽、高和实际 MP。两个开关同时打开时以自定义比例为准，同时关闭时回退到 16:9。

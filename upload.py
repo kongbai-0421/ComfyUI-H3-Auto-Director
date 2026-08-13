@@ -87,7 +87,34 @@ def _resolve_input_file(value):
 
 
 def probe_video_file(path):
-    return {"has_audio": _video_has_audio(_resolve_input_file(path))}
+    resolved = _resolve_input_file(path)
+    result = {"has_audio": _video_has_audio(resolved)}
+    ffprobe = _find_ffprobe()
+    if ffprobe:
+        try:
+            probe = subprocess.run([
+                ffprobe, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate,nb_frames,duration:format=duration",
+                "-of", "json", str(resolved),
+            ], capture_output=True, text=True, timeout=30)
+            import json
+            data = json.loads(probe.stdout or "{}")
+            stream = (data.get("streams") or [{}])[0]
+            duration = float(stream.get("duration") or (data.get("format") or {}).get("duration") or 0.0)
+            rate = str(stream.get("avg_frame_rate") or "24/1")
+            if "/" in rate:
+                numerator, denominator = rate.split("/", 1)
+                source_fps = float(numerator) / max(float(denominator), 1.0)
+            else:
+                source_fps = float(rate)
+            result.update({
+                "duration": duration,
+                "fps": source_fps,
+                "frame_count_24": int(round(duration * 24.0)),
+            })
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+            pass
+    return result
 
 
 def _initial_directory(value, destination):

@@ -1,9 +1,15 @@
 import { app } from "../../scripts/app.js";
 
 const NODE = "H3AutoDirectorPlan";
+const TRANSFER_NODE = "H3AutoDirectorVideoTransferPlan";
+const TRANSFER_LOADER_NODE = "H3AutoDirectorTransferModelLoader";
+const HYBRID_LOADER_NODE = "H3AutoDirectorHybridModelLoader";
+const TTS_NODE = "H3AutoDirectorTTSPlan";
 const SEGMENT_NODE = "H3AutoDirectorSegment";
 const REFERENCE_NODE = "H3AutoDirectorReferenceResolver";
 const CACHED_REFERENCE_NODE = "H3AutoDirectorCachedReferenceToVideo";
+const DUAL_SAMPLING_NODE = "H3AutoDirectorDualSampling";
+const AV_DECODE_NODE = "H3AutoDirectorAVDecode";
 const CONTEXT_NODE = "H3AutoDirectorContext";
 const RESUME_NODE = "H3AutoDirectorResumeContext";
 const MOTION_CONTEXT_NODE = "H3AutoDirectorMotionContext";
@@ -11,9 +17,11 @@ const MOTION_TRIM_NODE = "MiniMaxH3MotionContextTrim";
 const MOTION_SAVE_LATENT_NODE = "MiniMaxH3MotionContextSaveLatent";
 const MOTION_LOAD_LATENT_NODE = "MiniMaxH3MotionContextLoadLatent";
 const RESOLUTION_NODE = "ResolutionSelector";
+const H3_RESOLUTION_NODE = "H3AutoDirectorResolution";
 const SAVE_NODE = "H3AutoDirectorSaveSegment";
 const CONTROLLER_NODE = "H3AutoDirectorController";
-const H3_NODE_CLASSES = new Set([NODE, SEGMENT_NODE, REFERENCE_NODE, CACHED_REFERENCE_NODE, CONTEXT_NODE, RESUME_NODE, MOTION_CONTEXT_NODE, MOTION_TRIM_NODE, MOTION_SAVE_LATENT_NODE, MOTION_LOAD_LATENT_NODE, RESOLUTION_NODE, SAVE_NODE, CONTROLLER_NODE]);
+const SAMPLING_SWITCH_NODE = "H3AutoDirectorSamplingSwitch";
+const H3_NODE_CLASSES = new Set([NODE, TRANSFER_NODE, TRANSFER_LOADER_NODE, HYBRID_LOADER_NODE, TTS_NODE, SEGMENT_NODE, REFERENCE_NODE, CACHED_REFERENCE_NODE, DUAL_SAMPLING_NODE, AV_DECODE_NODE, CONTEXT_NODE, RESUME_NODE, MOTION_CONTEXT_NODE, MOTION_TRIM_NODE, MOTION_SAVE_LATENT_NODE, MOTION_LOAD_LATENT_NODE, RESOLUTION_NODE, H3_RESOLUTION_NODE, SAVE_NODE, CONTROLLER_NODE, SAMPLING_SWITCH_NODE]);
 const MAX_REFS = { image: 9, video: 3, audio: 3 };
 const MAX_TOTAL_REFS = 12;
 const DIR_KEY = "h3-auto-director-picker-dirs";
@@ -52,10 +60,12 @@ function writePickerOptions(options) {
 
 function normalizeSegment(value) {
   const seg = value && typeof value === "object" ? value : {};
-  return {
+  const normalized = {
     prompt: String(seg.prompt || ""),
     duration: Number(seg.duration) || 5,
+    audio_filename: String(seg.audio_filename || ""),
     audio_restart: !!seg.audio_restart,
+    continue_audio: seg.continue_audio !== false,
     continue_video: seg.continue_video !== false,
     references: Array.isArray(seg.references) ? seg.references.map((ref) => {
       if (typeof ref === "string") return { type: "image", name: ref, path: ref };
@@ -67,6 +77,10 @@ function normalizeSegment(value) {
       return normalized;
     }) : [],
   };
+  if (Object.prototype.hasOwnProperty.call(seg, "use_previous_video_reference")) {
+    normalized.use_previous_video_reference = !!seg.use_previous_video_reference;
+  }
+  return normalized;
 }
 
 function normalizeSegments(value) {
@@ -86,7 +100,14 @@ function readSegments(node) {
 function writeSegments(node, segments) {
   const w = widget(node, "segments_json");
   if (!w) return;
-  w.value = JSON.stringify(segments, null, 2);
+  const saved = segments.map((segment) => {
+    const copy = { ...segment };
+    delete copy._references_open;
+    delete copy._media_references_open;
+    delete copy._audio_references_open;
+    return copy;
+  });
+  w.value = JSON.stringify(saved, null, 2);
   w.callback?.(w.value);
   const globalAssets = widget(node, "global_assets_json");
   if (globalAssets) {
@@ -149,6 +170,16 @@ async function probeVideoAudio(path) {
   try { result = await response.json(); } catch (_) { /* handled below */ }
   if (!response.ok) throw new Error(result.error || `视频音轨检测失败（${response.status}）`);
   return result.has_audio === true;
+}
+
+async function probeVideoInfo(path) {
+  const response = await fetch("/h3_auto_director/video_info", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }),
+  });
+  let result = {};
+  try { result = await response.json(); } catch (_) { /* handled below */ }
+  if (!response.ok) throw new Error(result.error || `视频信息读取失败（${response.status}）`);
+  return result;
 }
 
 async function uploadOne(file, type) {
@@ -232,12 +263,30 @@ function applyChineseLabels(node) {
     clip: "文本编码器", vae: "视频 VAE", audio_vae: "音频 VAE", width: "宽度", height: "高度", length: "帧数",
     ref_image_size: "参考图片尺寸", enable_resume: "启用断点续接", latent_path: "缓存潜变量路径", video_path: "缓存视频路径",
     conditioning: "条件", latent: "潜变量", context_frames: "上下文画面", context_latent: "上下文潜变量",
-    use_video_context: "使用视频上下文", use_audio_context: "使用音频上下文", fps: "帧率", images: "视频画面",
-    audio: "音频", saved_video: "已保存视频", segment_node_id: "片段节点 ID", trim_frames: "裁剪帧数", match_tail: "匹配音频尾部",
+    use_video_context: "使用视频上下文", use_audio_context: "使用音频上下文", use_video_latent: "使用视频潜空间",
+    fps: "帧率", images: "视频画面",
+    audio: "音频", saved_video: nodeClass === "H3AutoDirectorTTSController" ? "已保存音频" : "已保存视频", segment_node_id: "片段节点 ID", trim_frames: "裁剪帧数", match_tail: "匹配音频尾部",
     clip_index: "片段序号", latent_path: "潜变量路径",
     aspect_ratio: "宽高比", megapixels: "目标像素数（MP）", multiple: "尺寸倍数",
-    output_root: nodeClass === SAVE_NODE ? "输出文件名（中间片段，留空使用 H3）" : nodeClass === CONTROLLER_NODE ? "输出文件名（最终视频，留空使用 H3）" : "项目文件夹名称（保存于 output/h3_project 下）",
+    use_preset_ratio: "使用预设比例", use_custom_ratio: "使用自定义比例", aspect_preset: "宽高比预设", custom_ratio: "自定义比例（宽,高）",
+    stage1_megapixels: "第一阶段像素数（MP）", stage2_megapixels: "第二阶段像素数（MP）",
+    resolution_preview: "当前输出分辨率",
+    output_root: nodeClass === SAVE_NODE ? "输出文件名（中间片段，留空使用 H3）" : nodeClass === CONTROLLER_NODE ? "输出文件名（最终视频，留空使用 H3）" : nodeClass === "H3AutoDirectorTTSController" ? "最终长 WAV 文件名（留空使用 H3）" : "项目文件夹名称（保存于 output/h3_project 下）",
     video_format: "视频格式", video_codec: "编码格式", encoder_device: "编码设备", quality: "编码质量", color_correction: "上下文色彩校正",
+    scene_cut_protection: "场景切换保护", scene_cut_threshold: "场景切换阈值",
+    correction_strength: "校色强度", residual_strength: "残余漂移强度",
+    cleanup_after_final: "最终完成后清理显存", sampling_mode: "音频采样切换",
+    stage1_steps: "第一阶段步数", stage1_denoise: "第一阶段降噪", enable_stage2: "启用第二阶段采样", stage2_use_context: "二采使用上下文接续", stage2_steps: "第二阶段步数", stage2_denoise: "第二阶段降噪",
+    upscale_mode: "视频放大方式", target_width: "第二阶段宽度", target_height: "第二阶段高度", upscale_model: "普通放大模型", seed: "双采样种子",
+    shift_video: "视频调度偏移", shift_audio: "音频调度偏移",
+    unet_name: nodeClass === HYBRID_LOADER_NODE || nodeClass === TRANSFER_LOADER_NODE ? "多模态参考模型（Ref2VA）" : "扩散模型",
+    base_model: "画面基础模型（FL2VA）", enable_hybrid: "启用 H3 混合模型", weight_dtype: "权重数据类型",
+    reference_video_json: "参考动作视频", reference_assets_json: "附加参考素材",
+    segment_seconds: "每段秒数", pass_reference_video_audio: "传递参考视频音频",
+    enable_audio_continuation: "开启音频上下文接续", audio_restart_segments: "重新生成音频片段",
+    previous_video_reference_segments: "使用上段视频参考片段", skip_h3_audio_decode: "仅不解码 H3 音频（仍联合采样）",
+    final_audio_source: "最终视频音频来源", edit_transfer: "编辑动作迁移计划",
+    concat_final_audio: "拼接最终长音频", edit_tts: "编辑 TTS 片段",
   };
   const apply = (item) => {
     const label = labels[item?.name];
@@ -258,6 +307,17 @@ function decorateNode(node) {
     button.label = "编辑片段";
     button.serialize = false;
   }
+  if (nodeClass === TRANSFER_NODE && !widget(node, "edit_transfer")) {
+    const button = node.addWidget("button", "edit_transfer", "编辑动作迁移计划", () => openTransferEditor(node));
+    button.label = "编辑动作迁移计划";
+    button.serialize = false;
+  }
+  if (nodeClass === TTS_NODE && !widget(node, "edit_tts")) {
+    const button = node.addWidget("button", "edit_tts", "编辑 TTS 片段", () => openTTSPlanEditor(node));
+    button.label = "编辑 TTS 片段";
+    button.serialize = false;
+  }
+  if (nodeClass === H3_RESOLUTION_NODE) decorateH3Resolution(node);
   const labels = {
     project_id: "总文件夹名称",
     segments_json: "片段配置",
@@ -273,6 +333,26 @@ function decorateNode(node) {
     encoder_device: "编码设备",
     quality: "编码质量",
     color_correction: "上下文色彩校正",
+    use_video_latent: "使用视频潜空间",
+    scene_cut_protection: "场景切换保护",
+    scene_cut_threshold: "场景切换阈值",
+    correction_strength: "校色强度",
+    residual_strength: "残余漂移强度",
+    cleanup_after_final: "最终完成后清理显存",
+    sampling_mode: "音频采样切换",
+    shift_video: "视频调度偏移",
+    shift_audio: "音频调度偏移",
+    reference_video_json: "参考视频素材",
+    reference_assets_json: "参考素材",
+    segment_seconds: "每段秒数",
+    pass_reference_video_audio: "传递参考视频音频",
+    enable_audio_continuation: "开启音频上下文接续",
+    audio_restart_segments: "重新生成音频片段",
+    previous_video_reference_segments: "使用上段视频参考片段",
+    skip_h3_audio_decode: "仅不解码 H3 音频（仍联合采样）",
+    final_audio_source: "最终视频音频来源",
+    concat_final_audio: "拼接最终长音频",
+    edit_tts: "编辑 TTS 片段",
   };
   applyChineseLabels(node);
   if (nodeClass === SAVE_NODE) {
@@ -281,8 +361,240 @@ function decorateNode(node) {
     if (output && String(output.value || "").trim() === "h3_projects") { output.value = ""; output.callback?.(output.value); }
   }
   normalizeSaveFps(node);
-  if (nodeClass === NODE) node.setSize([900, 360]);
-  if (nodeClass === SAVE_NODE || nodeClass === CONTROLLER_NODE) node.setSize([430, 320]);
+}
+
+function h3ResolutionValue(node, name, fallback) {
+  const value = widget(node, name)?.value;
+  return value === undefined || value === null || value === "" ? fallback : value;
+}
+
+function h3BooleanValue(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "string") return !["false", "0", "off", "关闭"].includes(value.trim().toLowerCase());
+  return Boolean(value);
+}
+
+function calculateH3Resolution(ratioWidth, ratioHeight, megapixels, multiple) {
+  const ratio = Math.max(1, Number(ratioWidth) || 1) / Math.max(1, Number(ratioHeight) || 1);
+  const alignment = Math.max(1, Math.trunc(Number(multiple) || 32));
+  const targetPixels = Math.max(0.2, Math.min(5, Number(megapixels) || 0.2)) * 1024 * 1024;
+  let width = Math.max(alignment, Math.round(Math.sqrt(targetPixels * ratio) / alignment) * alignment);
+  let height = Math.max(alignment, Math.round((Math.sqrt(targetPixels * ratio) / ratio) / alignment) * alignment);
+  const maxDimension = Math.max(alignment, Math.floor(16384 / alignment) * alignment);
+  if (Math.max(width, height) > maxDimension) {
+    const scale = maxDimension / Math.max(width, height);
+    width = Math.max(alignment, Math.round(width * scale / alignment) * alignment);
+    height = Math.max(alignment, Math.round(height * scale / alignment) * alignment);
+  }
+  return { width, height, megapixels: (width * height / 1000000).toFixed(2) };
+}
+
+function decorateH3Resolution(node) {
+  const presets = { "16:9": [16, 9], "9:16": [9, 16], "1:1": [1, 1], "4:3": [4, 3], "3:4": [3, 4], "3:2": [3, 2], "2:3": [2, 3], "21:9": [21, 9] };
+  let preview = widget(node, "resolution_preview");
+  if (!preview) {
+    preview = node.addWidget("text", "resolution_preview", "", () => {});
+    preview.label = "当前输出分辨率";
+    preview.serialize = false;
+    preview.options = { multiline: true };
+  }
+  const updatePreview = () => {
+    const presetEnabled = h3BooleanValue(h3ResolutionValue(node, "use_preset_ratio", true), true);
+    const customEnabled = h3BooleanValue(h3ResolutionValue(node, "use_custom_ratio", false), false);
+    const preset = String(h3ResolutionValue(node, "aspect_preset", "16:9"));
+    const ratioText = String(h3ResolutionValue(node, "custom_ratio", "16,9")).replace(/，/g, ",");
+    const custom = ratioText.split(",").map((part) => Number(part.trim()));
+    const ratio = customEnabled && custom.length === 2 && custom.every((value) => Number.isFinite(value) && value > 0)
+      ? custom : (presets[preset] || [16, 9]);
+    const first = calculateH3Resolution(ratio[0], ratio[1], h3ResolutionValue(node, "stage1_megapixels", 0.4), h3ResolutionValue(node, "multiple", 32));
+    const second = calculateH3Resolution(ratio[0], ratio[1], h3ResolutionValue(node, "stage2_megapixels", 0.98), h3ResolutionValue(node, "multiple", 32));
+    const selectedText = customEnabled ? `${ratio[0]}:${ratio[1]}` : (presetEnabled ? preset : "16:9");
+    preview.value = `第一阶段：${first.width} x ${first.height}（${first.megapixels} MP）\n第二阶段：${second.width} x ${second.height}（${second.megapixels} MP）\n比例：${selectedText}`;
+    const presetWidget = widget(node, "aspect_preset");
+    const customWidget = widget(node, "custom_ratio");
+    if (presetWidget) presetWidget.hidden = customEnabled || !presetEnabled;
+    if (customWidget) customWidget.hidden = !customEnabled;
+    node.setDirtyCanvas(true, true);
+  };
+  if (!node.__h3ResolutionPreviewBound) {
+    node.__h3ResolutionPreviewBound = true;
+    ["use_preset_ratio", "use_custom_ratio", "aspect_preset", "custom_ratio", "stage1_megapixels", "stage2_megapixels", "multiple"].forEach((name) => {
+      const input = widget(node, name);
+      if (!input) return;
+      const previous = input.callback;
+      input.callback = function (value, ...args) {
+        if (name === "use_preset_ratio" && h3BooleanValue(value)) {
+          const custom = widget(node, "use_custom_ratio");
+          if (custom) { custom.value = false; custom.callback?.(false); }
+        } else if (name === "use_custom_ratio" && h3BooleanValue(value)) {
+          const preset = widget(node, "use_preset_ratio");
+          if (preset) { preset.value = false; preset.callback?.(false); }
+        }
+        const result = previous?.call(this, value, ...args);
+        requestAnimationFrame(updatePreview);
+        return result;
+      };
+    });
+  }
+  updatePreview();
+}
+
+function openTTSPlanEditor(node) {
+  const get = (name, fallback) => { const value = widget(node, name)?.value; return value === undefined || value === null ? fallback : value; };
+  const set = (name, value) => { const item = widget(node, name); if (item) { item.value = value; item.callback?.(value); } };
+  let segments = [], legacyVideo = {}, legacyAssets = [];
+  try { segments = JSON.parse(get("segments_json", "[]") || "[]"); } catch (_) { segments = []; }
+  try { legacyVideo = JSON.parse(get("reference_video_json", "{}") || "{}"); } catch (_) { legacyVideo = {}; }
+  try { legacyAssets = JSON.parse(get("reference_assets_json", "[]") || "[]"); } catch (_) { legacyAssets = []; }
+  if (!Array.isArray(segments) || !segments.length) segments = [{ prompt: "", duration: 5, audio_filename: "", continue_audio: true, references: [] }];
+  const legacyRefs = [...(Array.isArray(legacyAssets) ? legacyAssets : [])];
+  if (legacyVideo?.path || legacyVideo?.name) legacyRefs.push({ ...legacyVideo, type: "video", video_audio_enabled: get("pass_reference_video_audio", false) });
+  // Migrate only rows that truly lack the new per-segment field. An explicit
+  // empty array is meaningful and must remain empty when unified references
+  // are disabled, even though the compatibility field may contain assets.
+  segments.forEach((seg) => {
+    if (!("references" in seg)) {
+      seg.references = legacyRefs.map((ref) => ({ ...ref }));
+    }
+  });
+  const shade = document.createElement("div"); shade.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:10000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif";
+  const panel = document.createElement("div"); panel.style.cssText = "width:min(1120px,95vw);height:min(860px,92vh);max-height:92vh;box-sizing:border-box;resize:both;overflow:hidden;background:#20252b;color:#eee;border:1px solid #59636e;border-radius:8px;padding:18px;display:flex;flex-direction:column";
+  const title = document.createElement("h2"); title.textContent = "H3 自动导演｜TTS 片段计划"; title.style.margin = "0 0 12px"; panel.appendChild(title);
+  const notice = document.createElement("div"); notice.style.cssText = "color:#aeb7c1;font-size:12px;min-height:22px"; panel.appendChild(notice);
+  const settings = document.createElement("div"); settings.style.cssText = "display:flex;flex-wrap:wrap;gap:12px;padding:10px;background:#15191d;border:1px solid #424b55;border-radius:6px;margin-bottom:12px"; panel.appendChild(settings);
+  const checkbox = (label, name, fallback) => { const wrap = document.createElement("label"); wrap.style.cssText = "display:flex;align-items:center;gap:6px"; const input = document.createElement("input"); input.type = "checkbox"; input.checked = !!get(name, fallback); wrap.append(input, label); settings.appendChild(wrap); return input; };
+  const unified = checkbox("统一参考集（所有片段使用第 1 段素材）", "global_reference_set", false);
+  const concat = checkbox("拼接最终长音频", "concat_final_audio", true);
+  const continuation = checkbox("开启音频上下文接续", "enable_audio_continuation", true);
+  const cache = checkbox("一次性缓存提示词向量", "cache_prompt_embeddings", true);
+  const list = document.createElement("div"); list.style.cssText = "display:flex;flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;flex-direction:column;gap:10px;padding:0 6px 10px 0"; panel.appendChild(list);
+  const refName = (ref) => ref.originalName || ref.name || ref.path || "未命名素材";
+  const refLabel = (ref, type, refs) => { const ordinal = refs.filter((x) => x.type === type).indexOf(ref) + 1; return `${type === "image" ? "图片" : type === "video" ? "视频" : "音频"}${ordinal}：${refName(ref)}`; };
+  const addFiles = async (seg, type, renderRefs) => {
+    const options = readPickerOptions(); let selected = [];
+    if (options.mode === "python") selected = await selectFilesWithPython(type, readDirectories()[type], options.useDefaultPath);
+    else { const input = document.createElement("input"); input.type = "file"; input.multiple = true; input.accept = type === "image" ? "image/*" : type === "video" ? "video/*" : "audio/*"; selected = await new Promise((resolve) => { input.onchange = () => resolve(Array.from(input.files || [])); input.click(); }); }
+    const refs = seg.references || (seg.references = []);
+    if (refs.length + selected.length > MAX_TOTAL_REFS) throw new Error(`每段参考素材最多 ${MAX_TOTAL_REFS} 个`);
+    if (refs.filter((x) => x.type === type).length + selected.length > MAX_REFS[type]) throw new Error(`${type === "image" ? "图片" : type === "video" ? "视频" : "音频"}参考最多 ${MAX_REFS[type]} 个`);
+    if (type === "video" && selected.length + refs.filter((x) => x.type === "video").length > 3) throw new Error("视频参考最多 3 个");
+    for (const item of selected) refs.push(item instanceof File ? await uploadOne(item, type) : item);
+    renderRefs();
+  };
+  const render = () => {
+    list.replaceChildren();
+    segments.forEach((seg, index) => {
+      if (!Array.isArray(seg.references)) seg.references = [];
+      const box = document.createElement("div"); box.style.cssText = "padding:10px;background:#15191d;border:1px solid #424b55;border-radius:6px";
+      const head = document.createElement("div"); head.textContent = `片段 ${index + 1}`; head.style.fontWeight = "600"; box.appendChild(head);
+      const prompt = document.createElement("textarea"); prompt.value = String(seg.prompt || ""); prompt.placeholder = "H3 TTS 完整提示词"; prompt.style.cssText = "width:100%;min-height:70px;box-sizing:border-box;margin-top:7px;background:#20252b;color:#eee;border:1px solid #59636e;padding:7px"; prompt.oninput = () => { seg.prompt = prompt.value; }; box.appendChild(prompt);
+      const controls = document.createElement("div"); controls.style.cssText = "display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:7px";
+      const duration = document.createElement("input"); duration.type = "number"; duration.min = "4"; duration.max = "15"; duration.step = "0.1"; duration.value = Number(seg.duration) || 5; duration.style.width = "80px"; duration.oninput = () => { seg.duration = Number(duration.value) || 5; };
+      const filename = document.createElement("input"); filename.type = "text"; filename.value = String(seg.audio_filename || ""); filename.placeholder = `H3_${String(index + 1).padStart(5, "0")}.wav`; filename.style.cssText = "width:250px;background:#20252b;color:#eee;border:1px solid #59636e;padding:5px"; filename.oninput = () => { seg.audio_filename = filename.value; };
+      controls.append("秒数", duration, "音频文件名", filename); if (segments.length > 1) controls.appendChild(makeButton("删除片段", () => { segments.splice(index, 1); render(); })); box.appendChild(controls);
+      const details = document.createElement("details"); details.open = seg._media_references_open === true; details.ontoggle = () => { seg._media_references_open = details.open; }; details.style.cssText = "margin-top:9px;padding:8px;background:#20252b;border:1px solid #59636e;border-radius:5px"; const summary = document.createElement("summary"); summary.textContent = `图片/视频参考（${seg.references.filter((r) => r.type === "image" || r.type === "video").length}）`; summary.style.cursor = "pointer"; details.appendChild(summary);
+      const mediaList = document.createElement("div"); mediaList.style.cssText = "display:flex;flex-direction:column;gap:6px;margin-top:8px";
+      const audioDetails = document.createElement("details"); audioDetails.open = seg._audio_references_open !== false; audioDetails.ontoggle = () => { seg._audio_references_open = audioDetails.open; }; audioDetails.style.cssText = "margin-top:8px;padding:8px;background:#20252b;border:1px solid #59636e;border-radius:5px"; const audioSummary = document.createElement("summary"); audioSummary.textContent = `音频参考（${seg.references.filter((r) => r.type === "audio").length}）`; audioSummary.style.cursor = "pointer"; audioDetails.appendChild(audioSummary); const audioList = document.createElement("div"); audioList.style.cssText = "display:flex;flex-direction:column;gap:6px;margin-top:8px"; audioDetails.appendChild(audioList);
+      const audioContinuation = document.createElement("label"); audioContinuation.style.cssText = "display:flex;align-items:center;gap:6px;margin-top:8px;font-size:12px;color:#d6dde5"; const audioContinuationInput = document.createElement("input"); audioContinuationInput.type = "checkbox"; audioContinuationInput.checked = seg.continue_audio === false; audioContinuationInput.onchange = () => { seg.continue_audio = !audioContinuationInput.checked; }; audioContinuation.append(audioContinuationInput, "关闭本段音频接续"); box.appendChild(audioContinuation);
+      const renderRefs = () => {
+        const editable = !unified.checked || index === 0;
+        mediaList.replaceChildren(); audioList.replaceChildren();
+        if (!editable) { mediaList.append("统一参考集已开启，素材来自第 1 段。"); audioList.append("统一参考集已开启，素材来自第 1 段。"); }
+        const refs = unified.checked && index > 0 ? segments[0].references : seg.references;
+        refs.forEach((ref) => {
+          const type = ref.type; if (type !== "image" && type !== "video" && type !== "audio") return;
+          const row = document.createElement("div"); row.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px;background:#15191d;border:1px solid #424b55;border-radius:4px";
+          row.append(refLabel(ref, type, refs)); if (type === "video" && ref.has_audio === true) { const toggle = document.createElement("label"); toggle.style.cssText = "margin-left:auto;display:flex;align-items:center;gap:4px;font-size:12px"; const input = document.createElement("input"); input.type = "checkbox"; input.checked = ref.video_audio_enabled !== false; input.disabled = !editable; input.onchange = () => { ref.video_audio_enabled = input.checked; renderRefs(); }; toggle.append(input, "传递音频"); row.appendChild(toggle); }
+          if (editable) row.appendChild(makeButton("删除", () => { seg.references.splice(seg.references.indexOf(ref), 1); renderRefs(); }));
+          (type === "audio" ? audioList : mediaList).appendChild(row);
+        });
+        summary.textContent = `图片/视频参考（${refs.filter((r) => r.type === "image" || r.type === "video").length}）`; audioSummary.textContent = `音频参考（${refs.filter((r) => r.type === "audio").length}）`;
+      };
+      details.appendChild(makeButton("+ 添加图片", () => editableOrNotice(unified, index, () => addFiles(seg, "image", renderRefs), notice)));
+      details.appendChild(makeButton("+ 添加视频", () => editableOrNotice(unified, index, () => addFiles(seg, "video", renderRefs), notice)));
+      details.appendChild(mediaList); audioDetails.appendChild(makeButton("+ 添加音频参考", () => editableOrNotice(unified, index, () => addFiles(seg, "audio", renderRefs), notice))); audioDetails.appendChild(audioList); box.append(details, audioDetails); list.appendChild(box); renderRefs();
+    });
+  };
+  const editableOrNotice = (flag, index, fn, message) => { if (flag.checked && index > 0) { message.textContent = "统一参考集已开启，请编辑第 1 段或关闭统一参考集。"; return; } Promise.resolve(fn()).catch((error) => { message.textContent = error.message || String(error); }); };
+  unified.onchange = render;
+  const actions = document.createElement("div"); actions.style.cssText = "flex:0 0 auto;display:flex;justify-content:flex-end;gap:8px;margin:14px -18px -18px;padding:12px 18px;background:rgba(32,37,43,.98);border-top:1px solid #59636e";
+  actions.append(makeButton("+ 添加片段", () => { segments.push({ prompt: "", duration: 5, audio_filename: "", audio_restart: false, continue_audio: continuation.checked, references: [], _media_references_open: false, _audio_references_open: true }); render(); }), makeButton("将第 1 段参考素材应用到全部", () => { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); unified.checked = true; render(); }), makeButton("取消", () => shade.remove()), makeButton("保存", () => { const names = new Set(); for (const seg of segments) { if (Number(seg.duration) < 4 || Number(seg.duration) > 15) { notice.textContent = "每段时长必须在 4 到 15 秒之间。"; return; } const name = String(seg.audio_filename || "").trim(); if (name && !name.toLowerCase().endsWith(".wav")) { notice.textContent = "音频文件名必须使用 .wav 扩展名。"; return; } if (name && names.has(name.toLowerCase())) { notice.textContent = `音频文件名重复：${name}`; return; } if (name) names.add(name.toLowerCase()); } if (unified.checked) { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); } const savedSegments = segments.map((seg) => { const copy = { ...seg }; delete copy._media_references_open; delete copy._audio_references_open; return copy; }); set("segments_json", JSON.stringify(savedSegments, null, 2)); set("global_reference_set", unified.checked); set("cache_prompt_embeddings", cache.checked); set("enable_audio_continuation", continuation.checked); set("concat_final_audio", concat.checked); node.setDirtyCanvas(true, true); shade.remove(); }));
+  panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade); render();
+}
+
+function openTransferEditor(node) {
+  const get = (name, fallback) => {
+    const value = widget(node, name)?.value;
+    return value === undefined || value === null ? fallback : value;
+  };
+  let video = {};
+  let assets = [];
+  try { video = JSON.parse(get("reference_video_json", "{}") || "{}"); } catch (_) { video = {}; }
+  try { assets = JSON.parse(get("reference_assets_json", "[]") || "[]"); } catch (_) { assets = []; }
+  const set = (name, value) => { const item = widget(node, name); if (item) { item.value = value; item.callback?.(value); } };
+  const shade = document.createElement("div");
+  shade.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:10000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif";
+  const panel = document.createElement("div");
+  panel.style.cssText = "width:min(920px,94vw);height:min(760px,90vh);resize:both;overflow:auto;background:#20252b;color:#eee;border:1px solid #59636e;border-radius:8px;padding:18px;box-shadow:0 16px 60px #000";
+  const title = document.createElement("h2"); title.textContent = "H3 自动导演｜动作迁移项目计划"; title.style.margin = "0 0 12px"; panel.appendChild(title);
+  const notice = document.createElement("div"); notice.style.cssText = "color:#aeb7c1;font-size:12px;min-height:22px;margin:6px 0"; panel.appendChild(notice);
+  const summary = document.createElement("div"); summary.style.cssText = "padding:10px;background:#15191d;border:1px solid #424b55;border-radius:6px;margin-bottom:12px;line-height:1.6"; panel.appendChild(summary);
+  const refreshSummary = () => {
+    const seconds = Number(get("segment_seconds", 5)) || 5;
+    const duration = Number(video.duration || 0);
+    const count = duration > 0 ? Math.ceil(duration / seconds) : 0;
+    summary.textContent = video.path ? `参考视频：${video.originalName || video.name || video.path}｜时长：${formatDuration(duration)}｜按 ${seconds.toFixed(2)} 秒/段：${count || "等待读取"} 段` : "尚未上传参考视频";
+  };
+  const row = (label, control) => { const wrap = document.createElement("label"); wrap.style.cssText = "display:flex;align-items:center;gap:8px;margin:8px 0"; wrap.append(label, control); panel.appendChild(wrap); return control; };
+  const prompt = document.createElement("textarea"); prompt.value = get("prompt", ""); prompt.style.cssText = "width:100%;min-height:100px;box-sizing:border-box;background:#15191d;color:#eee;border:1px solid #59636e;padding:8px"; prompt.placeholder = "所有片段复用的 H3 完整提示词"; panel.appendChild(prompt);
+  const seconds = document.createElement("input"); seconds.type = "number"; seconds.min = "4"; seconds.max = "15"; seconds.step = "0.1"; seconds.value = get("segment_seconds", 5); seconds.style.width = "110px"; seconds.oninput = refreshSummary; row("每段秒数", seconds);
+  const checkbox = (label, name, checked) => { const input = document.createElement("input"); input.type = "checkbox"; input.checked = !!get(name, checked); row(label, input); return input; };
+  const passAudio = checkbox("传递参考视频音频", "pass_reference_video_audio", false);
+  const audioCont = checkbox("开启音频上下文接续", "enable_audio_continuation", true);
+  const cachePrompts = checkbox("一次性缓存全部片段的提示词向量", "cache_prompt_embeddings", true);
+  const autoRun = checkbox("自动连续生成并在最后拼接", "auto_run", true);
+  const skipDecode = checkbox("仅不解码 H3 音频（仍联合采样）", "skip_h3_audio_decode", false);
+  const audioMode = document.createElement("select"); audioMode.innerHTML = "<option>H3 生成音频</option><option>参考视频音频</option>"; audioMode.value = get("final_audio_source", "H3 生成音频"); row("最终视频音频来源", audioMode);
+  const restart = document.createElement("input"); restart.type = "text"; restart.value = get("audio_restart_segments", ""); restart.placeholder = "例如 3，6,9"; restart.style.width = "220px"; row("重新生成音频片段", restart);
+  const previous = document.createElement("input"); previous.type = "text"; previous.value = get("previous_video_reference_segments", ""); previous.placeholder = "例如 2,5"; previous.style.width = "220px"; row("使用上段视频参考片段", previous);
+  const assetList = document.createElement("div"); assetList.style.cssText = "display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin:12px 0"; panel.appendChild(assetList);
+  const renderAssets = () => { assetList.replaceChildren(); assets.forEach((asset, index) => { const item = document.createElement("div"); item.style.cssText = "padding:8px;background:#15191d;border:1px solid #424b55;border-radius:5px;display:flex;justify-content:space-between;gap:8px"; item.append(`${asset.type === "image" ? "图片" : "音频"}${index + 1}：${asset.originalName || asset.name}`); const remove = makeButton("删除", () => { assets.splice(index, 1); renderAssets(); }); item.appendChild(remove); assetList.appendChild(item); }); };
+  const add = async (type) => {
+    try {
+      let selected = [];
+      const options = readPickerOptions();
+      if (options.mode === "python") selected = await selectFilesWithPython(type, readDirectories()[type], options.useDefaultPath);
+      else {
+        const input = document.createElement("input"); input.type = "file"; input.multiple = true; input.accept = type === "image" ? "image/*" : "audio/*";
+        selected = await new Promise((resolve) => { input.onchange = () => resolve(Array.from(input.files || [])); input.click(); });
+      }
+      const uploaded = [];
+      for (const item of selected) uploaded.push(item instanceof File ? await uploadOne(item, type) : item);
+      if (assets.length + uploaded.length > 11) throw new Error("附加图片与音频参考最多 11 个（另有 1 个专用参考视频）");
+      assets.push(...uploaded); renderAssets(); notice.textContent = `已按选择顺序添加 ${uploaded.length} 个${type === "image" ? "图片" : "音频"}参考。`;
+    } catch (error) { notice.textContent = error.message || String(error); }
+  };
+  const assetButtons = document.createElement("div"); assetButtons.append(makeButton("+ 添加图片", () => add("image")), makeButton("+ 添加音频", () => add("audio"))); panel.appendChild(assetButtons);
+  const uploadVideo = async () => {
+    try {
+      let selected = [];
+      const options = readPickerOptions();
+      if (options.mode === "python") selected = await selectFilesWithPython("video", readDirectories().video, options.useDefaultPath);
+      else { const input = document.createElement("input"); input.type = "file"; input.accept = "video/*"; selected = await new Promise((resolve) => { input.onchange = () => resolve(Array.from(input.files || []).slice(0, 1)); input.click(); }); }
+      if (!selected.length) return;
+      const uploaded = selected[0] instanceof File ? await uploadOne(selected[0], "video") : selected[0];
+      const info = await probeVideoInfo(uploaded.path || uploaded.name);
+      video = { ...uploaded, ...info, frame_count_24: info.frame_count_24 || Math.round(Number(info.duration || 0) * 24) };
+      refreshSummary(); notice.textContent = "参考视频已上传；分段数量会按视频时长和每段秒数自动计算。";
+    } catch (error) { notice.textContent = error.message || String(error); }
+  };
+  panel.appendChild(makeButton(video.path ? "重新上传参考视频" : "+ 上传参考视频", uploadVideo));
+  const actions = document.createElement("div"); actions.style.cssText = "display:flex;justify-content:flex-end;gap:8px;margin-top:16px";
+  actions.append(makeButton("取消", () => shade.remove()), makeButton("保存", () => {
+    if (!video.path) { notice.textContent = "请先上传参考视频。"; return; }
+    set("prompt", prompt.value); set("segment_seconds", Number(seconds.value) || 5); set("pass_reference_video_audio", passAudio.checked); set("enable_audio_continuation", audioCont.checked); set("cache_prompt_embeddings", cachePrompts.checked); set("auto_run", autoRun.checked); set("skip_h3_audio_decode", skipDecode.checked); set("final_audio_source", audioMode.value); set("audio_restart_segments", restart.value); set("previous_video_reference_segments", previous.value); set("reference_video_json", JSON.stringify(video, null, 2)); set("reference_assets_json", JSON.stringify(assets, null, 2)); node.setDirtyCanvas(true, true); shade.remove();
+  }));
+  panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade); renderAssets(); refreshSummary();
 }
 
 function openEditor(node) {
@@ -389,7 +701,7 @@ function openEditor(node) {
   segmentCountPanel.appendChild(makeButton("应用片段数量", () => {
     const target = Math.max(1, Math.min(999, Math.floor(Number(segmentCountInput.value) || segments.length)));
     if (!confirmSegmentReduction(segments, target)) { segmentCountInput.value = String(segments.length); notice.textContent = "已取消减少片段。"; return; }
-    while (segments.length < target) segments.push({ prompt: "", duration: 5, audio_restart: false, continue_video: true, references: [] });
+    while (segments.length < target) segments.push({ prompt: "", duration: 5, audio_restart: false, continue_audio: true, continue_video: true, references: [], _references_open: false });
     if (segments.length > target) segments.length = target;
     segmentCountInput.value = String(target); directInput.value = JSON.stringify(segments, null, 2); render(); notice.textContent = `片段数量已设置为 ${target}。`;
   }));
@@ -520,18 +832,26 @@ function openEditor(node) {
     segments.forEach((seg, index) => {
       const row = document.createElement("div");
       row.style.cssText = "margin:8px 0;padding:10px;background:#2b3138;border:1px solid #424b55;border-radius:6px";
-      const head = document.createElement("div"); head.style.cssText = "display:grid;grid-template-columns:36px minmax(220px,1fr) 92px 140px 32px;gap:8px;align-items:start";
+      const head = document.createElement("div"); head.style.cssText = "display:grid;grid-template-columns:36px minmax(220px,1fr) 92px 140px 210px 230px 32px;gap:8px;align-items:start";
       const label = document.createElement("strong"); label.textContent = String(index + 1); label.style.paddingTop = "7px"; head.appendChild(label);
       const prompt = document.createElement("textarea"); prompt.rows = 3; prompt.placeholder = "输入本片段提示词，使用 <Picture 1>/<Video 1>/<Audio 1> 标签"; prompt.value = seg.prompt; prompt.style.cssText = "width:100%;resize:vertical;background:#15191d;color:#eee;border:1px solid #59636e;padding:6px"; prompt.oninput = () => { seg.prompt = prompt.value; }; head.appendChild(prompt);
       const duration = document.createElement("input"); duration.type = "number"; duration.min = "4"; duration.max = "15"; duration.step = "0.1"; duration.value = seg.duration; duration.title = "片段时长（秒）"; duration.style.cssText = "width:84px;background:#15191d;color:#eee;border:1px solid #59636e;padding:6px"; duration.oninput = () => { seg.duration = Number(duration.value) || 5; }; head.appendChild(duration);
       const reset = document.createElement("label"); reset.style.cssText = "font-size:12px;display:flex;gap:5px;align-items:center;padding-top:7px"; const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.checked = seg.audio_restart; checkbox.onchange = () => { seg.audio_restart = checkbox.checked; }; reset.append(checkbox, "重新生成音频"); head.appendChild(reset);
+      const videoReset = document.createElement("label"); videoReset.style.cssText = "font-size:12px;display:flex;gap:5px;align-items:center;padding-top:7px";
+      const videoResetCheckbox = document.createElement("input"); videoResetCheckbox.type = "checkbox"; videoResetCheckbox.checked = index > 0 && seg.continue_video === false; videoResetCheckbox.disabled = index === 0;
+      videoResetCheckbox.onchange = () => { seg.continue_video = !videoResetCheckbox.checked; if (videoResetCheckbox.checked) { previousCheckbox.checked = false; seg.use_previous_video_reference = false; } };
+      videoReset.append(videoResetCheckbox, "重新生成视频（关闭视频上下文）"); head.appendChild(videoReset);
+      const previous = document.createElement("label"); previous.style.cssText = "font-size:12px;display:flex;gap:5px;align-items:center;padding-top:7px";
+      const previousCheckbox = document.createElement("input"); previousCheckbox.type = "checkbox"; previousCheckbox.checked = index > 0 && !!seg.use_previous_video_reference; previousCheckbox.disabled = index === 0;
+      previousCheckbox.onchange = () => { seg.use_previous_video_reference = previousCheckbox.checked; if (previousCheckbox.checked) { seg.continue_video = false; videoResetCheckbox.checked = true; } };
+      previous.append(previousCheckbox, "使用上片段视频作为参考素材接续"); head.appendChild(previous);
       head.appendChild(makeButton("×", () => {
         if (segments.length <= 1) return;
         if (!confirmSegmentReduction(segments, segments.length - 1, [seg])) { notice.textContent = "已取消删除片段。"; return; }
         segments.splice(index, 1); render();
       }, "删除片段")); row.appendChild(head);
 
-      const details = document.createElement("details"); details.open = (seg.references || []).length > 0; details.style.cssText = "margin-top:8px;background:#20252b;border:1px solid #59636e;border-radius:5px;padding:6px 8px";
+      const details = document.createElement("details"); details.open = seg._references_open === true || (seg._references_open === undefined && (seg.references || []).length > 0); details.ontoggle = () => { seg._references_open = details.open; }; details.style.cssText = "margin-top:8px;background:#20252b;border:1px solid #59636e;border-radius:5px;padding:6px 8px";
       const summary = document.createElement("summary"); summary.textContent = `多模态参考素材（${totalRefs(seg)}/${MAX_TOTAL_REFS} / 图片${countRefs(seg, "image")}/9，视频${countRefs(seg, "video")}/3，音频${countRefs(seg, "audio")}/3）`; summary.style.cursor = "pointer"; details.appendChild(summary);
       const refList = document.createElement("div"); refList.style.cssText = "display:flex;flex-direction:column;gap:8px;margin-top:8px";
       const renderRefs = () => {
@@ -552,6 +872,11 @@ function openEditor(node) {
         const selected = Array.from(files || []);
         const remaining = MAX_REFS[type] - countRefs(seg, type);
         const totalRemaining = MAX_TOTAL_REFS - totalRefs(seg);
+        if (type === "video" && seg.use_previous_video_reference && index > 0
+            && countRefs(seg, "video") + selected.length > 1) {
+          notice.textContent = `第 ${index + 1} 段启用上片段视频参考时，最多只能上传 1 个视频参考素材。`;
+          return;
+        }
         if (selected.length > totalRemaining) { notice.textContent = `第 ${index + 1} 段参考素材总数最多 ${MAX_TOTAL_REFS} 个，已拒绝本次超出上限的文件。`; return; }
         if (selected.length > remaining) { notice.textContent = `第 ${index + 1} 段的${type === "image" ? "图片" : type === "video" ? "视频" : "音频"}最多 ${MAX_REFS[type]} 个，已拒绝超出上限的文件。`; return; }
         try {
@@ -566,6 +891,10 @@ function openEditor(node) {
           const selected = await selectFilesWithPython(type, dirs[type], pickerOptions.useDefaultPath);
           const remaining = MAX_REFS[type] - countRefs(seg, type);
           const totalRemaining = MAX_TOTAL_REFS - totalRefs(seg);
+          if (type === "video" && seg.use_previous_video_reference && index > 0
+              && countRefs(seg, "video") + selected.length > 1) {
+            throw new Error(`第 ${index + 1} 段启用上片段视频参考时，最多只能上传 1 个视频参考素材。`);
+          }
           if (selected.length > totalRemaining) throw new Error(`第 ${index + 1} 段参考素材总数最多 ${MAX_TOTAL_REFS} 个，已拒绝本次选择。`);
           if (selected.length > remaining) throw new Error(`第 ${index + 1} 段的${type === "image" ? "图片" : type === "video" ? "视频" : "音频"}最多 ${MAX_REFS[type]} 个，已拒绝本次选择。`);
           seg.references.push(...selected);
@@ -595,12 +924,17 @@ function openEditor(node) {
   render();
 
   const actions = document.createElement("div"); actions.style.cssText = "display:flex;gap:8px;justify-content:flex-end;margin-top:12px";
-  actions.appendChild(makeButton("+ 添加片段", () => { segments.push({ prompt: "", duration: 5, audio_restart: false, references: [] }); render(); }));
+  actions.appendChild(makeButton("+ 添加片段", () => { segments.push({ prompt: "", duration: 5, audio_restart: false, continue_video: true, use_previous_video_reference: false, references: [] }); render(); }));
   actions.appendChild(makeButton("将第 1 段参考素材应用到全部", () => { const refs = JSON.parse(JSON.stringify(segments[0].references || [])); segments.forEach((seg) => { seg.references = JSON.parse(JSON.stringify(refs)); }); render(); }));
   actions.appendChild(makeButton("取消", () => shade.remove()));
   actions.appendChild(makeButton("保存", () => {
     const invalid = segments.findIndex((seg) => totalRefs(seg) > MAX_TOTAL_REFS || Object.entries(MAX_REFS).some(([type, max]) => countRefs(seg, type) > max));
     if (invalid >= 0) { notice.textContent = `第 ${invalid + 1} 段参考素材数量超过限制（每段最多 ${MAX_TOTAL_REFS} 个）。`; return; }
+    const videoInvalid = segments.findIndex((seg, index) => index > 0 && seg.use_previous_video_reference && countRefs(seg, "video") > 1);
+    if (videoInvalid >= 0) {
+      notice.textContent = `第 ${videoInvalid + 1} 段启用上片段视频参考时，最多只能上传 1 个视频参考素材。`;
+      return;
+    }
     writeSegments(node, segments); shade.remove();
   }));
   panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade);
@@ -609,6 +943,106 @@ function openEditor(node) {
 app.registerExtension({
   name: "H3AutoDirector.Editor",
   beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData.name === NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        // Older workflows serialized the removed global previous-video widget
+        // between continuation_mode and cache_prompt_embeddings. Drop only
+        // that value so all remaining widgets keep their original meaning.
+        const legacy = Array.isArray(info?.inputs)
+          && info.inputs.some((input) => input?.name === "use_previous_video_reference");
+        if (legacy && Array.isArray(info.widgets_values) && info.widgets_values.length >= 10) {
+          info = { ...info, widgets_values: info.widgets_values.slice(0, 6).concat(info.widgets_values.slice(7)) };
+        }
+        return originalConfigure?.call(this, info);
+      };
+    }
+    if (nodeData.name === TTS_NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        // Older TTS workflows serialized global reference/audio widgets. The
+        // current node stores those values per segment, so drop the obsolete
+        // widget slots while preserving the remaining values by name.
+        const inputs = Array.isArray(info?.inputs) ? info.inputs : [];
+        const names = inputs.map((input) => input?.name);
+        const legacyNames = ["reference_video_json", "reference_assets_json", "pass_reference_video_audio", "audio_restart_segments"];
+        if (legacyNames.some((name) => names.includes(name)) && Array.isArray(info.widgets_values)) {
+          const keep = ["project_id", "segments_json", "auto_run", "cache_prompt_embeddings", "enable_audio_continuation", "concat_final_audio", "output_root", "global_reference_set"];
+          const values = Object.fromEntries(names.map((name, index) => [name, info.widgets_values[index]]));
+          info = { ...info, widgets_values: keep.map((name) => values[name]) };
+        }
+        return originalConfigure?.call(this, info);
+      };
+    }
+    if (nodeData.name === TRANSFER_NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        // Remove the two retired freeze widgets by name so the values that
+        // follow them keep their correct input mapping in old workflows.
+        const names = Array.isArray(info?.inputs) ? info.inputs.map((input) => input?.name) : [];
+        const retired = ["freeze_video_sampling", "freeze_audio_sampling"];
+        if (retired.some((name) => names.includes(name)) && Array.isArray(info.widgets_values)) {
+          info = { ...info, widgets_values: info.widgets_values.filter((_, index) => !retired.includes(names[index])) };
+        }
+        return originalConfigure?.call(this, info);
+      };
+    }
+    if (nodeData.name === TRANSFER_LOADER_NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        // The hybrid controls were inserted after Ref2VA. Convert the former
+        // six-widget transfer loader schema without shifting CLIP or either VAE.
+        const names = Array.isArray(info?.inputs) ? info.inputs.map((input) => input?.name) : [];
+        if (!names.includes("base_model") && Array.isArray(info?.widgets_values)) {
+          const old = info.widgets_values;
+          info = {
+            ...info,
+            widgets_values: [old[0], "MiniMax-H3\\minimax_h3_fl2va_pruned_int8_convrot.safetensors", false,
+              old[1], old[2], old[3], old[4] ?? "default", old[5] ?? "minimax"],
+          };
+        }
+        return originalConfigure?.call(this, info);
+      };
+    }
+    if (nodeData.name === DUAL_SAMPLING_NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        // The old dual-sampling schema did not include the two stage-control
+        // booleans.  Its trailing values were therefore read as
+        // [stage2_steps, stage2_denoise, upscale_mode, seed], which maps an
+        // old seed into stage2_denoise after the controls were added.
+        const names = Array.isArray(info?.inputs) ? info.inputs.map((input) => input?.name) : [];
+        const values = Array.isArray(info?.widgets_values) ? info.widgets_values : null;
+        if (names.includes("enable_stage2") && values?.length === 11
+          && Number(values[7]) > 1 && typeof values[8] === "string") {
+          info = {
+            ...info,
+            widgets_values: [
+              values[0], values[1], values[2], values[3],
+              true, false, values[4], values[5], values[6], values[7], values[8], values[9], values[10],
+            ],
+          };
+        }
+        return originalConfigure?.call(this, info);
+      };
+    }
+    if (nodeData.name === H3_RESOLUTION_NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        // Convert the first dual-resolution schema (preset + two integer
+        // fields) to the current two-switch and single "width,height" input.
+        const names = Array.isArray(info?.inputs) ? info.inputs.map((input) => input?.name) : [];
+        if (names.includes("custom_ratio_width") && Array.isArray(info.widgets_values)) {
+          const values = Object.fromEntries(names.map((name, index) => [name, info.widgets_values[index]]));
+          const legacyPreset = String(values.aspect_preset || "16:9").split(" ")[0];
+          const custom = `${values.custom_ratio_width ?? 16},${values.custom_ratio_height ?? 9}`;
+          const usesCustom = legacyPreset === "自定义";
+          info = { ...info, widgets_values: [!usesCustom, usesCustom, usesCustom ? "16:9" : legacyPreset, custom,
+            values.stage1_megapixels ?? 0.4, values.stage2_megapixels ?? 0.98, values.multiple ?? 32] };
+        }
+        return originalConfigure?.call(this, info);
+      };
+    }
     if (H3_NODE_CLASSES.has(nodeData.name)) {
       const original = nodeType.prototype.onNodeCreated;
       nodeType.prototype.onNodeCreated = function (...args) {

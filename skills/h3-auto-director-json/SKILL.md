@@ -5,8 +5,9 @@ description: Generate strict JSON segment plans for the MiniMax H3 Auto Director
 
 # H3 Auto Director JSON
 
-Generate the `segments_json` value consumed by `H3AutoDirectorPlan`. Follow the
-MiniMax H3 official full-reference prompt format, but return only the JSON
+Generate the `segments_json` value consumed by `H3AutoDirectorPlan` or
+`H3AutoDirectorTTSPlan`. Follow the MiniMax H3 official full-reference prompt
+format, but return only the JSON
 array. Do not add Markdown fences, explanations, headings, or comments outside
 the JSON.
 
@@ -21,18 +22,35 @@ field:
   "prompt": "subject_definitions:\n...\n\nsummary:\n...\n\nretention_analysis:\n...\n\ndetailed_description:\n...\n\noverall_soundscape:\n...\n\nnon_diegetic_music:\n...",
   "duration": 4,
   "audio_restart": false,
+  "continue_audio": true,
   "continue_video": false,
   "references": []
 }
 ```
 
+When the user requests the TTS workflow, an optional `audio_filename` field is
+allowed. It must be a filename only, use the `.wav` extension, and be unique
+within the plan. Do not put a directory path in this field. TTS still uses the
+same six prompt sections, but the prompt's main subject is the voice and audio
+timeline rather than a visual action sequence.
+
 Use these defaults:
 
 - `duration`: `5` unless the user gives a duration. Keep every value between `4` and `15` seconds.
 - `audio_restart`: `false`; set `true` only at a user-requested or clearly justified audio reset point.
+- `continue_audio`: `true` by default; set `false` on a specific segment when the user asks to close audio context continuation for that segment. This is independent of video continuation and global audio settings.
 - `continue_video`: `false` for the first segment; `true` for later segments unless the user requests independent scenes or disables continuation.
+- `use_previous_video_reference`: optional and `false` by default. Set it only on a later segment when the user asks to use the previous generated segment as a video reference. It automatically disables that segment's video context; do not set it on the first segment.
 - `references`: use `[]` unless the user supplies an exact local file path for the asset. Never invent filenames, paths, URLs, reference images, videos, audio, labels, or numbers.
 - Image references have no independent duration. Never emit `duration` or `image_duration` inside an image reference; the segment-level `duration` controls the complete generated clip. Video and audio metadata may retain `duration` only for display or source-media bookkeeping.
+
+Keep material file paths and material labels as separate facts. A path such as
+`D:\\...\\hero.mp4` identifies the file; `<Video 1>` identifies its prompt label.
+Never use a filename, upload order, attachment index, or label as a substitute
+for the other fact. If the user gives only a material label/number but no exact
+local file path, keep that segment's `references` as `[]`. If the user gives an
+exact local file path but no explicit one-based label/number, ask which
+`<Picture N>`, `<Video N>`, or `<Audio N>` it is before returning JSON.
 
 The plugin's reference arrays and ComfyUI sockets are zero-based, but MiniMax H3
 prompt labels are one-based. Labels are scoped to each segment and are assigned
@@ -59,11 +77,20 @@ do not mention a soundtrack label. When present, enabled video soundtracks are
 numbered first in H3 presentation order, followed by standalone audio files;
 disabling one removes its label and shifts later audio labels down. Do not invent
 `has_audio` metadata. If the user provides no exact local file paths, every
-segment's `references` must remain `[]`; if the prompt still refers to an
+segment's `references` must remain `[]`, including when only material numbers
+were provided; if the prompt still refers to an
 unidentified material, ask the user for its exact path and one-based label before
 returning JSON. Do not create a reference entry from a visual description, an
 attachment name, “reference” wording, an uploaded preview, a URL, or inferred
 asset mapping.
+
+When a later segment sets `use_previous_video_reference: true`, the plugin
+injects a runtime-only previous-video reference after the user's references and
+prefixes the prompt with its actual `<Video N>` label. This generated cache
+reference is not a user-supplied path and must not be emitted by this skill. The
+mode disables only video context; the injected reference carries video frames
+without its audio track. An enabled segment accepts at most one user video:
+without one, the injected clip is `<Video 1>`; with one, it is `<Video 2>`.
 
 ## Prompt Requirements
 
@@ -127,6 +154,40 @@ otherwise describe continuous ambience and music across the cut.
 When the user supplies no local audio file path, generate `overall_soundscape` and
 `non_diegetic_music` descriptions but keep `references` empty. Do not add an
 audio reference just because the prompt mentions music or sound effects.
+
+## TTS Prompt Rules
+
+For a TTS segment, write a complete audio-directed prompt instead of a short
+instruction such as `speak this sentence`. Keep the six sections in the same
+order, adapting their purpose as follows:
+
+- `subject_definitions`: define the intended speaker, vocal identity, age
+  range when provided, language, accent, register, pitch, texture, breathiness,
+  and any voice reference such as `<Audio 1>`. Do not invent a voice reference.
+- `summary`: state the spoken content, delivery arc, emotional intention, and
+  approximate timing within the segment. Keep dialogue, lyrics, and visible
+  text in the user's original language.
+- `retention_analysis`: state which voice qualities are fully preserved from
+  each confirmed audio reference and which qualities are intentionally changed;
+  a `<Subject N>` label never replaces `<Audio N>`.
+- `detailed_description`: describe pronunciation, pacing, pauses, syllable
+  stress, breath placement, intensity changes, whispers or emphasis, and the
+  exact start and end state of the voice. If the text is dialogue, quote it
+  exactly and do not rewrite or censor it.
+- `overall_soundscape`: describe diegetic room tone, microphone distance,
+  breaths, mouth sounds, Foley, and silence around the speech. Do not add a
+  file-backed audio reference unless its exact path and one-based label were
+  supplied.
+- `non_diegetic_music`: describe music or leave it explicitly absent. Do not
+  invent a music file or `<Audio N>` label from a request for background music.
+
+For TTS, set `continue_video` to `false`. Keep `continue_audio` true unless the
+user wants this segment to start a fresh voice/audio context, and set
+`audio_restart` true at each explicit regeneration point. These flags are
+independent: a TTS segment can restart audio while retaining the same voice
+reference. The segment-level `duration` is the complete generated audio length;
+do not add image durations. If the user asks for one long audio output, keep
+the per-segment durations and let the TTS controller concatenate the WAV files.
 
 ## Validation Before Returning
 
