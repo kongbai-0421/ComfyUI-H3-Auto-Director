@@ -563,6 +563,14 @@ def _mark_motion_context(conditioning):
     return node_helpers.conditioning_set_values(conditioning, {_MOTION_CONTEXT_MARKER: True})
 
 
+def _nearest_multiple(value, multiple=32):
+    """Round a positive dimension to its nearest H3 canvas multiple."""
+    multiple = max(1, int(multiple))
+    # Use conventional half-up rounding so backend values match the browser's
+    # Math.round behavior (for example, 80 -> 96 rather than Python's 64).
+    return max(multiple, int(math.floor(float(value) / multiple + 0.5)) * multiple)
+
+
 def _prepare_dual_sampling_conditioning(conditioning, strip_motion_context=False):
     """Remove internal tags and, for stage two, only Motion Context payloads.
 
@@ -1847,11 +1855,13 @@ def _cache_frame_count(plan, generation_index, context_length):
             if use_video else _align_frames(target))
 
 
-def _prompt_cache_key(plan, clip, vae, audio_vae, width, height, ref_image_size, context_length):
+def _prompt_cache_key(plan, clip, vae, audio_vae, width, height, ref_image_size, context_length,
+                      ref_short_edge=2048):
     # The seed belongs to RandomNoise/sampling downstream.  It is deliberately
     # absent here so changing the seed reuses the deterministic H3 conditioning.
     plan_data = {k: plan.get(k) for k in ("project_id", "global_reference_set", "global_assets", "segments", "continuation_mode")}
-    return (id(clip), id(vae), id(audio_vae), int(width), int(height), str(ref_image_size), int(context_length),
+    return (id(clip), id(vae), id(audio_vae), int(width), int(height), str(ref_image_size),
+            int(context_length), _nearest_multiple(ref_short_edge),
             json.dumps(plan_data, ensure_ascii=False, sort_keys=True, default=str))
 
 
@@ -1872,6 +1882,16 @@ class H3AutoDirectorCachedReferenceToVideo:
             "ref_image_size": (["match", "max"], {"default": "match"}),
             "context_length": ("INT", {"default": FRAME_CONTEXT_DEFAULT, "min": 5, "max": 39}),
             "segment_index": ("INT", {"default": 0, "min": 0, "forceInput": True}),
+            "use_auto_ref_image_size": ("BOOLEAN", {"default": True,
+                                      "label_on": "自动参考尺寸（match/max）",
+                                      "label_off": "关闭自动参考尺寸",
+                                      "tooltip": "开启时使用上方的 match/max 选项；与手动最短边二选一。"}),
+            "use_manual_ref_short_edge": ("BOOLEAN", {"default": False,
+                                      "label_on": "手动参考最短边",
+                                      "label_off": "关闭手动最短边",
+                                      "tooltip": "开启时按手动最短边缩放图片参考；输入会自动对齐到最近的 32 倍数。与自动参考尺寸二选一。"}),
+            "ref_short_edge": ("INT", {"default": 2048, "min": 32, "max": 8192, "step": 32,
+                                      "tooltip": "图片参考的目标最短边；不会放大低于该尺寸的原图。"}),
         }, "optional": {
             # The segment node emits this JSON directly. Keeping it optional
             # preserves older workflows while making per-segment references an
@@ -1885,9 +1905,16 @@ class H3AutoDirectorCachedReferenceToVideo:
     CATEGORY = "H3 自动导演"
 
     @staticmethod
-    def _encode_one(clip, vae, audio_vae, prompt, width, height, length, ref_image_size, refs, plan=None):
+    def _encode_one(clip, vae, audio_vae, prompt, width, height, length, ref_image_size, refs,
+                    plan=None, use_manual_ref_short_edge=False, ref_short_edge=2048):
         if _H3ReferenceToVideo is None:
             raise RuntimeError("当前 ComfyUI 未提供 MiniMaxH3ReferenceToVideo 核心节点")
+        if bool(use_manual_ref_short_edge):
+            prepared = H3AutoDirectorCachedReferenceToVideo._prepare_references(
+                vae, audio_vae, width, height, length, "manual", refs, plan=plan,
+                ref_short_edge=ref_short_edge)
+            return H3AutoDirectorCachedReferenceToVideo._encode_prepared_prompt(
+                clip, prompt, *prepared)
         ref_groups = _resolve_reference_groups(refs, plan=plan)
         result = _H3ReferenceToVideo.execute(
             clip, vae, audio_vae, prompt, int(width), int(height), int(length), str(ref_image_size),
@@ -1896,7 +1923,8 @@ class H3AutoDirectorCachedReferenceToVideo:
         return result[0], result[1]
 
     @staticmethod
-    def _prepare_references(vae, audio_vae, width, height, length, ref_image_size, refs, plan=None):
+    def _prepare_references(vae, audio_vae, width, height, length, ref_image_size, refs,
+                            plan=None, ref_short_edge=2048):
         """Encode all Ref2VA assets before the batch text-encoder session."""
         if _H3ReferenceToVideo is None or _minimax_h3 is None:
             raise RuntimeError("当前 ComfyUI 未提供 MiniMaxH3ReferenceToVideo 核心节点")
@@ -1911,6 +1939,9 @@ class H3AutoDirectorCachedReferenceToVideo:
             source_height, source_width = image.shape[1], image.shape[2]
             if ref_image_size == "match":
                 scale = min(1.0, math.sqrt((width * height) / (source_width * source_height)))
+            elif ref_image_size == "manual":
+                target_short_edge = _nearest_multiple(ref_short_edge, _minimax_h3.CANVAS_MULTIPLE)
+                scale = min(1.0, target_short_edge / min(source_width, source_height))
             else:
                 scale = min(1.0, _minimax_h3.REF_IMAGE_SHORT_EDGE / min(source_width, source_height))
             target_width = max(_minimax_h3.CANVAS_MULTIPLE,
@@ -1986,7 +2017,8 @@ class H3AutoDirectorCachedReferenceToVideo:
         return True
 
     @classmethod
-    def _build_cache(cls, plan, clip, vae, audio_vae, width, height, ref_image_size, context_length):
+    def _build_cache(cls, plan, clip, vae, audio_vae, width, height, ref_image_size, context_length,
+                     use_manual_ref_short_edge=False, ref_short_edge=2048):
         prepared = {}
         pending = []
         segment_count = len(plan.get("segments", []))
@@ -1998,7 +2030,9 @@ class H3AutoDirectorCachedReferenceToVideo:
                 pending.append(generation_index)
                 continue
             prepared[generation_index] = cls._prepare_references(
-                vae, audio_vae, width, height, length, ref_image_size, refs, plan=plan)
+                vae, audio_vae, width, height, length,
+                "manual" if use_manual_ref_short_edge else ref_image_size,
+                refs, plan=plan, ref_short_edge=ref_short_edge)
 
         LOG.info("H3 Auto Director: 参考素材预编码完成，开始连续缓存 %d 段文本向量", len(prepared))
         cache = {}
@@ -2021,6 +2055,7 @@ class H3AutoDirectorCachedReferenceToVideo:
     @classmethod
     def encode(cls, plan, clip, vae, audio_vae, prompt, width, height, length,
                ref_image_size="match", context_length=FRAME_CONTEXT_DEFAULT, segment_index=0,
+               use_auto_ref_image_size=True, use_manual_ref_short_edge=False, ref_short_edge=2048,
                references_json=None):
         # The original Auto Director workflow wires output 8 (the 0-based
         # context index) into this node.  TTS and Video Transfer workflows
@@ -2039,14 +2074,26 @@ class H3AutoDirectorCachedReferenceToVideo:
             except json.JSONDecodeError as exc:
                 raise ValueError("参考素材 JSON 无效: %s" % exc) from exc
             _validate_reference_limits(refs, "当前片段参考素材")
+        # Match the UI's mutual exclusion policy for both cached and direct
+        # encoding paths. Automatic sizing is the fallback when both switches
+        # are enabled in an older or hand-edited workflow.
+        manual_enabled = bool(use_manual_ref_short_edge) and not bool(use_auto_ref_image_size)
         if not bool(plan.get("cache_prompt_embeddings", False)):
             return cls._encode_one(clip, vae, audio_vae, prompt, width, height, length,
                                    ref_image_size, _cache_segment_references(plan, generation_index) if refs is None else refs,
-                                   plan=plan)
-        key = _prompt_cache_key(plan, clip, vae, audio_vae, width, height, ref_image_size, context_length)
+                                   plan=plan, use_manual_ref_short_edge=manual_enabled,
+                                   ref_short_edge=ref_short_edge)
+        # The UI keeps these switches mutually exclusive.  If an old or
+        # hand-edited workflow contains both values, automatic mode wins so
+        # execution remains deterministic and backward compatible.
+        effective_ref_mode = "manual" if manual_enabled else ref_image_size
+        key = _prompt_cache_key(plan, clip, vae, audio_vae, width, height,
+                                effective_ref_mode, context_length, ref_short_edge)
         cache = _PROMPT_CONDITIONING_CACHE.get(key)
         if cache is None:
-            cache = cls._build_cache(plan, clip, vae, audio_vae, width, height, ref_image_size, context_length)
+            cache = cls._build_cache(plan, clip, vae, audio_vae, width, height, ref_image_size, context_length,
+                                     use_manual_ref_short_edge=manual_enabled,
+                                     ref_short_edge=ref_short_edge)
             _PROMPT_CONDITIONING_CACHE[key] = cache
             _PROMPT_CONDITIONING_CACHE.move_to_end(key)
             while len(_PROMPT_CONDITIONING_CACHE) > PROMPT_CACHE_MAX_PROJECTS:
@@ -2062,7 +2109,9 @@ class H3AutoDirectorCachedReferenceToVideo:
                 raise FileNotFoundError("第 %d 段的上片段视频参考尚未生成，无法编码提示词向量" % generation_index)
             cache[generation_index] = cls._encode_one(
                 clip, vae, audio_vae, _previous_video_prompt(seg.get("prompt", ""), effective_refs),
-                width, height, length, ref_image_size, effective_refs, plan=plan)
+                width, height, length, effective_ref_mode, effective_refs, plan=plan,
+                use_manual_ref_short_edge=manual_enabled,
+                ref_short_edge=ref_short_edge)
             _PROMPT_CONDITIONING_CACHE[key] = cache
             LOG.info(
                 "H3 Auto Director: 已完成提示词向量缓存 %d/%d（第 %d 段，延迟参考素材就绪）",
