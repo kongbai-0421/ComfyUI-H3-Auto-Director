@@ -372,6 +372,10 @@ function decorateCachedReference(node) {
   const nearest32 = (value) => Math.max(32, Math.round(Number(value || 2048) / 32) * 32);
   const boolValue = (value) => !(typeof value === "string" && ["false", "0", "off", "关闭"].includes(value.trim().toLowerCase()));
   let normalizing = false;
+  // LiteGraph can briefly expose the old toggle value while a widget callback
+  // is running. Keep the user's last mode separately so editing the numeric
+  // short-edge field cannot accidentally fall back to preset mode.
+  let selectedMode = node.__h3CachedReferenceSizingMode || null;
   const setWidgetBoolean = (item, value) => {
     if (!item) return;
     const changed = boolValue(item.value) !== !!value;
@@ -385,12 +389,25 @@ function decorateCachedReference(node) {
     let presetOn = boolValue(auto?.value);
     let manualOn = boolValue(manual?.value);
     if (preferredMode === "preset") {
+      selectedMode = "preset";
       presetOn = true; manualOn = false;
     } else if (preferredMode === "manual") {
+      selectedMode = "manual";
+      presetOn = false; manualOn = true;
+    } else if (selectedMode === "preset") {
+      presetOn = true; manualOn = false;
+    } else if (selectedMode === "manual") {
       presetOn = false; manualOn = true;
     } else if (presetOn === manualOn) {
+      // Ambiguous legacy state: preserve the historical preset default.
+      selectedMode = "preset";
       presetOn = true; manualOn = false;
+    } else {
+      // Hydrate the remembered mode from an existing, valid pair of widget
+      // values before any later numeric-field callback can run.
+      selectedMode = presetOn ? "preset" : "manual";
     }
+    node.__h3CachedReferenceSizingMode = selectedMode;
     normalizing = true;
     if (auto) { auto.value = presetOn; if (auto.options) auto.options.value = presetOn; }
     if (manual) { manual.value = manualOn; if (manual.options) manual.options.value = manualOn; }
@@ -442,7 +459,7 @@ function decorateCachedReference(node) {
         const aligned = nearest32(value);
         this.value = aligned;
         const result = previous?.call(this, aligned, ...args);
-        update();
+        update(selectedMode);
         return result;
       };
     }
