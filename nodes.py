@@ -1882,10 +1882,13 @@ class H3AutoDirectorCachedReferenceToVideo:
             "ref_image_size": (["match", "max"], {"default": "match"}),
             "context_length": ("INT", {"default": FRAME_CONTEXT_DEFAULT, "min": 5, "max": 39}),
             "segment_index": ("INT", {"default": 0, "min": 0, "forceInput": True}),
+            # Kept at the original widget position so old workflows still
+            # deserialize correctly. The browser hides this legacy switch;
+            # ``ref_image_size`` is now the sole automatic match/max control.
             "use_auto_ref_image_size": ("BOOLEAN", {"default": True,
-                                      "label_on": "自动参考尺寸（match/max）",
-                                      "label_off": "关闭自动参考尺寸",
-                                      "tooltip": "开启时使用上方的 match/max 选项；与手动最短边二选一。"}),
+                                      "label_on": "旧版自动尺寸（兼容）",
+                                      "label_off": "旧版自动尺寸（兼容）",
+                                      "tooltip": "旧工作流兼容字段，不再参与模式选择。"}),
             "use_manual_ref_short_edge": ("BOOLEAN", {"default": False,
                                       "label_on": "手动参考最短边",
                                       "label_off": "关闭手动最短边",
@@ -2074,18 +2077,15 @@ class H3AutoDirectorCachedReferenceToVideo:
             except json.JSONDecodeError as exc:
                 raise ValueError("参考素材 JSON 无效: %s" % exc) from exc
             _validate_reference_limits(refs, "当前片段参考素材")
-        # Match the UI's mutual exclusion policy for both cached and direct
-        # encoding paths. Automatic sizing is the fallback when both switches
-        # are enabled in an older or hand-edited workflow.
-        manual_enabled = bool(use_manual_ref_short_edge) and not bool(use_auto_ref_image_size)
+        # ``ref_image_size`` is always the automatic match/max mode. The
+        # manual switch is the only override; the legacy auto boolean is
+        # intentionally ignored so closing one control cannot toggle another.
+        manual_enabled = bool(use_manual_ref_short_edge)
         if not bool(plan.get("cache_prompt_embeddings", False)):
             return cls._encode_one(clip, vae, audio_vae, prompt, width, height, length,
                                    ref_image_size, _cache_segment_references(plan, generation_index) if refs is None else refs,
                                    plan=plan, use_manual_ref_short_edge=manual_enabled,
                                    ref_short_edge=ref_short_edge)
-        # The UI keeps these switches mutually exclusive.  If an old or
-        # hand-edited workflow contains both values, automatic mode wins so
-        # execution remains deterministic and backward compatible.
         effective_ref_mode = "manual" if manual_enabled else ref_image_size
         key = _prompt_cache_key(plan, clip, vae, audio_vae, width, height,
                                 effective_ref_mode, context_length, ref_short_edge)

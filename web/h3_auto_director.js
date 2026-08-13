@@ -261,7 +261,7 @@ function applyChineseLabels(node) {
     segment_index: nodeClass === SEGMENT_NODE || nodeClass === CONTEXT_NODE || nodeClass === RESUME_NODE ? "上下文片段序号" : "片段序号",
     context_length: "上下文长度", prompt: "提示词", references_json: "参考素材 JSON",
     clip: "文本编码器", vae: "视频 VAE", audio_vae: "音频 VAE", width: "宽度", height: "高度", length: "帧数",
-    ref_image_size: "自动参考尺寸（match/max）", use_auto_ref_image_size: "使用自动参考尺寸", use_manual_ref_short_edge: "使用手动参考最短边", ref_short_edge: "参考图片最短边", enable_resume: "启用断点续接", latent_path: "缓存潜变量路径", video_path: "缓存视频路径",
+    ref_image_size: "自动参考尺寸（match/max）", use_auto_ref_image_size: "旧版自动尺寸（兼容）", use_manual_ref_short_edge: "使用手动参考最短边", ref_short_edge: "参考图片最短边", enable_resume: "启用断点续接", latent_path: "缓存潜变量路径", video_path: "缓存视频路径",
     conditioning: "条件", latent: "潜变量", context_frames: "上下文画面", context_latent: "上下文潜变量",
     use_video_context: "使用视频上下文", use_audio_context: "使用音频上下文", use_video_latent: "使用视频潜空间",
     fps: "帧率", images: "视频画面",
@@ -373,12 +373,10 @@ function decorateCachedReference(node) {
   const boolValue = (value) => !(typeof value === "string" && ["false", "0", "off", "关闭"].includes(value.trim().toLowerCase()));
   const update = () => {
     const manualOn = boolValue(manual?.value);
-    // Keep exactly one sizing mode active.  If both are off (old workflow or
-    // manual widget edit), restore automatic sizing as the default.
-    const autoOn = !manualOn;
-    if (auto) auto.value = autoOn;
-    if (manual) manual.value = manualOn;
-    if (mode) mode.hidden = !autoOn;
+    // ``ref_image_size`` is the automatic match/max selector. It remains
+    // available whenever manual mode is off; no second boolean is toggled.
+    if (auto) auto.hidden = true;
+    if (mode) mode.hidden = manualOn;
     if (edge) {
       edge.hidden = !manualOn;
       if (manualOn) {
@@ -393,19 +391,14 @@ function decorateCachedReference(node) {
   };
   if (!node.__h3CachedReferenceSizingBound) {
     node.__h3CachedReferenceSizingBound = true;
-    [[auto, manual], [manual, auto]].forEach(([source, other]) => {
-      if (!source) return;
-      const previous = source.callback;
-      source.callback = function (value, ...args) {
-        if (boolValue(value) && other) {
-          other.value = false;
-          other.callback?.(false);
-        }
+    if (manual) {
+      const previous = manual.callback;
+      manual.callback = function (value, ...args) {
         const result = previous?.call(this, value, ...args);
         update();
         return result;
       };
-    });
+    }
     if (edge) {
       const previous = edge.callback;
       edge.callback = function (value, ...args) {
