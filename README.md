@@ -10,7 +10,7 @@
 ComfyUI/custom_nodes/ComfyUI-H3-Auto-Director
 ```
 
-重启 ComfyUI。连续视频上下文依赖 `ComfyUI-H3-Motion-Context`，多模态参考依赖 ComfyUI 中的 `MiniMaxH3ReferenceToVideo`、`VHS_LoadVideo`、核心 `LoadAudio` 和 `ResolutionSelector` 节点。
+重启 ComfyUI。连续视频/音频上下文已内置：新版 ComfyUI 使用核心的 `MiniMaxH3AddGuide` 原生任意帧锚定；旧版 ComfyUI 会自动启用插件内置的 Motion Context 兼容层。因此不再必须安装 `ComfyUI-H3-Motion-Context`。多模态参考仍依赖 ComfyUI 中的 `MiniMaxH3ReferenceToVideo`、`VHS_LoadVideo`、核心 `LoadAudio` 和 `ResolutionSelector` 节点。
 
 ## H3 音频采样切换
 
@@ -56,8 +56,8 @@ LoRA 验证基础 H3 流程。
 
 ```text
 项目计划 -> 片段设置 -> H3 多模态参考生成
-                       -> 运动上下文 -> 引导器/采样器/解码
-解码后的视频与音频 + 未裁剪 AV latent -> 保存中间片段
+                       -> 自动导演上下文 -> 引导器/采样器/解码
+解码后的视频与音频 + AV latent -> 保存中间片段
 保存的视频 -> 自动控制器 -> 下一段或最终拼接视频
 ```
 
@@ -200,9 +200,9 @@ output/h3_project/<项目文件夹名称>/
 
 ### 8. 保存与排错
 
-- 中间片段节点必须接收未裁剪的 AV latent、裁剪后的画面和对应音频。
+- 中间片段节点必须接收 AV latent、H3 AV 解码节点输出的画面和对应音频；新版原生 Guide 不会向输出视频追加上下文帧。
 - 项目目录为 `output/h3_project/<项目名>/`，其中 `context/` 保存未经最终校色的上下文源，`clips/` 保存校色后的中间片段，`cache/` 保存 AV latent，`final/` 保存最终拼接视频。接续模式只读取 `context/`，旧项目没有该目录时自动回退到 `clips/`。
-- 运动上下文节点默认优先从缓存 AV latent 尾部直取视频 latent；当前片段分辨率不一致时自动回退到画面 VAE 编码路径。该选项可在节点的“使用视频 latent”输入中关闭。
+- 自动导演上下文节点默认优先从缓存 AV latent 尾部直取视频 latent；当前片段分辨率不一致时自动回退到画面 VAE 编码路径。新版 ComfyUI 通过原生 Guide 在目标时间轴写入视频与音频锚点；旧版自动使用插件内置兼容层。该选项可在节点的“使用视频 latent”输入中关闭。
 - “拼接最终视频”节点默认只在所有片段存在、最终文件写入成功且大小大于 0 后清理显存；中间片段保存、拼接失败或暂停时不会清理。可通过“最终视频完成后清理显存”关闭。
 - `fps` 使用数字 `24`，不要填入文本。
 - 输出文件名只控制文件名，不改变项目目录；留空使用 `H3`。
@@ -213,7 +213,7 @@ output/h3_project/<项目文件夹名称>/
 
 H3 混合模型加载与 FL2VA/Ref2VA 组合方案参考 [ComfyUI-MiniMax-H3-Hybrid](https://github.com/ANe5s/ComfyUI-MiniMax-H3-Hybrid)，感谢 ANe5s 对 MiniMax H3 混合模型加载和权重组合的探索。本项目仅采用兼容性思路并实现独立的模型合并加载路径，没有复制该项目源代码；使用或再发布相关模型、代码时请遵守上游项目的许可证和条款。
 
-本项目的连续视频上下文功能基于并调用 [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) 提供的节点和实现思路，特别感谢 NikoDemon80 的工作。本仓库没有复制其完整源代码；安装和运行上下文功能时仍需单独安装该项目，并遵守其 GPL-3.0 许可证。视频 latent 直取和音频 payload 组合路径也会在其补丁可用时启用。
+本项目的连续视频上下文设计、旧版 H3 任意帧布局兼容和音频时间轴处理参考 [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context)，特别感谢 NikoDemon80 的工作。自动导演现已内置独立的旧版兼容实现，并在新版 ComfyUI 中优先使用核心 `MiniMaxH3AddGuide` 的原生能力；不再要求单独安装该项目。请遵守本仓库与上游项目的 GPL-3.0 许可证。
 
 高级色彩校正的设计参考了 [ComfyUI-CustomNodeKit](https://github.com/user2318/ComfyUI-CustomNodeKit) 的色彩漂移校正思路；H3 版本采用独立的保守实现，并增加场景切换保护。
 

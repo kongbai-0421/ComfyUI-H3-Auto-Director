@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import importlib
+import inspect
 from collections import OrderedDict
 import json
 import logging
@@ -88,6 +89,7 @@ CONTEXT_DIR_NAME = "context"
 CONTEXT_STAGE1_DIR_NAME = "context_stage1"
 DUAL_UPSCALE_CHOICES = ("普通插值", "普通放大模型", "RTX Video Super Resolution", "自动（RTX→普通模型→插值）")
 _MOTION_CONTEXT_MARKER = "_h3_auto_director_motion_context"
+_NATIVE_CONTEXT_KEY = "_h3_auto_director_native_context"
 _LAST_STAGE1_CONTEXT = None
 
 
@@ -575,6 +577,61 @@ def _mark_motion_context(conditioning):
     return node_helpers.conditioning_set_values(conditioning, {_MOTION_CONTEXT_MARKER: True})
 
 
+def _native_h3_add_guide_supported():
+    """Whether this ComfyUI core natively accepts arbitrary H3 guide frames.
+
+    ComfyUI v0.31's H3 PackedLayout accepts arbitrary ``resolved_frame_index``
+    and audio latents directly on a keyframe.  Older cores restrict anchors to
+    first/last frame and require the external Motion Context layout patch.
+    Probe the constructor instead of relying on a version string because many
+    portable ComfyUI distributions backport only part of the H3 changes.
+    """
+    try:
+        module = importlib.import_module("comfy.ldm.minimax.model")
+        parameters = inspect.signature(module.PackedLayout.__init__).parameters
+        return (hasattr(module, "FRAME_PER_TOKEN")
+                and "frame_count" not in parameters)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return False
+
+
+def _h3_pixel_frames(latent_t):
+    """Return H3 pixel frames represented by a video latent's temporal axis."""
+    try:
+        module = importlib.import_module("comfy.ldm.minimax.model")
+        frame_per_token = module.FRAME_PER_TOKEN
+    except (ImportError, AttributeError):
+        frame_per_token = (1, 4, 4, 4, 4)
+    return sum(frame_per_token[index % len(frame_per_token)] for index in range(int(latent_t)))
+
+
+def _h3_context_run(context_length):
+    """Snap the requested context to a distinct H3 VAE temporal run."""
+    return next((value for value in (39, 22, 5, 1) if value <= int(context_length)), 1)
+
+
+def _h3_audio_tail_from_latent(context_latent, frame_count):
+    """Read a context audio tail without depending on Motion Context nodes."""
+    parts = _av_latent_parts(context_latent)
+    if parts is None or not torch.is_tensor(parts[0]) or not torch.is_tensor(parts[1]):
+        raise ValueError("上下文 AV latent 无效，无法读取音频上下文")
+    video, audio = parts
+    if audio.ndim == 3:
+        audio = audio.unsqueeze(0)
+    if video.ndim != 5 or audio.ndim != 4:
+        raise ValueError("H3 上下文 latent 格式无效")
+    total_steps = int(audio.shape[-1])
+    wanted_steps = max(1, int(round(int(frame_count) / FPS * 40.0)))
+    actual_steps = min(wanted_steps, total_steps)
+    if actual_steps < 1:
+        raise ValueError("上下文音频 latent 为空")
+    frame_total = _h3_pixel_frames(int(video.shape[2]))
+    overhang = float(total_steps) - (5.0 / 3.0) * float(frame_total)
+    if not 0.0 <= overhang < 1.0:
+        overhang = 0.0
+    return audio[:1, ..., -actual_steps:].clone(), actual_steps, overhang
+
+
 def _nearest_multiple(value, multiple=32):
     """Round a positive dimension to its nearest H3 canvas multiple."""
     multiple = max(1, int(multiple))
@@ -605,19 +662,34 @@ def _prepare_dual_sampling_conditioning(conditioning, strip_motion_context=False
         if not preserve_motion_context_marker:
             values.pop(_MOTION_CONTEXT_MARKER, None)
         if strip_motion_context and is_motion_context:
-            values.pop("minimax_keyframes", None)
-            values.pop("minimax_frame_count", None)
+            keyframes = values.get("minimax_keyframes")
+            if isinstance(keyframes, (list, tuple)):
+                kept_keyframes = [item for item in keyframes if not (
+                    isinstance(item, dict) and (
+                        item.get(_NATIVE_CONTEXT_KEY)
+                        or item.get("h3_auto_director_legacy_frame_index") is not None
+                    )
+                )]
+                if kept_keyframes:
+                    values["minimax_keyframes"] = kept_keyframes
+                else:
+                    values.pop("minimax_keyframes", None)
+                    values.pop("minimax_frame_count", None)
             refs = values.get("minimax_refs")
             if isinstance(refs, (list, tuple)):
                 # The adapter marks its audio continuation ref with the
                 # Motion Context timeline field. Leave all normal user refs.
                 retained = [ref for ref in refs if not (
-                    isinstance(ref, dict) and "motion_context_audio_end_frame" in ref
+                    isinstance(ref, dict) and (
+                        "motion_context_audio_end_frame" in ref
+                        or "h3_auto_director_legacy_audio_end_frame" in ref
+                    )
                 )]
                 if retained:
                     values["minimax_refs"] = retained
                 else:
                     values.pop("minimax_refs", None)
+            values.pop(_NATIVE_CONTEXT_KEY, None)
         prepared.append([entry[0], values, *entry[2:]])
     return prepared
 
@@ -705,7 +777,8 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context):
                 for ref in refs:
                     item = dict(ref)
                     ref_t = int(item.get("ref_audio_t", 0) or 0)
-                    is_context_audio = "motion_context_audio_end_frame" in item
+                    is_context_audio = ("motion_context_audio_end_frame" in item
+                                        or "h3_auto_director_legacy_audio_end_frame" in item)
                     if is_context_audio and ref_t > 0:
                         if item.get("audio_latent") is None:
                             # Never leave a positive ref_audio_t without a
@@ -739,6 +812,25 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context):
                                     )
                     updated_refs.append(item)
                 values["minimax_refs"] = updated_refs
+            # Native H3 guide audio lives on a keyframe rather than a ref.
+            # Replace only the Auto Director-marked guide with the separately
+            # saved final (stage-two) context audio; user-added guide audio is
+            # deliberately untouched.
+            if torch.is_tensor(source_audio) and source_audio.ndim == 4:
+                native_keyframes = values.get("minimax_keyframes")
+                if isinstance(native_keyframes, (list, tuple)):
+                    updated_keyframes = []
+                    for keyframe in native_keyframes:
+                        item = dict(keyframe)
+                        old_audio = item.get("audio_latent")
+                        if (item.get(_NATIVE_CONTEXT_KEY) and torch.is_tensor(old_audio)
+                                and old_audio.ndim == 4):
+                            actual_t = min(int(old_audio.shape[-1]), int(source_audio.shape[-1]))
+                            if actual_t > 0:
+                                item["audio_latent"] = source_audio[..., -actual_t:].to(
+                                    device=target_video.device, dtype=target_video.dtype)
+                        updated_keyframes.append(item)
+                    values["minimax_keyframes"] = updated_keyframes
             # The keyframe timeline is still the current segment's timeline;
             # the frame count from the first pass is valid for the same length.
             # Keep the marker out of the model payload after this pass; it is
@@ -1825,8 +1917,13 @@ class H3AutoDirectorSegment:
         use_audio = (bool(plan.get("continuation_mode", True)) and bool(seg.get("continue_audio", True))
                      and not restart and context_index > 0)
         target = round(float(seg["duration"]) * FPS)
-        physical = (_align_frames_nearest(target + int(context_length))
-                    if use_video else _align_frames(target))
+        # Native MiniMaxH3AddGuide anchors context *inside* the target
+        # timeline, so it does not consume output frames. Older H3 cores keep
+        # the historical head-pinned representation and still need the extra
+        # frame budget for their compatibility path.
+        physical = (_align_frames(target) if _native_h3_add_guide_supported()
+                    else (_align_frames_nearest(target + int(context_length))
+                          if use_video else _align_frames(target)))
         refs = _segment_reference_specs(plan, generation_index)
         LOG.info(
             "H3 Auto Director: 第 %d 段解析：视频上下文=%s，音频上下文=%s，"
@@ -2022,6 +2119,8 @@ def _cache_frame_count(plan, generation_index, context_length):
                  and _video_context_enabled(plan)
                  and bool(seg.get("continue_video", generation_index > 1)) and generation_index > 1)
     target = round(float(seg["duration"]) * FPS)
+    if _native_h3_add_guide_supported():
+        return _align_frames(target)
     return (_align_frames_nearest(target + int(context_length))
             if use_video else _align_frames(target))
 
@@ -2354,6 +2453,12 @@ class H3AutoDirectorAVDecode:
         images = _decode_h3_video(video_vae, parts[0])
         waveform = audio_vae.decode(parts[1]).movedim(-1, 1)
         sample_rate = getattr(audio_vae, "audio_sample_rate_output", getattr(audio_vae, "audio_sample_rate", 32000))
+        # Native H3 Guide has no prepended context frames. Its audio latent
+        # grid can round up by a fraction of a frame, so trim only that tail
+        # here and keep every decoded video frame.
+        expected_samples = int(round(int(images.shape[0]) / FPS * sample_rate))
+        if waveform.shape[-1] > expected_samples:
+            waveform = waveform[..., :expected_samples]
         return (images, {"waveform": waveform, "sample_rate": sample_rate})
 
 
@@ -2532,23 +2637,7 @@ class H3AutoDirectorMotionContext:
     @staticmethod
     def _direct_latent_context(conditioning, latent, context_latent, context_length, use_audio_context,
                                use_video_context=True):
-        """Build Motion Context payloads from the cached AV latent without VAE re-encoding."""
-        cls = nodes.NODE_CLASS_MAPPINGS.get("MiniMaxH3MotionContext")
-        if cls is None:
-            raise RuntimeError("未安装 ComfyUI-H3-Motion-Context")
-        try:
-            motion_nodes = importlib.import_module(cls.__module__)
-            package = cls.__module__.rsplit(".", 1)[0]
-            layout_module = importlib.import_module(package + ".patch_layout")
-            payload_module = importlib.import_module(package + ".patch_payload")
-            MC_KEY = layout_module.MC_KEY
-            MC_AUDIO_KEY = layout_module.MC_AUDIO_KEY
-            is_applied = layout_module.is_applied
-            payload_patch_applied = payload_module.is_applied
-        except (ImportError, AttributeError) as exc:
-            raise RuntimeError("ComfyUI-H3-Motion-Context 未提供 latent 直取所需接口") from exc
-        if not is_applied():
-            raise RuntimeError("H3 Motion Context 布局补丁未启用，无法使用视频 latent 直取")
+        """Build native or legacy-compatible context from cached AV latents."""
         target_parts = _av_latent_parts(latent)
         context_parts = _av_latent_parts(context_latent)
         if target_parts is None or context_parts is None:
@@ -2558,46 +2647,113 @@ class H3AutoDirectorMotionContext:
             raise ValueError("H3 视频 latent 必须是 [B,C,T,H,W]")
         if target_video.shape[0] != context_video.shape[0] or target_video.shape[1] != context_video.shape[1] or target_video.shape[3:] != context_video.shape[3:]:
             raise ValueError("上下文 latent 分辨率或通道与当前片段不一致")
-        run = next((value for value in (39, 22, 5, 1) if value <= int(context_length)), 1)
+        native_guides = _native_h3_add_guide_supported()
+        run = _h3_context_run(context_length)
         steps = {1: 1, 5: 2, 22: 7, 39: 12}[run]
+        legacy = None
+        if not native_guides:
+            from . import legacy_h3_motion
+            if not legacy_h3_motion.ensure_legacy_h3_motion_context():
+                raise RuntimeError("当前旧版 ComfyUI 无法启用内置 H3 Motion Context 兼容层")
+            legacy = legacy_h3_motion
         if not use_video_context:
             if not use_audio_context:
                 return conditioning, 0
-            if not payload_patch_applied():
-                raise RuntimeError("H3 Motion Context payload 补丁未启用，无法安全使用音频上下文")
-            audio_tail, audio_steps, overhang = motion_nodes._audio_tail_from_latent(context_latent, run)
-            values = {"minimax_refs": [{
-                "kind": "audio", "ref_audio_t": audio_steps,
-                "audio_latent": audio_tail.to(device=target_video.device, dtype=target_video.dtype),
-                # Audio-only continuation starts at the first frame because
-                # no video rows are pinned in this mode.
-                MC_AUDIO_KEY: 0.0,
-            }]}
+            audio_tail, audio_steps, _overhang = _h3_audio_tail_from_latent(context_latent, run)
+            audio_tail = audio_tail.to(device=target_video.device, dtype=target_video.dtype)
+            if native_guides:
+                values = {"minimax_keyframes": [{"resolved_frame_index": 0, "audio_latent": audio_tail,
+                                                   _NATIVE_CONTEXT_KEY: True}],
+                          _NATIVE_CONTEXT_KEY: True}
+            else:
+                values = {"minimax_refs": [{"kind": "audio", "ref_audio_t": audio_steps,
+                                              "audio_latent": audio_tail, legacy.MC_AUDIO_KEY: 0.0}]}
             return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), 0
         if context_video.shape[2] < steps:
             raise ValueError("上下文视频 latent 长度不足，无法读取 %d 帧上下文" % run)
-        if run >= motion_nodes._pixel_frames(int(target_video.shape[2])):
+        if run >= _h3_pixel_frames(int(target_video.shape[2])):
             raise ValueError("上下文长度不能占满当前生成片段")
         tail = context_video[:, :, -steps:].to(device=target_video.device, dtype=target_video.dtype)
-        offsets = motion_nodes._step_offsets(steps)
-        values = {
-            "minimax_keyframes": [
-                {"resolved_frame_index": 0, MC_KEY: offset, "latent": tail[:, :, index:index + 1]}
-                for index, offset in enumerate(offsets)
-            ],
-            "minimax_frame_count": motion_nodes._pixel_frames(int(target_video.shape[2])),
-        }
+        offsets, offset = [], 0
+        try:
+            frame_per_token = importlib.import_module("comfy.ldm.minimax.model").FRAME_PER_TOKEN
+        except (ImportError, AttributeError):
+            frame_per_token = (1, 4, 4, 4, 4)
+        for index in range(steps):
+            offsets.append(offset)
+            offset += frame_per_token[index % len(frame_per_token)]
+        if native_guides:
+            keyframes = [{"resolved_frame_index": frame, "latent": tail[:, :, index:index + 1],
+                          _NATIVE_CONTEXT_KEY: True}
+                         for index, frame in enumerate(offsets)]
+            values = {"minimax_keyframes": keyframes, _NATIVE_CONTEXT_KEY: True}
+        else:
+            keyframes = [{"resolved_frame_index": 0, legacy.MC_KEY: frame, "latent": tail[:, :, index:index + 1]}
+                         for index, frame in enumerate(offsets)]
+            values = {"minimax_keyframes": keyframes,
+                      "minimax_frame_count": _h3_pixel_frames(int(target_video.shape[2]))}
         if use_audio_context:
-            if not payload_patch_applied():
-                raise RuntimeError("H3 Motion Context payload 补丁未启用，无法安全使用音频上下文")
-            audio_tail, audio_steps, overhang = motion_nodes._audio_tail_from_latent(context_latent, run)
-            values["minimax_refs"] = [{
-                "kind": "audio", "ref_audio_t": audio_steps,
-                "audio_latent": audio_tail.to(device=target_video.device, dtype=target_video.dtype),
-                # Match Motion Context's placement exactly: H3's final audio
-                # latent can extend a fraction of a step beyond the last video frame.
-                MC_AUDIO_KEY: float(run) + float(overhang) / (5.0 / 3.0),
-            }]
+            audio_tail, audio_steps, overhang = _h3_audio_tail_from_latent(context_latent, run)
+            audio_tail = audio_tail.to(device=target_video.device, dtype=target_video.dtype)
+            if native_guides:
+                # MiniMaxH3AddGuide anchors audio at the keyframe's frame
+                # index. Context audio is the *start* of the carried window,
+                # therefore it must start at frame 0 alongside the first
+                # video block, not at the final compressed-video block.
+                keyframes[0]["audio_latent"] = audio_tail
+            else:
+                values["minimax_refs"] = [{"kind": "audio", "ref_audio_t": audio_steps,
+                                             "audio_latent": audio_tail,
+                                             legacy.MC_AUDIO_KEY: float(run) + float(overhang) / (5.0 / 3.0)}]
+        return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), (0 if native_guides else run)
+
+    @staticmethod
+    def _vae_context(conditioning, vae, latent, context_frames, context_length, use_audio_context):
+        """Fallback when no compatible cached AV latent is available.
+
+        This keeps old workflows usable without an external Motion Context
+        installation.  The native core receives arbitrary guide frames
+        directly; a legacy core receives the internally patched equivalent.
+        """
+        target_parts = _av_latent_parts(latent)
+        if target_parts is None or not torch.is_tensor(target_parts[0]) or target_parts[0].ndim != 5:
+            raise ValueError("H3 目标 latent 无效，无法编码视频上下文")
+        target_video = target_parts[0]
+        run = _h3_context_run(context_length)
+        frames = context_frames
+        if not torch.is_tensor(frames) or frames.ndim != 4 or frames.shape[0] < 1:
+            raise ValueError("上下文画面无效，无法回退至 VAE 编码")
+        frames = frames[-min(run, int(frames.shape[0])):]
+        if frames.shape[0] < run:
+            frames = torch.cat((frames[:1].repeat((run - frames.shape[0], 1, 1, 1)), frames), dim=0)
+        height, width = int(target_video.shape[3]) * 16, int(target_video.shape[4]) * 16
+        samples = frames[..., :3].movedim(-1, 1)
+        samples = comfy.utils.common_upscale(samples, width, height, "lanczos", "center").movedim(1, -1)
+        encoded = _encode_h3_video(vae, samples)
+        if not torch.is_tensor(encoded) or encoded.ndim != 5:
+            raise ValueError("H3 视频 VAE 未返回 [B,C,T,H,W] latent")
+        steps = min(int(encoded.shape[2]), int(target_video.shape[2]))
+        offsets, current = [], 0
+        module = importlib.import_module("comfy.ldm.minimax.model")
+        for index in range(steps):
+            offsets.append(current)
+            current += module.FRAME_PER_TOKEN[index % len(module.FRAME_PER_TOKEN)]
+        if _native_h3_add_guide_supported():
+            keyframes = [{"resolved_frame_index": frame, "latent": encoded[:, :, index:index + 1].to(
+                device=target_video.device, dtype=target_video.dtype), _NATIVE_CONTEXT_KEY: True}
+                for index, frame in enumerate(offsets)]
+            values = {"minimax_keyframes": keyframes, _NATIVE_CONTEXT_KEY: True}
+            LOG.info("H3 Auto Director: 使用新版原生 Guide VAE 回退上下文：视频 keyframe=%d，音频上下文不可用", len(keyframes))
+            return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), 0
+        from . import legacy_h3_motion
+        if not legacy_h3_motion.ensure_legacy_h3_motion_context():
+            raise RuntimeError("当前旧版 ComfyUI 无法启用内置 H3 Motion Context 兼容层")
+        keyframes = [{"resolved_frame_index": 0, legacy_h3_motion.MC_KEY: frame,
+                      "latent": encoded[:, :, index:index + 1].to(device=target_video.device, dtype=target_video.dtype)}
+                     for index, frame in enumerate(offsets)]
+        values = {"minimax_keyframes": keyframes,
+                  "minimax_frame_count": _h3_pixel_frames(int(target_video.shape[2]))}
+        LOG.info("H3 Auto Director: 使用内置旧版 Motion Context VAE 回退：视频 keyframe=%d，音频上下文不可用", len(keyframes))
         return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), run
 
     def apply(self, conditioning, vae, latent, context_frames, use_video_context, use_audio_context, context_length, context_latent=None, use_video_latent=True):
@@ -2636,16 +2792,8 @@ class H3AutoDirectorMotionContext:
                 return with_stage2(result)
             except ValueError as exc:
                 LOG.info("H3 Auto Director: 视频 latent 直取不可用，回退 VAE 上下文编码：%s", exc)
-        cls = nodes.NODE_CLASS_MAPPINGS.get("MiniMaxH3MotionContext")
-        if cls is None:
-            raise RuntimeError("Install ComfyUI-H3-Motion-Context before using H3 Auto Director")
-        inner = cls()
-        result = inner.apply(conditioning, vae, latent, context_frames, context_length,
-                             "video", "head", "disabled", context_length,
-                             "timeline", context_latent if use_audio_context else None, None, None)
-        LOG.info("H3 Auto Director: 应用 VAE 视频上下文：裁剪帧数=%d，音频上下文=%s",
-                 int(result[1]), "开启" if use_audio_context else "关闭")
-        return (self._attach_stage2_context(_mark_motion_context(result[0]), stage2_context), result[1])
+        result = self._vae_context(conditioning, vae, latent, context_frames, context_length, use_audio_context)
+        return with_stage2(result)
 
 
 def _write_wav(path: Path, audio):
