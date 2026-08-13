@@ -1883,16 +1883,16 @@ class H3AutoDirectorCachedReferenceToVideo:
             "context_length": ("INT", {"default": FRAME_CONTEXT_DEFAULT, "min": 5, "max": 39}),
             "segment_index": ("INT", {"default": 0, "min": 0, "forceInput": True}),
             # Kept at the original widget position so old workflows still
-            # deserialize correctly. The browser hides this legacy switch;
-            # ``ref_image_size`` is now the sole automatic match/max control.
+            # deserialize correctly. It is now the visible preset-mode switch;
+            # ``ref_image_size`` is the preset selector shown beside it.
             "use_auto_ref_image_size": ("BOOLEAN", {"default": True,
-                                      "label_on": "旧版自动尺寸（兼容）",
-                                      "label_off": "旧版自动尺寸（兼容）",
-                                      "tooltip": "旧工作流兼容字段，不再参与模式选择。"}),
+                                      "label_on": "使用预设",
+                                      "label_off": "关闭使用预设",
+                                      "tooltip": "使用 match/max 预设参考尺寸；关闭后自动切换到手动设置。"}),
             "use_manual_ref_short_edge": ("BOOLEAN", {"default": False,
-                                      "label_on": "手动参考最短边",
-                                      "label_off": "关闭手动最短边",
-                                      "tooltip": "开启时按手动最短边缩放图片参考；输入会自动对齐到最近的 32 倍数。与自动参考尺寸二选一。"}),
+                                      "label_on": "使用手动设置",
+                                      "label_off": "关闭使用手动设置",
+                                      "tooltip": "按参考图最短边缩放图片参考；输入会自动对齐到最近的 32 倍数。与预设模式二选一。"}),
             "ref_short_edge": ("INT", {"default": 2048, "min": 32, "max": 8192, "step": 32,
                                       "tooltip": "图片参考的目标最短边；不会放大低于该尺寸的原图。"}),
         }, "optional": {
@@ -2077,10 +2077,10 @@ class H3AutoDirectorCachedReferenceToVideo:
             except json.JSONDecodeError as exc:
                 raise ValueError("参考素材 JSON 无效: %s" % exc) from exc
             _validate_reference_limits(refs, "当前片段参考素材")
-        # ``ref_image_size`` is always the automatic match/max mode. The
-        # manual switch is the only override; the legacy auto boolean is
-        # intentionally ignored so closing one control cannot toggle another.
-        manual_enabled = bool(use_manual_ref_short_edge)
+        # The UI keeps the two switches mutually exclusive. If an old or
+        # hand-edited workflow contains both values, preset mode wins; if both
+        # are off, preset mode is the deterministic fallback.
+        manual_enabled = bool(use_manual_ref_short_edge) and not bool(use_auto_ref_image_size)
         if not bool(plan.get("cache_prompt_embeddings", False)):
             return cls._encode_one(clip, vae, audio_vae, prompt, width, height, length,
                                    ref_image_size, _cache_segment_references(plan, generation_index) if refs is None else refs,

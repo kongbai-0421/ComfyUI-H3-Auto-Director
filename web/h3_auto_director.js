@@ -261,7 +261,7 @@ function applyChineseLabels(node) {
     segment_index: nodeClass === SEGMENT_NODE || nodeClass === CONTEXT_NODE || nodeClass === RESUME_NODE ? "上下文片段序号" : "片段序号",
     context_length: "上下文长度", prompt: "提示词", references_json: "参考素材 JSON",
     clip: "文本编码器", vae: "视频 VAE", audio_vae: "音频 VAE", width: "宽度", height: "高度", length: "帧数",
-    ref_image_size: "自动参考尺寸（match/max）", use_auto_ref_image_size: "旧版自动尺寸（兼容）", use_manual_ref_short_edge: "使用手动参考最短边", ref_short_edge: "参考图片最短边", enable_resume: "启用断点续接", latent_path: "缓存潜变量路径", video_path: "缓存视频路径",
+    ref_image_size: "预设选项（match/max）", use_auto_ref_image_size: "使用预设", use_manual_ref_short_edge: "使用手动设置", ref_short_edge: "参考图最短边", enable_resume: "启用断点续接", latent_path: "缓存潜变量路径", video_path: "缓存视频路径",
     conditioning: "条件", latent: "潜变量", context_frames: "上下文画面", context_latent: "上下文潜变量",
     use_video_context: "使用视频上下文", use_audio_context: "使用音频上下文", use_video_latent: "使用视频潜空间",
     fps: "帧率", images: "视频画面",
@@ -371,15 +371,25 @@ function decorateCachedReference(node) {
   const mode = widget(node, "ref_image_size");
   const nearest32 = (value) => Math.max(32, Math.round(Number(value || 2048) / 32) * 32);
   const boolValue = (value) => !(typeof value === "string" && ["false", "0", "off", "关闭"].includes(value.trim().toLowerCase()));
+  let switching = false;
   const update = () => {
+    // A loaded legacy workflow may have both switches off (or both on).
+    // Normalize it once, then keep the two modes mutually exclusive.
+    let presetOn = boolValue(auto?.value);
     const manualOn = boolValue(manual?.value);
-    // ``ref_image_size`` is the automatic match/max selector. It remains
-    // available whenever manual mode is off; no second boolean is toggled.
-    if (auto) auto.hidden = true;
-    if (mode) mode.hidden = manualOn;
+    if (!presetOn && !manualOn) {
+      presetOn = true;
+      if (auto && !switching) auto.value = true;
+    }
+    if (presetOn && manualOn && !switching) {
+      if (auto) auto.value = false;
+      presetOn = false;
+    }
+    if (auto) auto.hidden = false;
+    if (mode) mode.hidden = !presetOn;
     if (edge) {
-      edge.hidden = !manualOn;
-      if (manualOn) {
+      edge.hidden = presetOn;
+      if (!presetOn) {
         const aligned = nearest32(edge.value);
         if (Number(edge.value) !== aligned) {
           edge.value = aligned;
@@ -391,12 +401,31 @@ function decorateCachedReference(node) {
   };
   if (!node.__h3CachedReferenceSizingBound) {
     node.__h3CachedReferenceSizingBound = true;
+    const switchMode = (source, other, value, args, previous) => {
+      const enabled = boolValue(value);
+      switching = true;
+      if (enabled) {
+        if (other) other.value = false;
+      } else if (other) {
+        // Turning one mode off immediately activates the other mode, so the
+        // node can never get stuck with both modes disabled.
+        other.value = true;
+      }
+      const result = previous?.call(source, value, ...args);
+      switching = false;
+      update();
+      return result;
+    };
+    if (auto) {
+      const previous = auto.callback;
+      auto.callback = function (value, ...args) {
+        return switchMode(this, manual, value, args, previous);
+      };
+    }
     if (manual) {
       const previous = manual.callback;
       manual.callback = function (value, ...args) {
-        const result = previous?.call(this, value, ...args);
-        update();
-        return result;
+        return switchMode(this, auto, value, args, previous);
       };
     }
     if (edge) {
