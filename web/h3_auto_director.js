@@ -371,20 +371,30 @@ function decorateCachedReference(node) {
   const mode = widget(node, "ref_image_size");
   const nearest32 = (value) => Math.max(32, Math.round(Number(value || 2048) / 32) * 32);
   const boolValue = (value) => !(typeof value === "string" && ["false", "0", "off", "关闭"].includes(value.trim().toLowerCase()));
-  let switching = false;
-  const update = () => {
-    // A loaded legacy workflow may have both switches off (or both on).
-    // Normalize it once, then keep the two modes mutually exclusive.
+  let normalizing = false;
+  const setWidgetBoolean = (item, value) => {
+    if (!item) return;
+    const changed = boolValue(item.value) !== !!value;
+    item.value = !!value;
+    if (item.options) item.options.value = !!value;
+    if (changed && typeof item.callback === "function" && !normalizing) item.callback(!!value);
+  };
+  const update = (preferredMode = null) => {
+    // Older saved workflows may not contain the newly added widgets. Always
+    // normalize both values before drawing so there is never a dead state.
     let presetOn = boolValue(auto?.value);
-    const manualOn = boolValue(manual?.value);
-    if (!presetOn && !manualOn) {
-      presetOn = true;
-      if (auto && !switching) auto.value = true;
+    let manualOn = boolValue(manual?.value);
+    if (preferredMode === "preset") {
+      presetOn = true; manualOn = false;
+    } else if (preferredMode === "manual") {
+      presetOn = false; manualOn = true;
+    } else if (presetOn === manualOn) {
+      presetOn = true; manualOn = false;
     }
-    if (presetOn && manualOn && !switching) {
-      if (auto) auto.value = false;
-      presetOn = false;
-    }
+    normalizing = true;
+    if (auto) { auto.value = presetOn; if (auto.options) auto.options.value = presetOn; }
+    if (manual) { manual.value = manualOn; if (manual.options) manual.options.value = manualOn; }
+    normalizing = false;
     if (auto) auto.hidden = false;
     if (mode) mode.hidden = !presetOn;
     if (edge) {
@@ -397,35 +407,33 @@ function decorateCachedReference(node) {
         }
       }
     }
+    if (typeof node.computeSize === "function" && typeof node.setSize === "function") {
+      node.setSize(node.computeSize());
+    }
     node.setDirtyCanvas(true, true);
   };
   if (!node.__h3CachedReferenceSizingBound) {
     node.__h3CachedReferenceSizingBound = true;
-    const switchMode = (source, other, value, args, previous) => {
-      const enabled = boolValue(value);
-      switching = true;
-      if (enabled) {
-        if (other) other.value = false;
-      } else if (other) {
-        // Turning one mode off immediately activates the other mode, so the
-        // node can never get stuck with both modes disabled.
-        other.value = true;
-      }
-      const result = previous?.call(source, value, ...args);
-      switching = false;
-      update();
+    const switchMode = (source, modeName, value, args, previous) => {
+      // LiteGraph versions differ in when they assign widget.value. Prefer
+      // the callback argument when present; it is the newly clicked state.
+      const enabled = value === undefined ? boolValue(source?.value) : boolValue(value);
+      if (source) source.value = enabled;
+      const selectedMode = enabled ? modeName : (modeName === "preset" ? "manual" : "preset");
+      const result = previous?.call(source, enabled, ...args);
+      update(selectedMode);
       return result;
     };
     if (auto) {
       const previous = auto.callback;
       auto.callback = function (value, ...args) {
-        return switchMode(this, manual, value, args, previous);
+        return switchMode(this, "preset", value, args, previous);
       };
     }
     if (manual) {
       const previous = manual.callback;
       manual.callback = function (value, ...args) {
-        return switchMode(this, auto, value, args, previous);
+        return switchMode(this, "manual", value, args, previous);
       };
     }
     if (edge) {
@@ -440,6 +448,10 @@ function decorateCachedReference(node) {
     }
   }
   update();
+  // Node widgets can be hydrated one frame after loadedGraphNode. Reapply
+  // the invariant after hydration as well as on the initial decoration.
+  requestAnimationFrame(() => update());
+  setTimeout(() => update(), 120);
 }
 
 function h3ResolutionValue(node, name, fallback) {
