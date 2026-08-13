@@ -1407,10 +1407,13 @@ class H3AutoDirectorVideoTransferPlan:
             normalized.append({
                 "prompt": str(prompt or "").strip(), "duration": available / FPS,
                 "audio_restart": index in restart_at,
-                # Transfer uses the matching source window. Pixel-context
-                # continuation is opt-in only through the per-segment prior
-                # generated-video reference flag below.
-                "continue_video": False,
+                # Transfer uses the matching source window for motion. In
+                # addition, keep generated-scene continuity by default from
+                # segment 2 onward. A segment listed in
+                # ``previous_video_reference_segments`` switches to the
+                # previous generated clip as a multimodal video reference and
+                # therefore disables pixel/video context for that segment.
+                "continue_video": index > 1 and index not in previous_ref_at,
                 "use_previous_video_reference": index in previous_ref_at,
                 "references": [transfer_ref] + [dict(item) for item in assets],
             })
@@ -1428,7 +1431,10 @@ class H3AutoDirectorVideoTransferPlan:
             "auto_run": bool(auto_run),
             # Audio and video context policies are intentionally separate.
             "continuation_mode": bool(enable_audio_continuation),
-            "video_continuation": False,
+            # Video context continuation is enabled by default for transfer.
+            # The per-segment previous-video-reference flag is the explicit
+            # opt-out for selected segments.
+            "video_continuation": True,
             "cache_prompt_embeddings": bool(cache_prompt_embeddings),
             "skip_h3_audio_decode": bool(skip_h3_audio_decode),
             "final_audio_source": str(final_audio_source),
