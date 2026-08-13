@@ -85,8 +85,10 @@ QUALITY_CHOICES = ("最高质量", "高质量", "平衡", "快速")
 ENCODER_DEVICES = ("CPU", "GPU")
 COLOR_CORRECTION_CHOICES = ("关闭", "匹配首段", "匹配上段")
 CONTEXT_DIR_NAME = "context"
+CONTEXT_STAGE1_DIR_NAME = "context_stage1"
 DUAL_UPSCALE_CHOICES = ("普通插值", "普通放大模型", "RTX Video Super Resolution", "自动（RTX→普通模型→插值）")
 _MOTION_CONTEXT_MARKER = "_h3_auto_director_motion_context"
+_LAST_STAGE1_CONTEXT = None
 
 
 def _output_root():
@@ -345,10 +347,12 @@ def _indexed_file(directory: Path, index: int, suffix, output_name=""):
     return preferred
 
 
-def _paths(plan, index: int, output_name="", video_format="mp4", for_write=False, for_context=False):
+def _paths(plan, index: int, output_name="", video_format="mp4", for_write=False,
+           for_context=False, context_stage=2):
     base = Path(plan["project_dir"])
-    clips = base / (CONTEXT_DIR_NAME if for_context else "clips")
-    cache = base / "cache"
+    clips = base / ((CONTEXT_STAGE1_DIR_NAME if int(context_stage) == 1 else CONTEXT_DIR_NAME)
+                    if for_context else "clips")
+    cache = base / ("cache_stage1" if for_context and int(context_stage) == 1 else "cache")
     if for_write:
         stem = _output_filename(output_name)
         ext = "." + str(video_format or "mp4").lower().lstrip(".")
@@ -571,7 +575,8 @@ def _nearest_multiple(value, multiple=32):
     return max(multiple, int(math.floor(float(value) / multiple + 0.5)) * multiple)
 
 
-def _prepare_dual_sampling_conditioning(conditioning, strip_motion_context=False):
+def _prepare_dual_sampling_conditioning(conditioning, strip_motion_context=False,
+                                        preserve_motion_context_marker=False):
     """Remove internal tags and, for stage two, only Motion Context payloads.
 
     The stage-one sampler is responsible for joining a project segment to its
@@ -586,7 +591,11 @@ def _prepare_dual_sampling_conditioning(conditioning, strip_motion_context=False
             prepared.append(entry)
             continue
         values = entry[1].copy()
-        is_motion_context = bool(values.pop(_MOTION_CONTEXT_MARKER, False))
+        if not preserve_motion_context_marker:
+            values.pop("h3_stage2_context_latent", None)
+        is_motion_context = bool(values.get(_MOTION_CONTEXT_MARKER, False))
+        if not preserve_motion_context_marker:
+            values.pop(_MOTION_CONTEXT_MARKER, None)
         if strip_motion_context and is_motion_context:
             values.pop("minimax_keyframes", None)
             values.pop("minimax_frame_count", None)
@@ -601,6 +610,132 @@ def _prepare_dual_sampling_conditioning(conditioning, strip_motion_context=False
                     values["minimax_refs"] = retained
                 else:
                     values.pop("minimax_refs", None)
+        prepared.append([entry[0], values, *entry[2:]])
+    return prepared
+
+
+def _resize_h3_context_latent(latent, target_h, target_w):
+    """Resize a visual Motion Context latent to the current H3 latent grid.
+
+    The first and second passes of dual sampling intentionally use different
+    spatial grids.  Motion Context keyframes are encoded on the first-pass
+    grid, while the second pass consumes the upscaled grid.  Passing the old
+    keyframe tensor through unchanged makes ``PackedLayout.img_update`` expect
+    a different number of patch rows than ``cond_video_rows`` provides, which
+    aborts sampling with a shape-mismatch error.  Keep the temporal context
+    steps intact and resize only H/W; these are conditioning rows, not the
+    denoised video itself.
+    """
+    if not torch.is_tensor(latent) or latent.ndim != 5:
+        return latent
+    target_h, target_w = int(target_h), int(target_w)
+    if target_h <= 0 or target_w <= 0 or tuple(latent.shape[-2:]) == (target_h, target_w):
+        return latent
+    b, c, t, h, w = latent.shape
+    if h == target_h and w == target_w:
+        return latent
+    # Interpolate each temporal latent independently so no context timestep is
+    # invented or dropped during the resolution transition.
+    flat = latent.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w).float()
+    flat = torch.nn.functional.interpolate(flat, size=(target_h, target_w),
+                                            mode="bilinear", align_corners=False)
+    return flat.reshape(b, t, c, target_h, target_w).permute(0, 2, 1, 3, 4).to(
+        device=latent.device, dtype=latent.dtype
+    )
+
+
+def _prepare_stage2_conditioning(conditioning, latent, use_context):
+    """Prepare second-pass conditioning without stale first-pass grids."""
+    if not bool(use_context):
+        return _prepare_dual_sampling_conditioning(conditioning, strip_motion_context=True)
+    parts = _av_latent_parts(latent)
+    if not parts or not torch.is_tensor(parts[0]) or parts[0].ndim != 5:
+        return _prepare_dual_sampling_conditioning(conditioning)
+    target_video = parts[0]
+    source_video, source_audio = parts
+    prepared = []
+    for entry in _prepare_dual_sampling_conditioning(
+        conditioning, preserve_motion_context_marker=True
+    ):
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            prepared.append(entry)
+            continue
+        values = entry[1].copy()
+        if values.get(_MOTION_CONTEXT_MARKER):
+            saved_stage2 = values.pop("h3_stage2_context_latent", None)
+            saved_parts = _av_latent_parts(saved_stage2)
+            if saved_parts is not None:
+                source_video, source_audio = saved_parts
+            keyframes = values.get("minimax_keyframes")
+            if isinstance(keyframes, (list, tuple)):
+                source_video_resized = _resize_h3_context_latent(
+                    source_video, target_video.shape[-2], target_video.shape[-1]
+                )
+                source_steps = int(source_video_resized.shape[2]) if torch.is_tensor(source_video_resized) else 0
+                source_tail = source_video_resized[:, :, -len(keyframes):] if source_steps >= len(keyframes) else None
+                resized = []
+                for index, keyframe in enumerate(keyframes):
+                    item = dict(keyframe)
+                    if source_tail is not None:
+                        item["latent"] = source_tail[:, :, index:index + 1]
+                    else:
+                        item["latent"] = _resize_h3_context_latent(
+                            item.get("latent"), target_video.shape[-2], target_video.shape[-1]
+                        )
+                    resized.append(item)
+                values["minimax_keyframes"] = resized
+            refs = values.get("minimax_refs")
+            if isinstance(refs, (list, tuple)) and torch.is_tensor(source_audio):
+                # Only replace the Motion Context audio ref. User-supplied
+                # audio references must keep their own latent. The previous
+                # implementation also sliced ``[:, :, -ref_t:]``; for H3's
+                # [B, C, stereo, time] audio latent that indexes the stereo
+                # axis and leaves the full time axis intact. The layout then
+                # reserved 2*ref_t rows while the payload supplied 2*total_t
+                # rows (the 470-vs-74 crash seen on the second segment).
+                updated_refs = []
+                for ref in refs:
+                    item = dict(ref)
+                    ref_t = int(item.get("ref_audio_t", 0) or 0)
+                    is_context_audio = "motion_context_audio_end_frame" in item
+                    if is_context_audio and ref_t > 0:
+                        if item.get("audio_latent") is None:
+                            # Never leave a positive ref_audio_t without a
+                            # payload: PackedLayout would reserve rows that
+                            # _cond_audio_rows cannot fill.
+                            item["ref_audio_t"] = 0
+                            item.pop("motion_context_audio_end_frame", None)
+                        elif source_audio.ndim != 4:
+                            LOG.warning("H3 Auto Director: 二采上下文音频 latent 维度异常，跳过音频上下文：%s", tuple(source_audio.shape))
+                            item.pop("audio_latent", None)
+                            item["ref_audio_t"] = 0
+                            item.pop("motion_context_audio_end_frame", None)
+                        else:
+                            available_t = int(source_audio.shape[-1])
+                            actual_t = min(ref_t, available_t)
+                            if actual_t <= 0:
+                                item.pop("audio_latent", None)
+                                item["ref_audio_t"] = 0
+                                item.pop("motion_context_audio_end_frame", None)
+                            else:
+                                # Time is the final dimension: [B, C, 2, T].
+                                item["audio_latent"] = source_audio[..., -actual_t:]
+                                item["ref_audio_t"] = actual_t
+                                if actual_t != ref_t:
+                                    # Keep the timeline marker valid for the
+                                    # shortened window; the end coordinate is
+                                    # unchanged, only its width is reduced.
+                                    LOG.warning(
+                                        "H3 Auto Director: 二采上下文音频仅有 %d 个 latent 步，原请求 %d，已截取可用长度",
+                                        actual_t, ref_t,
+                                    )
+                    updated_refs.append(item)
+                values["minimax_refs"] = updated_refs
+            # The keyframe timeline is still the current segment's timeline;
+            # the frame count from the first pass is valid for the same length.
+            # Keep the marker out of the model payload after this pass; it is
+            # only an internal routing flag for this preparation step.
+            values.pop(_MOTION_CONTEXT_MARKER, None)
         prepared.append([entry[0], values, *entry[2:]])
     return prepared
 
@@ -957,25 +1092,34 @@ class H3AutoDirectorDualSampling:
         }, "optional": {
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_conditioning": ("CONDITIONING",),
+            "stage2_context_latent": ("LATENT",),
         }}
 
-    RETURN_TYPES = ("LATENT", "LATENT", "IMAGE")
-    RETURN_NAMES = ("最终 AV latent", "第一阶段 AV latent", "放大预览")
+    RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("最终 AV latent", "第一阶段 AV latent", "放大预览", "第一阶段画面")
     FUNCTION = "sample"
     CATEGORY = "H3 自动导演/采样"
 
     def sample(self, model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
                stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
                target_width, target_height, enable_stage2=True, stage2_use_context=False,
-               upscale_model=None, seed=0, stage2_conditioning=None):
+               upscale_model=None, seed=0, stage2_conditioning=None, stage2_context_latent=None):
+        global _LAST_STAGE1_CONTEXT
         stage1_conditioning = _prepare_dual_sampling_conditioning(conditioning)
         first = _dual_sample(model, stage1_conditioning, latent, sampler_name, scheduler, stage1_steps, stage1_denoise, seed)
+        # SaveSegment consumes this immediately after the sampler.  Keeping it
+        # here preserves compatibility with existing graphs that do not expose
+        # the optional first-stage latent socket.
+        _LAST_STAGE1_CONTEXT = first
+        first_output = dict(first)
+        first_output["_h3_stage1_context"] = first
         if not bool(enable_stage2):
             # Preserve the output contract without paying for decode/upscale.
             # The empty IMAGE is deliberately inert; the final AV latent is
             # the first-stage result and remains compatible with AV Decode.
             empty_preview = torch.empty((0, 1, 1, 3), dtype=torch.float32)
-            return (first, first, empty_preview)
+            first_images = _decode_h3_video(video_vae, _av_latent_parts(first)[0])
+            return (first_output, first, empty_preview, first_images)
         parts = _av_latent_parts(first)
         if parts is None:
             raise ValueError("双采样仅支持 MiniMax H3 联合 AV latent")
@@ -1015,12 +1159,21 @@ class H3AutoDirectorDualSampling:
         # injected for stage one unless the user explicitly asks to apply it
         # again during refinement. This also applies to a separately connected
         # stage-two conditioning if it came from our Motion Context adapter.
-        final_conditioning = _prepare_dual_sampling_conditioning(
+        # When provided, this is the separately saved final (second-pass)
+        # context from the previous segment. It is deliberately independent
+        # of the first-pass context used to create ``conditioning``.
+        stage2_source = stage2_context_latent if stage2_context_latent is not None else refined
+        if isinstance(stage2_source, dict) and stage2_source.get("h3_stage2_context_latent") is not None:
+            stage2_source = stage2_source["h3_stage2_context_latent"]
+        final_conditioning = _prepare_stage2_conditioning(
             stage2_conditioning if stage2_conditioning is not None else conditioning,
-            strip_motion_context=not bool(stage2_use_context),
+            stage2_source,
+            stage2_use_context,
         )
         final = _dual_sample(model, final_conditioning, refined, sampler_name, scheduler, stage2_steps, stage2_denoise, int(seed) + 1)
-        return (final, first, preview)
+        final_output = dict(final)
+        final_output["_h3_stage1_context"] = first
+        return (final_output, first, preview, decoded)
 
 
 class H3AutoDirectorDualSamplingModel:
@@ -1045,21 +1198,23 @@ class H3AutoDirectorDualSamplingModel:
             "target_width": ("INT", {"default": 1344, "min": 32, "max": nodes.MAX_RESOLUTION, "step": 32, "forceInput": True}),
             "target_height": ("INT", {"default": 768, "min": 32, "max": nodes.MAX_RESOLUTION, "step": 32, "forceInput": True}),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-        }, "optional": {"upscale_model": ("UPSCALE_MODEL",), "stage2_conditioning": ("CONDITIONING",)}}
+        }, "optional": {"upscale_model": ("UPSCALE_MODEL",), "stage2_conditioning": ("CONDITIONING",),
+            "stage2_context_latent": ("LATENT",)}}
 
-    RETURN_TYPES = ("LATENT", "LATENT", "IMAGE")
-    RETURN_NAMES = ("最终 AV latent", "第一阶段 AV latent", "放大预览")
+    RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("最终 AV latent", "第一阶段 AV latent", "放大预览", "第一阶段画面")
     FUNCTION = "sample"
     CATEGORY = "H3 自动导演/采样"
 
     def sample(self, model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
         stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
                target_width, target_height, enable_stage2=True, stage2_use_context=False,
-               seed=0, upscale_model=None, stage2_conditioning=None):
+               seed=0, upscale_model=None, stage2_conditioning=None, stage2_context_latent=None):
         return H3AutoDirectorDualSampling().sample(
         model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
             stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
-            target_width, target_height, enable_stage2, stage2_use_context, upscale_model, seed, stage2_conditioning)
+            target_width, target_height, enable_stage2, stage2_use_context, upscale_model, seed,
+            stage2_conditioning, stage2_context_latent)
 
 
 def _validate_reference_limits(refs, label="参考素材"):
@@ -2253,23 +2408,42 @@ class H3AutoDirectorSaveAudioSegment:
 class H3AutoDirectorContext:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"plan": ("H3_AUTO_PLAN",), "segment_index": ("INT", {"default": 0, "min": 0})}}
+        return {"required": {"plan": ("H3_AUTO_PLAN",), "segment_index": ("INT", {"default": 0, "min": 0})},
+                "optional": {"context_stage": ("INT", {"default": 1, "min": 1, "max": 2,
+                    "tooltip": "1=一采上下文，2=二采最终上下文"})}}
 
     RETURN_TYPES = ("IMAGE", "LATENT")
     RETURN_NAMES = ("上下文画面", "上下文潜变量")
     FUNCTION = "load"
     CATEGORY = "H3 自动导演"
 
-    def load(self, plan, segment_index):
+    def load(self, plan, segment_index, context_stage=1):
         video_enabled = _video_context_enabled(plan)
         audio_enabled = bool(plan.get("continuation_mode", True))
         if int(segment_index) <= 0 or not (video_enabled or audio_enabled):
             return (torch.zeros((1, 1, 1, 3), dtype=torch.float32), {"samples": [torch.zeros((1, 24, 2, 1, 1)), torch.zeros((1, 32, 2, 1))]})
-        video_path, latent_path = _paths(plan, int(segment_index), for_context=True)
-        if not latent_path.exists() or (video_enabled and not video_path.exists()):
+        context_stage = 1 if int(context_stage) == 1 else 2
+        video_path, latent_path = _paths(plan, int(segment_index), for_context=True, context_stage=context_stage)
+        if context_stage == 1 and not latent_path.exists():
+            # Projects created before dual-context caches existed remain
+            # resumable: use the final cache as the one available source.
+            video_path, latent_path = _paths(plan, int(segment_index), for_context=True, context_stage=2)
+        # Stage-one context intentionally stores the latent first.  Its video
+        # preview is optional because latent-direct Motion Context does not
+        # need a decoded frame stream; stage two keeps the normal video cache.
+        if not latent_path.exists() or (video_enabled and context_stage != 1 and not video_path.exists()):
             raise FileNotFoundError("Missing context cache for segment %d: %s / %s" % (int(segment_index), video_path, latent_path))
-        frames = _load_context_video(video_path) if video_enabled else torch.zeros((1, 1, 1, 3), dtype=torch.float32)
-        return (frames, _load_av_latent(latent_path))
+        frames = (_load_context_video(video_path) if video_enabled and video_path.exists()
+                  else torch.zeros((1, 1, 1, 3), dtype=torch.float32))
+        context_latent = _load_av_latent(latent_path)
+        # A stage-one reader can transparently carry the previous segment's
+        # final (stage-two) cache for the second pass of dual sampling.
+        if context_stage == 1:
+            _, stage2_path = _paths(plan, int(segment_index), for_context=True, context_stage=2)
+            if stage2_path.is_file():
+                context_latent = dict(context_latent)
+                context_latent["h3_stage2_context_latent"] = _load_av_latent(stage2_path)
+        return (frames, context_latent)
 
 
 class H3AutoDirectorResumeContext:
@@ -2320,6 +2494,17 @@ class H3AutoDirectorMotionContext:
     RETURN_NAMES = ("条件", "裁剪帧数")
     FUNCTION = "apply"
     CATEGORY = "H3 自动导演"
+
+    @staticmethod
+    def _attach_stage2_context(conditioning, context_latent):
+        if not isinstance(context_latent, dict):
+            return conditioning
+        stage2 = context_latent.get("h3_stage2_context_latent")
+        if stage2 is None:
+            return conditioning
+        return node_helpers.conditioning_set_values(
+            conditioning, {"h3_stage2_context_latent": stage2}
+        )
 
     @staticmethod
     def _direct_latent_context(conditioning, latent, context_latent, context_length, use_audio_context,
@@ -2393,17 +2578,22 @@ class H3AutoDirectorMotionContext:
         return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), run
 
     def apply(self, conditioning, vae, latent, context_frames, use_video_context, use_audio_context, context_length, context_latent=None, use_video_latent=True):
+        stage2_context = context_latent.get("h3_stage2_context_latent") if isinstance(context_latent, dict) else None
+        def with_stage2(value):
+            if stage2_context is None:
+                return value
+            return (self._attach_stage2_context(value[0], stage2_context), value[1])
         if not use_video_context:
             if bool(use_audio_context) and context_latent is not None:
                 try:
-                    return self._direct_latent_context(conditioning, latent, context_latent, context_length,
-                                                       True, use_video_context=False)
+                    return with_stage2(self._direct_latent_context(conditioning, latent, context_latent, context_length,
+                                                                    True, use_video_context=False))
                 except (ValueError, RuntimeError) as exc:
                     LOG.info("H3 Auto Director: 音频上下文直取不可用，跳过音频上下文：%s", exc)
-            return (conditioning, 0)
+            return (self._attach_stage2_context(conditioning, stage2_context), 0)
         if bool(use_video_latent) and context_latent is not None:
             try:
-                return self._direct_latent_context(conditioning, latent, context_latent, context_length, use_audio_context)
+                return with_stage2(self._direct_latent_context(conditioning, latent, context_latent, context_length, use_audio_context))
             except ValueError as exc:
                 LOG.info("H3 Auto Director: 视频 latent 直取不可用，回退 VAE 上下文编码：%s", exc)
         cls = nodes.NODE_CLASS_MAPPINGS.get("MiniMaxH3MotionContext")
@@ -2413,7 +2603,7 @@ class H3AutoDirectorMotionContext:
         result = inner.apply(conditioning, vae, latent, context_frames, context_length,
                              "video", "head", "disabled", context_length,
                              "timeline", context_latent if use_audio_context else None, None, None)
-        return (_mark_motion_context(result[0]), result[1])
+        return (self._attach_stage2_context(_mark_motion_context(result[0]), stage2_context), result[1])
 
 
 def _write_wav(path: Path, audio):
@@ -2623,6 +2813,8 @@ class H3AutoDirectorSaveSegment:
             "color_correction": (list(COLOR_CORRECTION_CHOICES), {"default": "关闭"}),
         }, "optional": {
             "audio": ("AUDIO",),
+            "stage1_latent": ("LATENT",),
+            "stage1_images": ("IMAGE",),
             "scene_cut_protection": ("BOOLEAN", {"default": True, "tooltip": "检测到明显场景切换时跳过颜色匹配，避免把新场景强行拉回旧场景。"}),
             "scene_cut_threshold": ("FLOAT", {"default": 0.18, "min": 0.02, "max": 1.0, "step": 0.01}),
             "correction_strength": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
@@ -2635,7 +2827,16 @@ class H3AutoDirectorSaveSegment:
     CATEGORY = "H3 自动导演"
     OUTPUT_NODE = True
 
-    def save(self, plan, segment_index, latent, images, fps, output_root="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量", color_correction="关闭", scene_cut_protection=True, scene_cut_threshold=0.18, correction_strength=0.75, residual_strength=0.2, audio=None):
+    def save(self, plan, segment_index, latent, images, fps, output_root="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量", color_correction="关闭", scene_cut_protection=True, scene_cut_threshold=0.18, correction_strength=0.75, residual_strength=0.2, audio=None, stage1_latent=None, stage1_images=None):
+        global _LAST_STAGE1_CONTEXT
+        if stage1_latent is None:
+            stage1_latent = latent.get("_h3_stage1_context") if isinstance(latent, dict) else None
+        if stage1_latent is None:
+            # Existing workflows predate the optional socket.  The dual
+            # sampler publishes the first-pass result for this immediately
+            # following save node, so old graphs still receive the separate
+            # stage-one cache automatically.
+            stage1_latent = _LAST_STAGE1_CONTEXT
         try:
             requested_fps = float(fps)
         except (TypeError, ValueError):
@@ -2688,6 +2889,23 @@ class H3AutoDirectorSaveSegment:
         else:
             _write_segment_video(video_path, images_to_save, audio, fps, video_format, video_codec, encoder_device, quality)
         st_save({"video": parts[0].detach().cpu().contiguous(), "audio": parts[1].detach().cpu().contiguous()}, str(latent_path), metadata={"format": "h3_auto_director_av_v1", "segment_index": str(int(segment_index))})
+        if stage1_latent is not None:
+            stage1_parts = _av_latent_parts(stage1_latent)
+            if stage1_parts is not None:
+                _, stage1_cache = _paths(plan, int(segment_index), output_root, video_format,
+                                         for_write=True, for_context=True, context_stage=1)
+                stage1_cache.parent.mkdir(parents=True, exist_ok=True)
+                st_save({"video": stage1_parts[0].detach().cpu().contiguous(),
+                         "audio": stage1_parts[1].detach().cpu().contiguous()},
+                        str(stage1_cache), metadata={"format": "h3_auto_director_av_stage1_v1", "segment_index": str(int(segment_index))})
+                if stage1_images is not None and torch.is_tensor(stage1_images) and stage1_images.numel():
+                    stage1_video, _ = _paths(plan, int(segment_index), output_root, video_format,
+                                             for_write=True, for_context=True, context_stage=1)
+                    stage1_video.parent.mkdir(parents=True, exist_ok=True)
+                    _write_segment_video(stage1_video, stage1_images, audio, fps,
+                                         video_format, video_codec, encoder_device, quality)
+                LOG.info("H3 Auto Director: 已保存第 %d 段一采上下文 latent 与二采上下文 latent", int(segment_index))
+        _LAST_STAGE1_CONTEXT = None
         return (str(video_path), str(latent_path))
 
 
