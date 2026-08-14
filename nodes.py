@@ -287,7 +287,30 @@ def _cpu_copy(value):
     return value
 
 
+def _allow_prompt_cache_safe_globals():
+    """Allow ComfyUI's AV container when loading trusted prompt caches.
+
+    PyTorch 2.6 changed ``torch.load``'s default safe-unpickler policy. H3
+    conditioning can legitimately contain ComfyUI's ``NestedTensor`` AV
+    container, so a weights-only load otherwise rejects a valid cache file.
+    Older PyTorch releases do not expose ``add_safe_globals`` and simply skip
+    this compatibility registration.
+    """
+    add_safe_globals = getattr(getattr(torch, "serialization", None),
+                               "add_safe_globals", None)
+    if add_safe_globals is None:
+        return
+    try:
+        nested_module = importlib.import_module("comfy.nested_tensor")
+        nested_tensor = getattr(nested_module, "NestedTensor", None)
+        if nested_tensor is not None:
+            add_safe_globals([nested_tensor])
+    except (ImportError, AttributeError, TypeError, RuntimeError) as exc:
+        LOG.debug("H3 Auto Director: 无法注册 NestedTensor 安全缓存类型：%s", exc)
+
+
 def _load_torch_cache(path):
+    _allow_prompt_cache_safe_globals()
     try:
         return torch.load(str(path), map_location="cpu", weights_only=True)
     except TypeError:
