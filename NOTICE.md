@@ -2,13 +2,13 @@
 
 ## ComfyUI-H3-Motion-Context
 
-The sequential video-context capability in this project integrates with and
-depends on [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context)
-by NikoDemon80. It provides the H3 motion-context node used to carry prior
-video frames and AV latent state into the following segment.
-
-This repository does not vendor that project's source code. Install it
-separately and comply with its GNU General Public License v3.0.
+The sequential video-context design and compatibility behavior in this project
+were informed by [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context)
+by NikoDemon80. The current Auto Director repository uses ComfyUI's native H3
+guide path when available and includes an independent compatibility layer, so
+the external node is optional for the bundled workflows. This repository does
+not vendor that project's source code. Follow its GNU General Public License
+v3.0 when using or redistributing the upstream project.
 
 ## MiniMax H3 and ComfyUI
 

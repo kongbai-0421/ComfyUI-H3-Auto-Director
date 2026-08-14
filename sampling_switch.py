@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import comfy.model_sampling
 import comfy.patcher_extension
+import logging
 
 try:
     import comfy.ldm.minimax.model as _minimax_model
@@ -16,6 +17,10 @@ except ImportError:  # pragma: no cover - only older ComfyUI builds
 
 
 PATCH_KEY = "h3_auto_director_legacy_audio_sampling"
+NATIVE_LAYOUT_PATCH_KEY = "h3_auto_director_native_layout_refresh"
+_LAYOUT_REFRESH_MARKER = "h3_auto_director_legacy_layout_refreshed"
+_LOG = logging.getLogger("h3_auto_director")
+_NATIVE_REFRESH_LOGGED = False
 NATIVE_MODE = "ComfyUI v0.31.0版本方法"
 LEGACY_MODE = "ComfyUI v0.30.0版本方法"
 _MODE_ALIASES = {
@@ -55,8 +60,104 @@ class MiniMaxH3LegacyModelSampling(
         return 1.0
 
 
+def _refresh_legacy_h3_payload(kwargs, transformer_options):
+    """Drop cached H3 layout data before running the legacy sampler.
+
+    H3 conditioning can be cached between segments, while the packed target
+    audio length changes with each segment.  The v0.31 core normally detects
+    this through ``PackedLayout.signature``; the v0.30 sampling wrapper can
+    receive a layout produced from the previous segment before that check.
+    Rebuild the layout from the actual ``x`` shape on every legacy forward and
+    rebuild the condition-latent lists from their source blocks as well.
+    """
+    payload = kwargs.get("minimax_payload")
+    if not isinstance(payload, dict):
+        return
+    if "layout" not in payload and "keyframes" not in payload and "refs" not in payload:
+        return
+    refreshed = dict(payload)
+    refreshed.pop("layout", None)
+    keyframes = refreshed.get("keyframes") or []
+    refs = refreshed.get("refs") or []
+    if keyframes or refs:
+        refreshed["cond_video_latents"] = [item["latent"] for item in keyframes
+                                            if isinstance(item, dict) and item.get("latent") is not None]
+        refreshed["cond_video_latents"] += [item["latent"] for item in refs
+                                             if isinstance(item, dict) and item.get("latent") is not None]
+        refreshed["cond_audio_latents"] = [item["audio_latent"] for item in keyframes
+                                            if isinstance(item, dict) and item.get("audio_latent") is not None]
+        refreshed["cond_audio_latents"] += [item["audio_latent"] for item in refs
+                                             if isinstance(item, dict) and item.get("audio_latent") is not None]
+    kwargs["minimax_payload"] = refreshed
+    if not transformer_options.get(_LAYOUT_REFRESH_MARKER):
+        transformer_options[_LAYOUT_REFRESH_MARKER] = True
+
+
+def _remove_legacy_motion_audio(payload):
+    """Remove only Auto Director's audio continuation blocks for a retry."""
+    if not isinstance(payload, dict):
+        return None
+    keyframes = payload.get("keyframes") or []
+    refs = payload.get("refs") or []
+    changed = False
+    new_keyframes = []
+    for item in keyframes:
+        if not isinstance(item, dict):
+            new_keyframes.append(item)
+            continue
+        clone = dict(item)
+        if clone.get("_h3_auto_director_native_context") and clone.get("audio_latent") is not None:
+            clone.pop("audio_latent", None)
+            changed = True
+        new_keyframes.append(clone)
+    new_refs = []
+    for item in refs:
+        if not isinstance(item, dict):
+            new_refs.append(item)
+            continue
+        if ("h3_auto_director_legacy_audio_end_frame" in item
+                or "motion_context_audio_end_frame" in item):
+            changed = True
+            continue
+        new_refs.append(item)
+    if not changed:
+        return None
+    retry = dict(payload)
+    retry.pop("layout", None)
+    retry["keyframes"] = new_keyframes
+    retry["refs"] = new_refs
+    retry["cond_video_latents"] = [item["latent"] for item in new_keyframes
+                                    if isinstance(item, dict) and item.get("latent") is not None]
+    retry["cond_video_latents"] += [item["latent"] for item in new_refs
+                                     if isinstance(item, dict) and item.get("latent") is not None]
+    retry["cond_audio_latents"] = [item["audio_latent"] for item in new_keyframes
+                                    if isinstance(item, dict) and item.get("audio_latent") is not None]
+    retry["cond_audio_latents"] += [item["audio_latent"] for item in new_refs
+                                     if isinstance(item, dict) and item.get("audio_latent") is not None]
+    return retry
+
+
+def _is_audio_layout_error(exc):
+    message = str(exc)
+    return ("expanded size" in message and "audio_embed" in message) or (
+        "expanded size" in message and "5376" in message
+    )
+
+
 def legacy_audio_sampling_wrapper(executor, x, timestep, context, transformer_options, **kwargs):
-    output = executor(x, timestep, context, transformer_options, **kwargs)
+    _refresh_legacy_h3_payload(kwargs, transformer_options)
+    try:
+        output = executor(x, timestep, context, transformer_options, **kwargs)
+    except RuntimeError as exc:
+        payload = kwargs.get("minimax_payload")
+        retry_payload = _remove_legacy_motion_audio(payload) if _is_audio_layout_error(exc) else None
+        if retry_payload is None:
+            raise
+        _LOG.warning(
+            "H3 Auto Director: v0.30 音频上下文布局不兼容，已移除自动导演音频上下文并保留视频上下文后重试"
+        )
+        kwargs["minimax_payload"] = retry_payload
+        output = executor(x, timestep, context, transformer_options, **kwargs)
     if not isinstance(output, (tuple, list)) or len(output) < 2:
         raise RuntimeError("MiniMax H3 legacy sampling expected separate video/audio model outputs")
     diffusion_model = executor.class_obj
@@ -69,6 +170,16 @@ def legacy_audio_sampling_wrapper(executor, x, timestep, context, transformer_op
     sigma_video = (timestep.flatten()[0] / 1000.0).float().clamp(min=1e-6)
     slope_audio = time_shift_slope(sigma_video, shift_video, shift_audio).to(output[1].dtype)
     return [output[0], output[1] * slope_audio]
+
+
+def native_layout_refresh_wrapper(executor, x, timestep, context, transformer_options, **kwargs):
+    """Refresh cached H3 condition layout while keeping native AV behavior."""
+    global _NATIVE_REFRESH_LOGGED
+    if not _NATIVE_REFRESH_LOGGED:
+        _LOG.info("H3 Auto Director: v0.31 原生音频采样已启用跨片段布局刷新")
+        _NATIVE_REFRESH_LOGGED = True
+    _refresh_legacy_h3_payload(kwargs, transformer_options)
+    return executor(x, timestep, context, transformer_options, **kwargs)
 
 
 def _new_model_sampling(model, sampling_type, shift_video, shift_audio):
@@ -118,6 +229,7 @@ def apply_h3_sampling(model, mode, shift_video, shift_audio):
         transformer_options["minimax_h3_sigma_shift_video"] = float(shift_video)
         transformer_options["minimax_h3_sigma_shift_audio"] = float(shift_audio)
         patched.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, PATCH_KEY)
+        patched.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, NATIVE_LAYOUT_PATCH_KEY)
         patched.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
             PATCH_KEY,
@@ -136,4 +248,10 @@ def apply_h3_sampling(model, mode, shift_video, shift_audio):
     transformer_options["minimax_h3_sigma_shift_audio"] = float(shift_audio)
     if hasattr(comfy.patcher_extension, "WrappersMP"):
         patched.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, PATCH_KEY)
+        patched.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, NATIVE_LAYOUT_PATCH_KEY)
+        patched.add_wrapper_with_key(
+            comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
+            NATIVE_LAYOUT_PATCH_KEY,
+            native_layout_refresh_wrapper,
+        )
     return patched
