@@ -41,16 +41,34 @@ Use these defaults:
 - `continue_audio`: `true` by default; set `false` on a specific segment when the user asks to close audio context continuation for that segment. This is independent of video continuation and global audio settings.
 - `continue_video`: `false` for the first segment; `true` for later segments unless the user requests independent scenes or disables continuation.
 - `use_previous_video_reference`: optional and `false` by default. Set it only on a later segment when the user asks to use the previous generated segment as a video reference. It automatically disables that segment's video context; do not set it on the first segment.
-- `references`: use `[]` unless the user supplies an exact local file path for the asset. Never invent filenames, paths, URLs, reference images, videos, audio, labels, or numbers.
+- `references`: use `[]` unless the user supplies an exact local file path for the asset. A file path is optional for prompt writing, but never invent filenames, paths, URLs, reference images, videos, audio, labels, or numbers.
 - Image references have no independent duration. Never emit `duration` or `image_duration` inside an image reference; the segment-level `duration` controls the complete generated clip. Video and audio metadata may retain `duration` only for display or source-media bookkeeping.
 
-Keep material file paths and material labels as separate facts. A path such as
-`D:\\...\\hero.mp4` identifies the file; `<Video 1>` identifies its prompt label.
-Never use a filename, upload order, attachment index, or label as a substitute
-for the other fact. If the user gives only a material label/number but no exact
-local file path, keep that segment's `references` as `[]`. If the user gives an
-exact local file path but no explicit one-based label/number, ask which
-`<Picture N>`, `<Video N>`, or `<Audio N>` it is before returning JSON.
+## Material Contract
+
+Treat a material's file path, one-based label, and prompt role as three separate
+facts. A path such as `D:\\...\\hero.mp4` tells the plugin which local file to
+load. `<Video 1>` tells H3 which material the text means. Its role explains
+what the material contributes, such as identity, composition, motion, sound,
+or a deliberately limited reference. A path never creates, changes, or proves
+a label or role; a label never creates a file-backed reference.
+
+For every material label supplied by the user and applicable to a segment, the
+segment prompt must include both its exact label and a basic role statement.
+Define it in `subject_definitions`, give it its own `retention_analysis` line,
+and cite the label where it affects the other sections. `<Subject N>` may
+describe a material-derived subject but never replaces `<Picture N>`,
+`<Video N>`, or `<Audio N>`. Do not omit a declared label merely because the
+file path is unavailable.
+
+When the user supplies a label/number and role but no local path, keep
+`references` as `[]` and still write that label and role in the prompt. When
+the user supplies an exact local path but no explicit one-based label, ask
+which `<Picture N>`, `<Video N>`, or `<Audio N>` it represents before returning
+JSON. Do not infer numbering from filenames, upload order, attachment index,
+visual appearance, or audio content. If the user supplies neither a material
+label nor a material request, use no fabricated material labels and keep
+`references` empty.
 
 The plugin's reference arrays and ComfyUI sockets are zero-based, but MiniMax H3
 prompt labels are one-based. Labels are scoped to each segment and are assigned
@@ -62,14 +80,24 @@ numbering or mapping, stop and ask which file is `<Picture N>`, `<Video N>`, or
 `<Audio N>`; do not infer numbering from filenames, upload order, descriptions,
 attachments, or visual appearance.
 
-For every referenced material, use its concrete material label in all six
-sections: define it in `subject_definitions`, list it as its own line in
-`retention_analysis`, and cite it at the point where it acts in `summary`,
-`detailed_description`, `overall_soundscape`, and/or `non_diegetic_music` as
-applicable. A `<Subject N>` may describe content derived from a material, but it
-never replaces the corresponding `<Picture N>`, `<Video N>`, or `<Audio N>` label.
-If a section has no applicable use for a material, state that relationship
-explicitly instead of silently omitting the label.
+Use only the user's stated role for a material when the model cannot directly
+inspect it. Do not claim to see, hear, or infer details from a file path,
+attachment, image, video, or audio file unless the user directly supplied those
+details or the executing model has the corresponding multimodal capability and
+was given the material. In that case, keep the description limited to the
+user's stated role: do not invent appearance, clothing, scene, motion, voice,
+instrumentation, lyrics, ambience, or other semantic details.
+
+Unless the user explicitly requests it, do not describe the appearance or
+clothing of a person with a corresponding picture reference. Refer to the
+person by the picture label and state only the requested preservation or use.
+Describe appearance and clothing only for a person without a corresponding
+picture reference, or when the user explicitly provides or requests those
+details. Apply the same rule to audio and video: do not describe a referenced
+voice, sound, music, action, performer, scene, or camera detail beyond the
+user's stated role. For an uninspected reference, write only a basic role
+statement, for example: `<Picture 1> provides the target identity as requested
+by the user.`
 
 A video reference creates an audio label only when the user explicitly confirms
 that it has an audio track or supplies an already-confirmed mapping. Otherwise
@@ -77,12 +105,10 @@ do not mention a soundtrack label. When present, enabled video soundtracks are
 numbered first in H3 presentation order, followed by standalone audio files;
 disabling one removes its label and shifts later audio labels down. Do not invent
 `has_audio` metadata. If the user provides no exact local file paths, every
-segment's `references` must remain `[]`, including when only material numbers
-were provided; if the prompt still refers to an
-unidentified material, ask the user for its exact path and one-based label before
-returning JSON. Do not create a reference entry from a visual description, an
-attachment name, “reference” wording, an uploaded preview, a URL, or inferred
-asset mapping.
+segment's `references` must remain `[]`, including when material labels were
+provided. Those labels and their user-defined roles still belong in the prompt.
+Do not create a reference entry from a visual description, an attachment name,
+“reference” wording, an uploaded preview, a URL, or inferred asset mapping.
 
 When a later segment sets `use_previous_video_reference: true`, the plugin
 injects a runtime-only previous-video reference after the user's references and
@@ -110,12 +136,12 @@ Use the official Ref2VA relationship markers in `retention_analysis`:
 `weak_reference`. Use `fully_copy`, `partially_copy`, `reference`, or
 `weak_reference` for audio entries.
 
-If the user provides no local file paths and no material is requested, write a
-text-only plan with `references: []` and no material labels. If the request
-mentions any missing material, ask for its exact local path and explicit one-based
-label before generating JSON. When references exist, every material label must be
-defined before use, remain stable across all six sections, and state precisely
-what is preserved versus transferred.
+If the user provides no material labels or material request, write a text-only
+plan with `references: []` and no material labels. If the user provides labels
+and roles but no paths, return the prompt with those labels and `references: []`.
+Ask only when a path is supplied without an explicit label. Every material label
+that is used must be defined before use, remain stable across all six sections,
+and state only the user-authorized preservation or transfer role.
 
 ## Segment Detail Rule
 
@@ -124,7 +150,9 @@ Do not reduce a segment to a short action label such as “the character runs”
 description. Each ordinary segment must describe a complete mini-shot:
 
 - composition, framing, subject position, and environment;
-- the subject's appearance and continuity from the previous segment;
+- the subject's continuity from the previous segment; describe appearance and
+  clothing only when there is no corresponding picture reference or the user
+  explicitly requests those details;
 - an ordered action progression with at least two or three state changes;
 - body direction, weight shift, hand/leg motion, and interaction with props when relevant;
 - camera type, movement direction, amplitude, speed, and the intended ending pose;
@@ -189,9 +217,11 @@ For a TTS segment, write a complete audio-directed prompt instead of a short
 instruction such as `speak this sentence`. Keep the six sections in the same
 order, adapting their purpose as follows:
 
-- `subject_definitions`: define the intended speaker, vocal identity, age
-  range when provided, language, accent, register, pitch, texture, breathiness,
-  and any voice reference such as `<Audio 1>`. Do not invent a voice reference.
+- `subject_definitions`: define the intended speaker and only the user-provided
+  vocal attributes (language, accent, register, pitch, texture, or breathiness).
+  For `<Audio 1>` or video audio, state its user-defined role but do not infer
+  vocal identity, age, accent, texture, lyrics, or music from an uninspected
+  file. Do not invent a voice reference.
 - `summary`: state the spoken content, delivery arc, emotional intention, and
   approximate timing within the segment. Keep dialogue, lyrics, and visible
   text in the user's original language.
@@ -223,13 +253,14 @@ Before emitting the result:
 
 1. Confirm the result parses as one JSON array.
 2. Confirm every segment has a non-empty `prompt`, valid duration, boolean audio and continuation flags, and a list-valued `references` field.
-3. Confirm `references` is `[]` for every segment unless the user supplied exact local file paths and explicit material labels. Confirm every non-empty reference has an exact user-provided local file path, the user-confirmed one-based label, and a valid type (`image`, `video`, or `audio`). For video references, `video_audio_enabled` is optional and must be boolean when present; omit it for the default enabled behavior.
+3. Confirm every user-declared material label appears with a basic, user-authorized role in every segment where it applies, even when its file path is absent. Confirm `references` is `[]` unless the user supplied exact local file paths. Confirm every non-empty reference has an exact user-provided local file path, an explicit user-confirmed one-based label, and a valid type (`image`, `video`, or `audio`). For video references, `video_audio_enabled` is optional and must be boolean when present; omit it for the default enabled behavior.
 4. Confirm no segment exceeds 12 total references, 9 images, 3 videos, or 3 independent audios.
 5. Confirm every prompt has all six sections in the required order.
 6. Confirm no prose, Markdown fence, or trailing comma appears outside the JSON.
 
-If the required material path or numbering clarification is missing, do not
-return a partial JSON array. Ask the user a concise clarification question first.
+If a supplied path has no numbering clarification, do not return a partial JSON
+array. Ask the user a concise clarification question first. A missing path by
+itself is not a blocker when the user supplied the material label and role.
 
 If the user supplies only a story idea and no segment count, infer a sensible
 number of 4-6 second segments from the requested duration, but do not add
