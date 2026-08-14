@@ -752,12 +752,29 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context):
                     source_video, target_video.shape[-2], target_video.shape[-1]
                 )
                 source_steps = int(source_video_resized.shape[2]) if torch.is_tensor(source_video_resized) else 0
-                source_tail = source_video_resized[:, :, -len(keyframes):] if source_steps >= len(keyframes) else None
+                # A native H3 guide may contain a continuous multi-step latent
+                # in one keyframe (the same form used by MiniMaxH3AddGuide).
+                # Do not equate keyframe count with temporal step count here:
+                # doing so replaced a 7-step context with one step in the
+                # second sampling pass and desynchronized PackedLayout from
+                # the payload's patchified condition rows.
+                step_counts = [
+                    int(item.get("latent").shape[2])
+                    if isinstance(item, dict) and torch.is_tensor(item.get("latent"))
+                    and item["latent"].ndim == 5 else 0
+                    for item in keyframes
+                ]
+                required_steps = sum(step_counts)
+                source_tail = (source_video_resized[:, :, -required_steps:]
+                               if required_steps > 0 and source_steps >= required_steps else None)
                 resized = []
+                cursor = 0
                 for index, keyframe in enumerate(keyframes):
                     item = dict(keyframe)
-                    if source_tail is not None:
-                        item["latent"] = source_tail[:, :, index:index + 1]
+                    item_steps = step_counts[index]
+                    if source_tail is not None and item_steps > 0:
+                        item["latent"] = source_tail[:, :, cursor:cursor + item_steps]
+                        cursor += item_steps
                     else:
                         item["latent"] = _resize_h3_context_latent(
                             item.get("latent"), target_video.shape[-2], target_video.shape[-1]
@@ -2674,20 +2691,24 @@ class H3AutoDirectorMotionContext:
         if run >= _h3_pixel_frames(int(target_video.shape[2])):
             raise ValueError("上下文长度不能占满当前生成片段")
         tail = context_video[:, :, -steps:].to(device=target_video.device, dtype=target_video.dtype)
-        offsets, offset = [], 0
-        try:
-            frame_per_token = importlib.import_module("comfy.ldm.minimax.model").FRAME_PER_TOKEN
-        except (ImportError, AttributeError):
-            frame_per_token = (1, 4, 4, 4, 4)
-        for index in range(steps):
-            offsets.append(offset)
-            offset += frame_per_token[index % len(frame_per_token)]
         if native_guides:
-            keyframes = [{"resolved_frame_index": frame, "latent": tail[:, :, index:index + 1],
-                          _NATIVE_CONTEXT_KEY: True}
-                         for index, frame in enumerate(offsets)]
+            # Native MiniMaxH3AddGuide represents a guide clip as one
+            # keyframe containing its full temporal latent.  Splitting this
+            # into arbitrary single-step keyframes can make the prebuilt
+            # PackedLayout disagree with cond_video_latents when conditioning
+            # is cached or references are also present.
+            keyframes = [{"resolved_frame_index": 0, "latent": tail,
+                          _NATIVE_CONTEXT_KEY: True}]
             values = {"minimax_keyframes": keyframes, _NATIVE_CONTEXT_KEY: True}
         else:
+            offsets, offset = [], 0
+            try:
+                frame_per_token = importlib.import_module("comfy.ldm.minimax.model").FRAME_PER_TOKEN
+            except (ImportError, AttributeError):
+                frame_per_token = (1, 4, 4, 4, 4)
+            for index in range(steps):
+                offsets.append(offset)
+                offset += frame_per_token[index % len(frame_per_token)]
             keyframes = [{"resolved_frame_index": 0, legacy.MC_KEY: frame, "latent": tail[:, :, index:index + 1]}
                          for index, frame in enumerate(offsets)]
             values = {"minimax_keyframes": keyframes,
@@ -2733,21 +2754,20 @@ class H3AutoDirectorMotionContext:
         if not torch.is_tensor(encoded) or encoded.ndim != 5:
             raise ValueError("H3 视频 VAE 未返回 [B,C,T,H,W] latent")
         steps = min(int(encoded.shape[2]), int(target_video.shape[2]))
-        offsets, current = [], 0
-        module = importlib.import_module("comfy.ldm.minimax.model")
-        for index in range(steps):
-            offsets.append(current)
-            current += module.FRAME_PER_TOKEN[index % len(module.FRAME_PER_TOKEN)]
         if _native_h3_add_guide_supported():
-            keyframes = [{"resolved_frame_index": frame, "latent": encoded[:, :, index:index + 1].to(
-                device=target_video.device, dtype=target_video.dtype), _NATIVE_CONTEXT_KEY: True}
-                for index, frame in enumerate(offsets)]
+            keyframes = [{"resolved_frame_index": 0, "latent": encoded[:, :, :steps].to(
+                device=target_video.device, dtype=target_video.dtype), _NATIVE_CONTEXT_KEY: True}]
             values = {"minimax_keyframes": keyframes, _NATIVE_CONTEXT_KEY: True}
             LOG.info("H3 Auto Director: 使用新版原生 Guide VAE 回退上下文：视频 keyframe=%d，音频上下文不可用", len(keyframes))
             return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), 0
         from . import legacy_h3_motion
         if not legacy_h3_motion.ensure_legacy_h3_motion_context():
             raise RuntimeError("当前旧版 ComfyUI 无法启用内置 H3 Motion Context 兼容层")
+        offsets, current = [], 0
+        module = importlib.import_module("comfy.ldm.minimax.model")
+        for index in range(steps):
+            offsets.append(current)
+            current += module.FRAME_PER_TOKEN[index % len(module.FRAME_PER_TOKEN)]
         keyframes = [{"resolved_frame_index": 0, legacy_h3_motion.MC_KEY: frame,
                       "latent": encoded[:, :, index:index + 1].to(device=target_video.device, dtype=target_video.dtype)}
                      for index, frame in enumerate(offsets)]
