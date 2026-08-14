@@ -29,6 +29,33 @@ ComfyUI/custom_nodes/ComfyUI-H3-Auto-Director
 `ModelSamplingMiniMaxH3` 或另一个 Legacy 节点。工作流文件不会因安装插件而自动修改。
 节点名称为“音频采样切换”，两个模式只改变 H3 音频采样时间尺度，视频 `shift_video` 仍由同一节点控制。
 
+### 音频采样方法的选择
+
+- 使用 ComfyUI v0.31.x 或更新核心，并且启用视频+音频上下文接续、音频参考或视频音轨参考时，选择
+  `ComfyUI v0.31.0版本方法`。该模式使用当前核心的 AV 音频采样和原生 H3 条件布局。
+- 需要复现 ComfyUI v0.30.0 的音频采样行为，或只生成独立片段、只使用画面上下文时，选择
+  `ComfyUI v0.30.0版本方法`。它只切换采样时间尺度，不会把当前 ComfyUI 核心降级为 v0.30.0。
+- 两种模式不要同时连接，也不要再串联核心的 `ModelSamplingMiniMaxH3` 或外部
+  `ComfyUI-MiniMax-H3-LegacySampling` 节点。切换后需要重新执行当前工作流；修改节点代码后需要重启实际运行工作流的 ComfyUI 进程。
+
+### 已知的旧版方法音频上下文错误
+
+在新版 ComfyUI 核心中选择 `ComfyUI v0.30.0版本方法`，并同时开启视频上下文和音频上下文时，部分 H3 latent
+形状会触发以下错误：
+
+```text
+RuntimeError: The expanded size of the tensor (414) must match the existing size (340)
+```
+
+该错误发生在 H3 的 `PackedLayout` 音频条件布局，与 ffmpeg、随机种子、文本编码器或模型文件损坏无关。原因是旧版音频采样包装器与新版原生音频上下文布局对同一段 latent 的音频步数计算不一致。
+
+临时规避方式：
+
+1. 需要音视频上下文接续时，切换为 `ComfyUI v0.31.0版本方法`；或
+2. 保持 v0.30 方法，但关闭发生错误片段的“音频上下文接续”，视频上下文可以继续使用。
+
+v0.30 方法在独立片段、普通多模态参考和仅视频上下文场景仍可使用。插件会在旧版核心上启用内置的 Motion Context 兼容层；该兼容层不等于把新版核心的 AV 音频布局强行改回旧版。后续若需要在 v0.30 方法下同时使用视频和音频上下文，必须进一步增加按实际 latent 音频长度重建布局的适配。
+
 ## 注意力加速与 Turbo LoRA
 
 `MiniMax H3 Mem Eff Sage Attention Patch`（Sage Attention）与 `SolAttnPatch`
