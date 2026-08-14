@@ -235,6 +235,8 @@ def apply_h3_sampling(model, mode, shift_video, shift_audio):
             PATCH_KEY,
             legacy_audio_sampling_wrapper,
         )
+        _LOG.info("H3 Auto Director: 音频采样=%s，视频偏移=%.3f，音频偏移=%.3f",
+                  LEGACY_MODE, float(shift_video), float(shift_audio))
         return patched
 
     if mode != NATIVE_MODE:
@@ -254,4 +256,6 @@ def apply_h3_sampling(model, mode, shift_video, shift_audio):
             NATIVE_LAYOUT_PATCH_KEY,
             native_layout_refresh_wrapper,
         )
+    _LOG.info("H3 Auto Director: 音频采样=%s，视频偏移=%.3f，音频偏移=%.3f",
+              NATIVE_MODE, float(shift_video), float(shift_audio))
     return patched

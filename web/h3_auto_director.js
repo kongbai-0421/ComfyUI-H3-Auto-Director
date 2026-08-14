@@ -257,15 +257,15 @@ function applyChineseLabels(node) {
   const labels = {
     project: "项目计划", project_id: "总文件夹名称", segments_json: "片段配置", duration: "默认片段时长",
     global_reference_set: "统一参考集", auto_run: "自动连续生成", continuation_mode: "接续模式",
-    cache_prompt_embeddings: "一次性缓存提示词向量", global_assets_json: "统一参考素材",
+    cache_prompt_embeddings: "一次性缓存提示词向量", cache_prompt_embeddings_to_disk: "缓存提示词向量到硬盘", global_assets_json: "统一参考素材",
     segment_index: nodeClass === SEGMENT_NODE || nodeClass === CONTEXT_NODE || nodeClass === RESUME_NODE ? "上下文片段序号" : "片段序号",
     context_length: "上下文长度", prompt: "提示词", references_json: "参考素材 JSON",
     clip: "文本编码器", vae: "视频 VAE", audio_vae: "音频 VAE", width: "宽度", height: "高度", length: "帧数",
     ref_image_size: "预设选项（match/max）", use_auto_ref_image_size: "使用预设", use_manual_ref_short_edge: "使用手动设置", ref_short_edge: "参考图最短边", enable_resume: "启用断点续接", latent_path: "缓存潜变量路径", video_path: "缓存视频路径",
     conditioning: "条件", latent: "潜变量", context_frames: "上下文画面", context_latent: "上下文潜变量",
     use_video_context: "使用视频上下文", use_audio_context: "使用音频上下文", use_video_latent: "使用视频潜空间",
-    fps: "帧率", images: "视频画面",
-    audio: "音频", saved_video: nodeClass === "H3AutoDirectorTTSController" ? "已保存音频" : "已保存视频", segment_node_id: "片段节点 ID", trim_frames: "裁剪帧数", match_tail: "匹配音频尾部",
+    fps: "帧率", images: "视频画面", use_stage1_audio_only: "最终仅使用一采音频",
+    audio: "音频", saved_video: nodeClass === "H3AutoDirectorTTSController" ? "已保存音频" : "已保存视频", segment_node_id: "片段节点 ID", trim_frames: "上下文裁剪帧数", match_tail: "匹配音频尾部",
     clip_index: "片段序号", latent_path: "潜变量路径",
     aspect_ratio: "宽高比", megapixels: "目标像素数（MP）", multiple: "尺寸倍数",
     use_preset_ratio: "使用预设比例", use_custom_ratio: "使用自定义比例", aspect_preset: "宽高比预设", custom_ratio: "自定义比例（宽,高）",
@@ -327,6 +327,7 @@ function decorateNode(node) {
     auto_run: "自动连续生成",
     continuation_mode: "接续模式",
     cache_prompt_embeddings: "一次性缓存提示词向量",
+    cache_prompt_embeddings_to_disk: "缓存提示词向量到硬盘",
     global_assets_json: "统一参考素材",
     output_root: nodeClass === SAVE_NODE ? "输出文件名（中间片段，留空使用 H3）" : nodeClass === CONTROLLER_NODE ? "输出文件名（最终视频，留空使用 H3）" : "项目文件夹名称（保存于 output/h3_project 下）",
     video_format: "视频格式",
@@ -372,10 +373,13 @@ function decorateCachedReference(node) {
   const nearest32 = (value) => Math.max(32, Math.round(Number(value || 2048) / 32) * 32);
   const boolValue = (value) => !(typeof value === "string" && ["false", "0", "off", "关闭"].includes(value.trim().toLowerCase()));
   let normalizing = false;
+  let hydrated = false;
   // LiteGraph can briefly expose the old toggle value while a widget callback
   // is running. Keep the user's last mode separately so editing the numeric
   // short-edge field cannot accidentally fall back to preset mode.
-  let selectedMode = node.__h3CachedReferenceSizingMode || null;
+  const storedMode = node.properties?.h3_ref_sizing_mode;
+  let selectedMode = (storedMode === "preset" || storedMode === "manual")
+    ? storedMode : (node.__h3CachedReferenceSizingMode || null);
   const setWidgetBoolean = (item, value) => {
     if (!item) return;
     const changed = boolValue(item.value) !== !!value;
@@ -399,15 +403,20 @@ function decorateCachedReference(node) {
     } else if (selectedMode === "manual") {
       presetOn = false; manualOn = true;
     } else if (presetOn === manualOn) {
-      // Ambiguous legacy state: preserve the historical preset default.
-      selectedMode = "preset";
+      // An equal pair can be the transient default values shown before a
+      // saved workflow's widgets are hydrated. Do not persist a mode yet.
+      if (hydrated) selectedMode = "preset";
       presetOn = true; manualOn = false;
-    } else {
+    } else if (hydrated) {
       // Hydrate the remembered mode from an existing, valid pair of widget
       // values before any later numeric-field callback can run.
       selectedMode = presetOn ? "preset" : "manual";
     }
     node.__h3CachedReferenceSizingMode = selectedMode;
+    if (selectedMode) {
+      node.properties = node.properties || {};
+      node.properties.h3_ref_sizing_mode = selectedMode;
+    }
     normalizing = true;
     if (auto) { auto.value = presetOn; if (auto.options) auto.options.value = presetOn; }
     if (manual) { manual.value = manualOn; if (manual.options) manual.options.value = manualOn; }
@@ -467,8 +476,8 @@ function decorateCachedReference(node) {
   update();
   // Node widgets can be hydrated one frame after loadedGraphNode. Reapply
   // the invariant after hydration as well as on the initial decoration.
-  requestAnimationFrame(() => update());
-  setTimeout(() => update(), 120);
+  requestAnimationFrame(() => { hydrated = true; update(); });
+  setTimeout(() => { hydrated = true; update(); }, 120);
 }
 
 function h3ResolutionValue(node, name, fallback) {
@@ -575,6 +584,7 @@ function openTTSPlanEditor(node) {
   const concat = checkbox("拼接最终长音频", "concat_final_audio", true);
   const continuation = checkbox("开启音频上下文接续", "enable_audio_continuation", true);
   const cache = checkbox("一次性缓存提示词向量", "cache_prompt_embeddings", true);
+  const diskCache = checkbox("缓存提示词向量到硬盘（使用项目 JSON 清单判断是否重编码）", "cache_prompt_embeddings_to_disk", false);
   const list = document.createElement("div"); list.style.cssText = "display:flex;flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;flex-direction:column;gap:10px;padding:0 6px 10px 0"; panel.appendChild(list);
   const refName = (ref) => ref.originalName || ref.name || ref.path || "未命名素材";
   const refLabel = (ref, type, refs) => { const ordinal = refs.filter((x) => x.type === type).indexOf(ref) + 1; return `${type === "image" ? "图片" : type === "video" ? "视频" : "音频"}${ordinal}：${refName(ref)}`; };
@@ -626,7 +636,7 @@ function openTTSPlanEditor(node) {
   const editableOrNotice = (flag, index, fn, message) => { if (flag.checked && index > 0) { message.textContent = "统一参考集已开启，请编辑第 1 段或关闭统一参考集。"; return; } Promise.resolve(fn()).catch((error) => { message.textContent = error.message || String(error); }); };
   unified.onchange = render;
   const actions = document.createElement("div"); actions.style.cssText = "flex:0 0 auto;display:flex;justify-content:flex-end;gap:8px;margin:14px -18px -18px;padding:12px 18px;background:rgba(32,37,43,.98);border-top:1px solid #59636e";
-  actions.append(makeButton("+ 添加片段", () => { segments.push({ prompt: "", duration: 5, audio_filename: "", audio_restart: false, continue_audio: continuation.checked, references: [], _media_references_open: false, _audio_references_open: true }); render(); }), makeButton("将第 1 段参考素材应用到全部", () => { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); unified.checked = true; render(); }), makeButton("取消", () => shade.remove()), makeButton("保存", () => { const names = new Set(); for (const seg of segments) { if (Number(seg.duration) < 4 || Number(seg.duration) > 15) { notice.textContent = "每段时长必须在 4 到 15 秒之间。"; return; } const name = String(seg.audio_filename || "").trim(); if (name && !name.toLowerCase().endsWith(".wav")) { notice.textContent = "音频文件名必须使用 .wav 扩展名。"; return; } if (name && names.has(name.toLowerCase())) { notice.textContent = `音频文件名重复：${name}`; return; } if (name) names.add(name.toLowerCase()); } if (unified.checked) { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); } const savedSegments = segments.map((seg) => { const copy = { ...seg }; delete copy._media_references_open; delete copy._audio_references_open; return copy; }); set("segments_json", JSON.stringify(savedSegments, null, 2)); set("global_reference_set", unified.checked); set("cache_prompt_embeddings", cache.checked); set("enable_audio_continuation", continuation.checked); set("concat_final_audio", concat.checked); node.setDirtyCanvas(true, true); shade.remove(); }));
+  actions.append(makeButton("+ 添加片段", () => { segments.push({ prompt: "", duration: 5, audio_filename: "", audio_restart: false, continue_audio: continuation.checked, references: [], _media_references_open: false, _audio_references_open: true }); render(); }), makeButton("将第 1 段参考素材应用到全部", () => { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); unified.checked = true; render(); }), makeButton("取消", () => shade.remove()), makeButton("保存", () => { const names = new Set(); for (const seg of segments) { if (Number(seg.duration) < 4 || Number(seg.duration) > 15) { notice.textContent = "每段时长必须在 4 到 15 秒之间。"; return; } const name = String(seg.audio_filename || "").trim(); if (name && !name.toLowerCase().endsWith(".wav")) { notice.textContent = "音频文件名必须使用 .wav 扩展名。"; return; } if (name && names.has(name.toLowerCase())) { notice.textContent = `音频文件名重复：${name}`; return; } if (name) names.add(name.toLowerCase()); } if (unified.checked) { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); } const savedSegments = segments.map((seg) => { const copy = { ...seg }; delete copy._media_references_open; delete copy._audio_references_open; return copy; }); set("segments_json", JSON.stringify(savedSegments, null, 2)); set("global_reference_set", unified.checked); set("cache_prompt_embeddings", cache.checked); set("cache_prompt_embeddings_to_disk", diskCache.checked); set("enable_audio_continuation", continuation.checked); set("concat_final_audio", concat.checked); node.setDirtyCanvas(true, true); shade.remove(); }));
   panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade); render();
 }
 
@@ -660,6 +670,7 @@ function openTransferEditor(node) {
   const passAudio = checkbox("传递参考视频音频", "pass_reference_video_audio", false);
   const audioCont = checkbox("开启音频上下文接续", "enable_audio_continuation", true);
   const cachePrompts = checkbox("一次性缓存全部片段的提示词向量", "cache_prompt_embeddings", true);
+  const diskCachePrompts = checkbox("缓存提示词向量到硬盘（使用项目 JSON 清单判断是否重编码）", "cache_prompt_embeddings_to_disk", false);
   const autoRun = checkbox("自动连续生成并在最后拼接", "auto_run", true);
   const skipDecode = checkbox("仅不解码 H3 音频（仍联合采样）", "skip_h3_audio_decode", false);
   const audioMode = document.createElement("select"); audioMode.innerHTML = "<option>H3 生成音频</option><option>参考视频音频</option>"; audioMode.value = get("final_audio_source", "H3 生成音频"); row("最终视频音频来源", audioMode);
@@ -700,7 +711,7 @@ function openTransferEditor(node) {
   const actions = document.createElement("div"); actions.style.cssText = "display:flex;justify-content:flex-end;gap:8px;margin-top:16px";
   actions.append(makeButton("取消", () => shade.remove()), makeButton("保存", () => {
     if (!video.path) { notice.textContent = "请先上传参考视频。"; return; }
-    set("prompt", prompt.value); set("segment_seconds", Number(seconds.value) || 5); set("pass_reference_video_audio", passAudio.checked); set("enable_audio_continuation", audioCont.checked); set("cache_prompt_embeddings", cachePrompts.checked); set("auto_run", autoRun.checked); set("skip_h3_audio_decode", skipDecode.checked); set("final_audio_source", audioMode.value); set("audio_restart_segments", restart.value); set("previous_video_reference_segments", previous.value); set("reference_video_json", JSON.stringify(video, null, 2)); set("reference_assets_json", JSON.stringify(assets, null, 2)); node.setDirtyCanvas(true, true); shade.remove();
+    set("prompt", prompt.value); set("segment_seconds", Number(seconds.value) || 5); set("pass_reference_video_audio", passAudio.checked); set("enable_audio_continuation", audioCont.checked); set("cache_prompt_embeddings", cachePrompts.checked); set("cache_prompt_embeddings_to_disk", diskCachePrompts.checked); set("auto_run", autoRun.checked); set("skip_h3_audio_decode", skipDecode.checked); set("final_audio_source", audioMode.value); set("audio_restart_segments", restart.value); set("previous_video_reference_segments", previous.value); set("reference_video_json", JSON.stringify(video, null, 2)); set("reference_assets_json", JSON.stringify(assets, null, 2)); node.setDirtyCanvas(true, true); shade.remove();
   }));
   panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade); renderAssets(); refreshSummary();
 }
