@@ -761,6 +761,78 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
     return result
 
 
+def _motion_context_video_steps(conditioning):
+    """Return the number of video-latent steps pinned by Motion Context.
+
+    Native H3 Guide stores the whole context window in one keyframe, while
+    the legacy compatibility layer stores one keyframe per temporal step.
+    Looking at the latent payload rather than the keyframe count keeps the
+    boundary lock correct on both ComfyUI generations.
+    """
+    maximum = 0
+    for entry in conditioning or []:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        values = entry[1]
+        if not isinstance(values, dict) or not values.get(_MOTION_CONTEXT_MARKER):
+            continue
+        entry_steps = 0
+        for keyframe in values.get("minimax_keyframes") or []:
+            if not isinstance(keyframe, dict):
+                continue
+            guide = keyframe.get("latent")
+            if torch.is_tensor(guide) and guide.ndim == 5:
+                entry_steps += int(guide.shape[2])
+        # conditioning_set_values applies the same Motion Context payload to
+        # every positive entry; do not multiply the lock window by that count.
+        maximum = max(maximum, entry_steps)
+    return max(0, maximum)
+
+
+def _lock_dual_sampling_context_prefix(refined, final, conditioning):
+    """Keep the already-connected boundary when stage two omits context.
+
+    Stage two starts from the upscaled first-pass latent, so it already has a
+    valid continuation prefix.  With no second Motion Context injection, a
+    high denoise value can nevertheless rewrite that prefix and create a seam
+    at the segment join.  Restore only the pinned video/audio prefix after the
+    second pass; the rest of the second-pass result remains untouched.
+    """
+    lock_video_steps = _motion_context_video_steps(conditioning)
+    if lock_video_steps <= 0:
+        return final
+    refined_parts = _av_latent_parts(refined)
+    final_parts = _av_latent_parts(final)
+    if refined_parts is None or final_parts is None:
+        return final
+    refined_video, refined_audio = refined_parts
+    final_video, final_audio = final_parts
+    if (not torch.is_tensor(refined_video) or not torch.is_tensor(final_video)
+            or refined_video.ndim != 5 or final_video.ndim != 5):
+        return final
+    lock_video_steps = min(lock_video_steps, int(refined_video.shape[2]), int(final_video.shape[2]))
+    if lock_video_steps <= 0:
+        return final
+    final_video = final_video.clone()
+    final_video[:, :, :lock_video_steps] = refined_video[:, :, :lock_video_steps].to(
+        device=final_video.device, dtype=final_video.dtype
+    )
+    if (torch.is_tensor(refined_audio) and torch.is_tensor(final_audio)
+            and refined_audio.ndim == 4 and final_audio.ndim == 4):
+        audio_steps = max(1, int(round(_h3_pixel_frames(lock_video_steps) / FPS * 40.0)))
+        audio_steps = min(audio_steps, int(refined_audio.shape[-1]), int(final_audio.shape[-1]))
+        if audio_steps > 0:
+            final_audio = final_audio.clone()
+            final_audio[..., :audio_steps] = refined_audio[..., :audio_steps].to(
+                device=final_audio.device, dtype=final_audio.dtype
+            )
+    import comfy.nested_tensor
+    locked = dict(final)
+    locked["samples"] = comfy.nested_tensor.NestedTensor((final_video, final_audio))
+    LOG.info("H3 Auto Director: 二采未启用上下文，锁定已接续边界 video_steps=%d", lock_video_steps)
+    return locked
+
+
 def _mark_motion_context(conditioning):
     """Tag only the conditioning emitted by this adapter, not user references."""
     return node_helpers.conditioning_set_values(conditioning, {_MOTION_CONTEXT_MARKER: True})
@@ -913,15 +985,22 @@ def _resize_h3_context_latent(latent, target_h, target_w):
     )
 
 
-def _prepare_stage2_conditioning(conditioning, latent, use_context):
-    """Prepare second-pass conditioning without stale first-pass grids."""
+def _prepare_stage2_conditioning(conditioning, latent, use_context, context_source=None):
+    """Prepare second-pass conditioning against the current pass's grid.
+
+    ``latent`` is always the current second-pass input.  ``context_source``
+    is the predecessor's final stage-two AV latent and must never be used as
+    the target grid merely because it is connected to the optional context
+    socket.
+    """
     if not bool(use_context):
         return _prepare_dual_sampling_conditioning(conditioning, strip_motion_context=True)
     parts = _av_latent_parts(latent)
     if not parts or not torch.is_tensor(parts[0]) or parts[0].ndim != 5:
         return _prepare_dual_sampling_conditioning(conditioning)
     target_video = parts[0]
-    source_video, source_audio = parts
+    source_parts = _av_latent_parts(context_source) if context_source is not None else None
+    source_video, source_audio = source_parts if source_parts is not None else parts
     prepared = []
     for entry in _prepare_dual_sampling_conditioning(
         conditioning, preserve_motion_context_marker=True
@@ -1388,7 +1467,7 @@ class H3AutoDirectorDualSampling:
             "enable_stage2": ("BOOLEAN", {"default": True, "label_on": "启用二采", "label_off": "关闭二采",
                                "tooltip": "关闭后仅执行第一阶段采样，跳过放大、视频 VAE 重编码和第二阶段采样。"}),
             "stage2_use_context": ("BOOLEAN", {"default": False, "label_on": "二采使用上下文", "label_off": "二采不使用上下文",
-                                    "tooltip": "开启后将第一阶段的项目视频/音频上下文也传入第二阶段；默认关闭，避免上下文被重复施加。"}),
+                                    "tooltip": "开启后将上一段最终二采视频/音频上下文适配到二采尺寸后传入；关闭时不重复注入并锁定一采已接续边界。"}),
             "stage2_steps": ("INT", {"default": 8, "min": 1, "max": 100}),
             "stage2_denoise": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.0, "step": 0.01}),
             "upscale_mode": (DUAL_UPSCALE_CHOICES, {"default": "普通插值"}),
@@ -1495,15 +1574,22 @@ class H3AutoDirectorDualSampling:
         # When provided, this is the separately saved final (second-pass)
         # context from the previous segment. It is deliberately independent
         # of the first-pass context used to create ``conditioning``.
-        stage2_source = stage2_context_latent if stage2_context_latent is not None else refined
+        stage2_source = stage2_context_latent
         if isinstance(stage2_source, dict) and stage2_source.get("h3_stage2_context_latent") is not None:
             stage2_source = stage2_source["h3_stage2_context_latent"]
         final_conditioning = _prepare_stage2_conditioning(
             stage2_conditioning if stage2_conditioning is not None else conditioning,
-            stage2_source,
+            refined,
             stage2_use_context,
+            stage2_source,
         )
         final = _dual_sample(model, final_conditioning, refined, sampler_name, scheduler, stage2_steps, stage2_denoise, int(seed) + 1)
+        if not bool(stage2_use_context):
+            # Do not inject the predecessor a second time, but preserve the
+            # prefix that stage one already generated from that predecessor.
+            # This keeps the segment join stable even at a stronger stage-two
+            # denoise value.
+            final = _lock_dual_sampling_context_prefix(refined, final, conditioning)
         if bool(use_stage1_audio_only):
             final_parts = _av_latent_parts(final)
             if final_parts is None:
@@ -1537,7 +1623,7 @@ class H3AutoDirectorDualSamplingModel:
             "enable_stage2": ("BOOLEAN", {"default": True, "label_on": "启用二采", "label_off": "关闭二采",
                                "tooltip": "关闭后仅执行第一阶段采样。"}),
             "stage2_use_context": ("BOOLEAN", {"default": False, "label_on": "二采使用上下文", "label_off": "二采不使用上下文",
-                                    "tooltip": "开启后第二阶段也使用视频/音频上下文接续。"}),
+                                    "tooltip": "开启后将上一段最终二采视频/音频上下文适配到二采尺寸后传入；关闭时不重复注入并锁定一采已接续边界。"}),
             "stage2_steps": ("INT", {"default": 8, "min": 1, "max": 100}),
             "stage2_denoise": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.0, "step": 0.01}),
             "upscale_mode": (DUAL_UPSCALE_CHOICES, {"default": "普通插值"}),
@@ -2870,12 +2956,29 @@ class H3AutoDirectorContext:
             LOG.info("H3 Auto Director: 上下文序号 %d 未启用视频/音频上下文，返回空上下文", int(segment_index))
             return (torch.zeros((1, 1, 1, 3), dtype=torch.float32), {"samples": [torch.zeros((1, 24, 2, 1, 1)), torch.zeros((1, 32, 2, 1))]})
         context_stage = 1 if int(context_stage) == 1 else 2
-        video_path, latent_path = _paths(plan, int(segment_index), for_context=True, context_stage=context_stage)
-        if context_stage == 1 and not latent_path.exists():
-            # Projects created before dual-context caches existed remain
-            # resumable: use the final cache as the one available source.
-            video_path, latent_path = _paths(plan, int(segment_index), for_context=True, context_stage=2)
-            LOG.info("H3 Auto Director: 一采上下文 latent 不存在，回退读取二采上下文：%s", latent_path)
+        requested_video_path, requested_latent_path = _paths(
+            plan, int(segment_index), for_context=True, context_stage=context_stage
+        )
+        video_path, latent_path = requested_video_path, requested_latent_path
+        if context_stage == 1:
+            # A dual-sampled predecessor's final output is the authoritative
+            # continuation source for both passes.  The first-pass cache is
+            # retained only as a compatibility fallback for old/incomplete
+            # projects or while a predecessor is still being generated.
+            final_video_path, final_latent_path = _paths(
+                plan, int(segment_index), for_context=True, context_stage=2
+            )
+            if final_latent_path.is_file() and (not video_enabled or final_video_path.is_file()):
+                video_path, latent_path = final_video_path, final_latent_path
+                LOG.info(
+                    "H3 Auto Director: 一采上下文优先使用上一段最终二采源：视频=%s，latent=%s",
+                    video_path, latent_path,
+                )
+            elif not requested_latent_path.exists():
+                # Projects created before dual-context caches existed remain
+                # resumable: use whatever final cache is available.
+                video_path, latent_path = final_video_path, final_latent_path
+                LOG.info("H3 Auto Director: 一采上下文 latent 不存在，回退读取二采上下文：%s", latent_path)
         # Stage-one context intentionally stores the latent first.  Its video
         # preview is optional because latent-direct Motion Context does not
         # need a decoded frame stream; stage two keeps the normal video cache.
@@ -2889,8 +2992,11 @@ class H3AutoDirectorContext:
         frames = (_load_context_video(video_path) if video_enabled and video_path.exists()
                   else torch.zeros((1, 1, 1, 3), dtype=torch.float32))
         context_latent = _load_av_latent(latent_path)
-        # A stage-one reader can transparently carry the previous segment's
-        # final (stage-two) cache for the second pass of dual sampling.
+        # Keep the final stage-two source explicit for the second pass.  When
+        # stage one already selected that source this is a duplicate by
+        # design; the marker makes the routing unambiguous and keeps old
+        # workflows (where stage-one cache is still the primary source)
+        # compatible.
         if context_stage == 1:
             _, stage2_path = _paths(plan, int(segment_index), for_context=True, context_stage=2)
             if stage2_path.is_file():
@@ -2970,8 +3076,18 @@ class H3AutoDirectorMotionContext:
         target_video, context_video = target_parts[0], context_parts[0]
         if not torch.is_tensor(target_video) or not torch.is_tensor(context_video) or target_video.ndim != 5 or context_video.ndim != 5:
             raise ValueError("H3 视频 latent 必须是 [B,C,T,H,W]")
-        if target_video.shape[0] != context_video.shape[0] or target_video.shape[1] != context_video.shape[1] or target_video.shape[3:] != context_video.shape[3:]:
-            raise ValueError("上下文 latent 分辨率或通道与当前片段不一致")
+        if (target_video.shape[0] != context_video.shape[0]
+                or target_video.shape[1] != context_video.shape[1]):
+            raise ValueError("上下文 latent batch 或通道与当前片段不一致")
+        if target_video.shape[3:] != context_video.shape[3:]:
+            old_size = tuple(int(value) for value in context_video.shape[3:])
+            context_video = _resize_h3_context_latent(
+                context_video, int(target_video.shape[3]), int(target_video.shape[4])
+            )
+            LOG.info(
+                "H3 Auto Director: 已将上一段最终二采视频上下文适配到当前一采尺寸：%s -> %s",
+                old_size, tuple(int(value) for value in context_video.shape[3:]),
+            )
         native_guides = _native_h3_add_guide_supported()
         run = _h3_context_run(context_length)
         steps = {1: 1, 5: 2, 22: 7, 39: 12}[run]
