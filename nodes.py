@@ -1576,11 +1576,16 @@ class H3AutoDirectorDualSampling:
         stage2_source = stage2_context_latent
         if isinstance(stage2_source, dict) and stage2_source.get("h3_stage2_context_latent") is not None:
             stage2_source = stage2_source["h3_stage2_context_latent"]
+        # Optional stage-two conditioning sockets are often left connected to
+        # an empty cache/placeholder node in older workflows.  An empty list
+        # must not replace the valid first-stage conditioning, otherwise the
+        # second sampler fails with "需要有效的正向条件" after stage one has
+        # already completed successfully.
+        stage2_input_conditioning = (
+            stage2_conditioning if stage2_conditioning else conditioning
+        )
         final_conditioning = _prepare_stage2_conditioning(
-            stage2_conditioning if stage2_conditioning is not None else conditioning,
-            refined,
-            stage2_use_context,
-            stage2_source,
+            stage2_input_conditioning, refined, stage2_use_context, stage2_source
         )
         final = _dual_sample(model, final_conditioning, refined, sampler_name, scheduler, stage2_steps, stage2_denoise, int(seed) + 1)
         if bool(use_stage1_audio_only):
