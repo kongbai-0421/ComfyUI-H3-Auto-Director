@@ -746,9 +746,46 @@ def _h3_sigmas(model, scheduler, steps, denoise):
     return sigmas[-(steps + 1):]
 
 
+def _is_conditioning_entry(value):
+    """Return whether *value* is one ComfyUI CONDITIONING entry.
+
+    Standard nodes return ``[[embedding, metadata], ...]``.  Prompt-cache and
+    compatibility nodes may return the single entry directly as
+    ``[embedding, metadata]`` (or use a tuple for the pair).  Treat both forms
+    identically so a valid positive condition is not mistaken for an empty
+    list.
+    """
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) >= 2
+        # The embedding is normally a tensor, but compatibility/cache nodes
+        # may wrap it in a tensor-like object.  The metadata dict is the
+        # reliable discriminator for a CONDITIONING entry.
+        and value[0] is not None
+        and isinstance(value[1], dict)
+    )
+
+
+def _conditioning_entries(value):
+    """Normalize standard and single-entry CONDITIONING values."""
+    if value is None:
+        return []
+    if _is_conditioning_entry(value):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return []
+
+
+def _has_positive_conditioning(value):
+    """Check for at least one usable positive CONDITIONING entry."""
+    return any(_is_conditioning_entry(entry) for entry in _conditioning_entries(value))
+
+
 def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, denoise, seed):
     """Run one positive-only H3 sampling pass, matching BasicGuider semantics."""
-    if not conditioning:
+    conditioning = _conditioning_entries(conditioning)
+    if not _has_positive_conditioning(conditioning):
         raise ValueError("双采样需要有效的正向条件")
     from comfy_extras.nodes_custom_sampler import Guider_Basic
     guider = Guider_Basic(model)
@@ -845,7 +882,7 @@ def _prepare_dual_sampling_conditioning(conditioning, strip_motion_context=False
     must remain available in both stages.
     """
     prepared = []
-    for entry in conditioning or []:
+    for entry in _conditioning_entries(conditioning):
         if not isinstance(entry, (list, tuple)) or len(entry) < 2:
             prepared.append(entry)
             continue
@@ -1063,6 +1100,12 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
                 "开启" if torch.is_tensor(source_audio) else "关闭",
                 tuple(int(v) for v in target_video.shape),
             )
+        else:
+            # A separately cached/encoded positive condition may not carry
+            # Auto Director's private Motion Context marker.  It is still a
+            # valid condition and must remain available for stage two; the
+            # fallback guide injection below can add context independently.
+            prepared.append([entry[0], values, *entry[2:]])
     # Some third-party prompt-cache nodes rebuild CONDITIONING and drop
     # Auto Director's private marker.  In that case the first pass still has
     # a valid continuation, but the second pass would silently refine without
@@ -1575,15 +1618,7 @@ class H3AutoDirectorDualSampling:
         # Optional stage-two conditioning sockets are often left connected to
         # an empty cache/placeholder node in older workflows.  An empty list
         # must not replace the valid first-stage conditioning, otherwise the
-        # second sampler fails with "需要有效的正向条件" after stage one has
-        # already completed successfully.
-        def _has_positive_conditioning(value):
-            return isinstance(value, (list, tuple)) and any(
-                isinstance(entry, (list, tuple)) and len(entry) >= 2
-                and isinstance(entry[1], dict)
-                for entry in value
-            )
-
+        # second sampler fails after stage one has already completed.
         stage2_input_conditioning = (
             stage2_conditioning if _has_positive_conditioning(stage2_conditioning)
             else conditioning
