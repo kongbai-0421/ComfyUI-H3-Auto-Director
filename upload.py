@@ -128,14 +128,37 @@ def _initial_directory(value, destination):
 
 def _enable_windows_dpi_awareness():
     if os.name != "nt":
-        return
+        return None
+    previous = None
     try:
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)  # PER_MONITOR_AWARE_V2
-    except (AttributeError, OSError):
+        # Set the process default for Tk's common dialog.  ComfyUI may already
+        # have selected a DPI mode, so also switch the picker thread below.
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
+    except (AttributeError, OSError, OverflowError, TypeError, ctypes.ArgumentError):
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
-        except (AttributeError, OSError):
+        except (AttributeError, OSError, OverflowError, TypeError, ctypes.ArgumentError):
             pass
+    try:
+        setter = ctypes.windll.user32.SetThreadDpiAwarenessContext
+        setter.restype = ctypes.c_void_p
+        setter.argtypes = [ctypes.c_void_p]
+        previous = setter(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
+    except (AttributeError, OSError, OverflowError, TypeError, ctypes.ArgumentError):
+        previous = None
+    return previous
+
+
+def _restore_windows_dpi_awareness(previous):
+    if os.name != "nt" or not previous:
+        return
+    try:
+        setter = ctypes.windll.user32.SetThreadDpiAwarenessContext
+        setter.restype = ctypes.c_void_p
+        setter.argtypes = [ctypes.c_void_p]
+        setter(previous)
+    except (AttributeError, OSError, OverflowError, TypeError, ctypes.ArgumentError):
+        pass
 
 
 def _create_hidden_root():
@@ -143,11 +166,36 @@ def _create_hidden_root():
         import tkinter as tk
     except ImportError as exc:
         raise RuntimeError("ComfyUI Python 缺少 tkinter，无法打开系统文件选择器") from exc
-    _enable_windows_dpi_awareness()
-    root = tk.Tk()
+    previous_dpi_context = _enable_windows_dpi_awareness()
+    try:
+        root = tk.Tk()
+    except Exception:
+        _restore_windows_dpi_awareness(previous_dpi_context)
+        raise
     root.withdraw()
     root.attributes("-topmost", True)
+    # Tk's logical scaling is independent from the native dialog DPI context.
+    # Set it from the actual monitor so fonts/buttons do not render at 96-DPI
+    # sizes on a 125/150/200% display.
+    if os.name == "nt":
+        try:
+            get_dpi = ctypes.windll.user32.GetDpiForWindow
+            get_dpi.argtypes = [ctypes.c_void_p]
+            get_dpi.restype = ctypes.c_uint
+            dpi = int(get_dpi(ctypes.c_void_p(root.winfo_id())) or 96)
+            root.tk.call("tk", "scaling", max(0.75, min(4.0, dpi / 72.0)))
+        except (AttributeError, OSError, tk.TclError):
+            pass
+    root._h3_previous_dpi_context = previous_dpi_context
     return root
+
+
+def _destroy_hidden_root(root):
+    previous = getattr(root, "_h3_previous_dpi_context", None)
+    try:
+        root.destroy()
+    finally:
+        _restore_windows_dpi_awareness(previous)
 
 
 def _select_paths(initial_dir, config):
@@ -164,7 +212,7 @@ def _select_paths(initial_dir, config):
             options["initialdir"] = str(initial_dir)
         return filedialog.askopenfilenames(**options)
     finally:
-        root.destroy()
+        _destroy_hidden_root(root)
 
 
 def select_directory(initial_dir=""):
@@ -175,7 +223,7 @@ def select_directory(initial_dir=""):
     try:
         selected = filedialog.askdirectory(title="选择文件选择器默认打开目录", initialdir=str(_initial_directory(initial_dir, destination)))
     finally:
-        root.destroy()
+        _destroy_hidden_root(root)
     return str(Path(selected).resolve()) if selected else ""
 
 

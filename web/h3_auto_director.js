@@ -584,7 +584,7 @@ function openTTSPlanEditor(node) {
   const concat = checkbox("拼接最终长音频", "concat_final_audio", true);
   const continuation = checkbox("开启音频上下文接续", "enable_audio_continuation", true);
   const cache = checkbox("一次性缓存提示词向量", "cache_prompt_embeddings", true);
-  const diskCache = checkbox("缓存提示词向量到硬盘（使用项目 JSON 清单判断是否重编码）", "cache_prompt_embeddings_to_disk", false);
+  const diskCache = checkbox("缓存提示词向量到硬盘（关闭一次性缓存时仅处理当前片段）", "cache_prompt_embeddings_to_disk", false);
   const list = document.createElement("div"); list.style.cssText = "display:flex;flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;flex-direction:column;gap:10px;padding:0 6px 10px 0"; panel.appendChild(list);
   const refName = (ref) => ref.originalName || ref.name || ref.path || "未命名素材";
   const refLabel = (ref, type, refs) => { const ordinal = refs.filter((x) => x.type === type).indexOf(ref) + 1; return `${type === "image" ? "图片" : type === "video" ? "视频" : "音频"}${ordinal}：${refName(ref)}`; };
@@ -670,7 +670,7 @@ function openTransferEditor(node) {
   const passAudio = checkbox("传递参考视频音频", "pass_reference_video_audio", false);
   const audioCont = checkbox("开启音频上下文接续", "enable_audio_continuation", true);
   const cachePrompts = checkbox("一次性缓存全部片段的提示词向量", "cache_prompt_embeddings", true);
-  const diskCachePrompts = checkbox("缓存提示词向量到硬盘（使用项目 JSON 清单判断是否重编码）", "cache_prompt_embeddings_to_disk", false);
+  const diskCachePrompts = checkbox("缓存提示词向量到硬盘（关闭一次性缓存时仅处理当前片段）", "cache_prompt_embeddings_to_disk", false);
   const autoRun = checkbox("自动连续生成并在最后拼接", "auto_run", true);
   const skipDecode = checkbox("仅不解码 H3 音频（仍联合采样）", "skip_h3_audio_decode", false);
   const audioMode = document.createElement("select"); audioMode.innerHTML = "<option>H3 生成音频</option><option>参考视频音频</option>"; audioMode.value = get("final_audio_source", "H3 生成音频"); row("最终视频音频来源", audioMode);

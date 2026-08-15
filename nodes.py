@@ -67,6 +67,10 @@ except ImportError:
 LOG = logging.getLogger("h3_auto_director")
 FPS = 24.0
 FRAME_CONTEXT_DEFAULT = 22
+# H3's first generated token after a pinned context can need several temporal
+# blocks to settle, especially when stage-two denoise is around 0.2.  Generate
+# this as hidden pre-roll and remove it before saving/concatenating the clip.
+CONTEXT_WARMUP_FRAMES = 16
 PROMPT_CACHE_MAX_PROJECTS = 2
 PROMPT_DISK_CACHE_SCHEMA = 1
 _PROMPT_CONDITIONING_CACHE = OrderedDict()
@@ -341,8 +345,28 @@ def _save_prompt_disk_entry(plan, manifest, generation_index, fingerprint, condi
     _atomic_json(manifest_path, manifest)
 
 
+def _bool_setting(value, default=False):
+    """Normalize ComfyUI/JSON boolean values, including legacy strings."""
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"", "0", "false", "off", "no", "关闭", "否"}:
+        return False
+    if text in {"1", "true", "on", "yes", "开启", "是"}:
+        return True
+    return bool(default)
+
+
+def _prompt_cache_all_enabled(plan):
+    return _bool_setting(plan.get("cache_prompt_embeddings", False), False)
+
+
 def _disk_cache_enabled(plan):
-    return bool(plan.get("cache_prompt_embeddings_to_disk", False))
+    return _bool_setting(plan.get("cache_prompt_embeddings_to_disk", False), False)
 
 
 def _prompt_disk_global_details(plan, width, height, ref_image_size, context_length,
@@ -759,78 +783,6 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
     result = dict(latent)
     result["samples"] = samples
     return result
-
-
-def _motion_context_video_steps(conditioning):
-    """Return the number of video-latent steps pinned by Motion Context.
-
-    Native H3 Guide stores the whole context window in one keyframe, while
-    the legacy compatibility layer stores one keyframe per temporal step.
-    Looking at the latent payload rather than the keyframe count keeps the
-    boundary lock correct on both ComfyUI generations.
-    """
-    maximum = 0
-    for entry in conditioning or []:
-        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
-            continue
-        values = entry[1]
-        if not isinstance(values, dict) or not values.get(_MOTION_CONTEXT_MARKER):
-            continue
-        entry_steps = 0
-        for keyframe in values.get("minimax_keyframes") or []:
-            if not isinstance(keyframe, dict):
-                continue
-            guide = keyframe.get("latent")
-            if torch.is_tensor(guide) and guide.ndim == 5:
-                entry_steps += int(guide.shape[2])
-        # conditioning_set_values applies the same Motion Context payload to
-        # every positive entry; do not multiply the lock window by that count.
-        maximum = max(maximum, entry_steps)
-    return max(0, maximum)
-
-
-def _lock_dual_sampling_context_prefix(refined, final, conditioning):
-    """Keep the already-connected boundary when stage two omits context.
-
-    Stage two starts from the upscaled first-pass latent, so it already has a
-    valid continuation prefix.  With no second Motion Context injection, a
-    high denoise value can nevertheless rewrite that prefix and create a seam
-    at the segment join.  Restore only the pinned video/audio prefix after the
-    second pass; the rest of the second-pass result remains untouched.
-    """
-    lock_video_steps = _motion_context_video_steps(conditioning)
-    if lock_video_steps <= 0:
-        return final
-    refined_parts = _av_latent_parts(refined)
-    final_parts = _av_latent_parts(final)
-    if refined_parts is None or final_parts is None:
-        return final
-    refined_video, refined_audio = refined_parts
-    final_video, final_audio = final_parts
-    if (not torch.is_tensor(refined_video) or not torch.is_tensor(final_video)
-            or refined_video.ndim != 5 or final_video.ndim != 5):
-        return final
-    lock_video_steps = min(lock_video_steps, int(refined_video.shape[2]), int(final_video.shape[2]))
-    if lock_video_steps <= 0:
-        return final
-    final_video = final_video.clone()
-    final_video[:, :, :lock_video_steps] = refined_video[:, :, :lock_video_steps].to(
-        device=final_video.device, dtype=final_video.dtype
-    )
-    if (torch.is_tensor(refined_audio) and torch.is_tensor(final_audio)
-            and refined_audio.ndim == 4 and final_audio.ndim == 4):
-        audio_steps = max(1, int(round(_h3_pixel_frames(lock_video_steps) / FPS * 40.0)))
-        audio_steps = min(audio_steps, int(refined_audio.shape[-1]), int(final_audio.shape[-1]))
-        if audio_steps > 0:
-            final_audio = final_audio.clone()
-            final_audio[..., :audio_steps] = refined_audio[..., :audio_steps].to(
-                device=final_audio.device, dtype=final_audio.dtype
-            )
-    import comfy.nested_tensor
-    locked = dict(final)
-    locked["samples"] = comfy.nested_tensor.NestedTensor((final_video, final_audio))
-    LOG.info("H3 Auto Director: 二采未启用上下文，锁定已接续边界 video_steps=%d", lock_video_steps)
-    return locked
 
 
 def _mark_motion_context(conditioning):
@@ -1467,7 +1419,7 @@ class H3AutoDirectorDualSampling:
             "enable_stage2": ("BOOLEAN", {"default": True, "label_on": "启用二采", "label_off": "关闭二采",
                                "tooltip": "关闭后仅执行第一阶段采样，跳过放大、视频 VAE 重编码和第二阶段采样。"}),
             "stage2_use_context": ("BOOLEAN", {"default": False, "label_on": "二采使用上下文", "label_off": "二采不使用上下文",
-                                    "tooltip": "开启后将上一段最终二采视频/音频上下文适配到二采尺寸后传入；关闭时不重复注入并锁定一采已接续边界。"}),
+                                    "tooltip": "开启后将上一段最终二采视频/音频上下文适配到二采尺寸后传入；关闭时仅使用一采已经接续的 latent。"}),
             "stage2_steps": ("INT", {"default": 8, "min": 1, "max": 100}),
             "stage2_denoise": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.0, "step": 0.01}),
             "upscale_mode": (DUAL_UPSCALE_CHOICES, {"default": "普通插值"}),
@@ -1493,7 +1445,7 @@ class H3AutoDirectorDualSampling:
                stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
                target_width, target_height, enable_stage2=True, stage2_use_context=False,
                upscale_model=None, seed=0, stage2_conditioning=None, stage2_context_latent=None,
-               use_stage1_audio_only=False):
+               use_stage1_audio_only=False, **_legacy_unused):
         global _LAST_STAGE1_CONTEXT
         stage1_conditioning = _prepare_dual_sampling_conditioning(conditioning)
         first = _dual_sample(model, stage1_conditioning, latent, sampler_name, scheduler, stage1_steps, stage1_denoise, seed)
@@ -1533,30 +1485,43 @@ class H3AutoDirectorDualSampling:
             raise ValueError("双采样仅支持 MiniMax H3 联合 AV latent")
         first_video, first_audio = parts
         decoded = _decode_h3_video(video_vae, first_video)
-        expected_frames = _expected_decoded_frames(video_vae, first_video)
         width = max(32, int(target_width) // 32 * 32)
         height = max(32, int(target_height) // 32 * 32)
-        mode = str(upscale_mode)
-        if mode == "RTX Video Super Resolution":
-            preview = _upscale_rtx(decoded, width, height, "高")
-        elif mode == "普通放大模型":
-            preview = _upscale_with_model(upscale_model, decoded)
-            preview = _upscale_interpolate(preview, width, height)
-        elif mode == "自动（RTX→普通模型→插值）":
-            try:
-                preview = _upscale_rtx(decoded, width, height, "高")
-            except Exception:
-                preview = _upscale_with_model(upscale_model, decoded) if upscale_model else decoded
-                preview = _upscale_interpolate(preview, width, height)
+        target_latent_size = (max(1, height // 16), max(1, width // 16))
+        first_latent_size = (int(first_video.shape[-2]), int(first_video.shape[-1]))
+        if first_latent_size == target_latent_size:
+            # Same spatial grid: a pixel upscale followed by VAE encode would
+            # only add reconstruction loss.  Keep the first-pass video latent
+            # byte-for-byte and decode it only for the preview output.
+            encoded_video = first_video
+            preview = decoded
+            LOG.info(
+                "H3 Auto Director: 一采/二采分辨率相同（latent=%s），跳过放大与视频 VAE 重编码",
+                first_latent_size,
+            )
         else:
-            preview = _upscale_interpolate(decoded, width, height)
-        # Some VAE/upscaler combinations round the temporal dimension while
-        # processing a video.  Restore H3's exact 17k+5 frame count before the
-        # second VAE encode; spatial scaling must never change time.
-        if expected_frames is not None:
-            preview = _match_video_frame_count(preview, expected_frames)
-        encoded_video = _encode_h3_video(video_vae, preview)
-        encoded_video = _match_latent_time(encoded_video, first_video.shape[2])
+            expected_frames = _expected_decoded_frames(video_vae, first_video)
+            mode = str(upscale_mode)
+            if mode == "RTX Video Super Resolution":
+                preview = _upscale_rtx(decoded, width, height, "高")
+            elif mode == "普通放大模型":
+                preview = _upscale_with_model(upscale_model, decoded)
+                preview = _upscale_interpolate(preview, width, height)
+            elif mode == "自动（RTX→普通模型→插值）":
+                try:
+                    preview = _upscale_rtx(decoded, width, height, "高")
+                except Exception:
+                    preview = _upscale_with_model(upscale_model, decoded) if upscale_model else decoded
+                    preview = _upscale_interpolate(preview, width, height)
+            else:
+                preview = _upscale_interpolate(decoded, width, height)
+            # Some VAE/upscaler combinations round the temporal dimension while
+            # processing a video.  Restore H3's exact 17k+5 frame count before
+            # the second VAE encode; spatial scaling must never change time.
+            if expected_frames is not None:
+                preview = _match_video_frame_count(preview, expected_frames)
+            encoded_video = _encode_h3_video(video_vae, preview)
+            encoded_video = _match_latent_time(encoded_video, first_video.shape[2])
         import comfy.nested_tensor
         # The two branches can be returned on different devices/dtypes by
         # custom VAEs.  Normalize audio before rebuilding H3's AV container.
@@ -1584,12 +1549,6 @@ class H3AutoDirectorDualSampling:
             stage2_source,
         )
         final = _dual_sample(model, final_conditioning, refined, sampler_name, scheduler, stage2_steps, stage2_denoise, int(seed) + 1)
-        if not bool(stage2_use_context):
-            # Do not inject the predecessor a second time, but preserve the
-            # prefix that stage one already generated from that predecessor.
-            # This keeps the segment join stable even at a stronger stage-two
-            # denoise value.
-            final = _lock_dual_sampling_context_prefix(refined, final, conditioning)
         if bool(use_stage1_audio_only):
             final_parts = _av_latent_parts(final)
             if final_parts is None:
@@ -1623,7 +1582,7 @@ class H3AutoDirectorDualSamplingModel:
             "enable_stage2": ("BOOLEAN", {"default": True, "label_on": "启用二采", "label_off": "关闭二采",
                                "tooltip": "关闭后仅执行第一阶段采样。"}),
             "stage2_use_context": ("BOOLEAN", {"default": False, "label_on": "二采使用上下文", "label_off": "二采不使用上下文",
-                                    "tooltip": "开启后将上一段最终二采视频/音频上下文适配到二采尺寸后传入；关闭时不重复注入并锁定一采已接续边界。"}),
+                                    "tooltip": "开启后将上一段最终二采视频/音频上下文适配到二采尺寸后传入；关闭时仅使用一采已经接续的 latent。"}),
             "stage2_steps": ("INT", {"default": 8, "min": 1, "max": 100}),
             "stage2_denoise": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.0, "step": 0.01}),
             "upscale_mode": (DUAL_UPSCALE_CHOICES, {"default": "普通插值"}),
@@ -1646,7 +1605,7 @@ class H3AutoDirectorDualSamplingModel:
                stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
                target_width, target_height, enable_stage2=True, stage2_use_context=False,
                seed=0, upscale_model=None, stage2_conditioning=None, stage2_context_latent=None,
-               use_stage1_audio_only=False):
+               use_stage1_audio_only=False, **_legacy_unused):
         return H3AutoDirectorDualSampling().sample(
         model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
             stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
@@ -2269,11 +2228,12 @@ class H3AutoDirectorSegment:
         use_audio = (bool(plan.get("continuation_mode", True)) and bool(seg.get("continue_audio", True))
                      and not restart and context_index > 0)
         target = round(float(seg["duration"]) * FPS)
+        context_run = _h3_context_run(context_length)
         # Both native Guide and the legacy compatibility path pin the previous
         # tail at the beginning of the generated timeline. SaveSegment removes
-        # that pre-roll before concatenation, so reserve it here to preserve
-        # the user's requested visible duration after trimming.
-        physical = (_align_frames_nearest(target + int(context_length))
+        # that pre-roll plus a short H3 settling window before concatenation,
+        # so reserve both here to preserve the requested visible duration.
+        physical = (_align_frames_nearest(target + context_run + CONTEXT_WARMUP_FRAMES)
                      if use_video else _align_frames(target))
         refs = _segment_reference_specs(plan, generation_index)
         LOG.info(
@@ -2470,7 +2430,7 @@ def _cache_frame_count(plan, generation_index, context_length):
                  and _video_context_enabled(plan)
                  and bool(seg.get("continue_video", generation_index > 1)) and generation_index > 1)
     target = round(float(seg["duration"]) * FPS)
-    return (_align_frames_nearest(target + int(context_length))
+    return (_align_frames_nearest(target + _h3_context_run(context_length) + CONTEXT_WARMUP_FRAMES)
             if use_video else _align_frames(target))
 
 
@@ -2720,6 +2680,57 @@ class H3AutoDirectorCachedReferenceToVideo:
         return cache
 
     @classmethod
+    def _encode_current_with_disk_cache(cls, plan, clip, vae, audio_vae, prompt,
+                                        width, height, length, ref_image_size,
+                                        context_length, generation_index, refs,
+                                        use_manual_ref_short_edge=False,
+                                        ref_short_edge=2048):
+        """Read/write only the requested segment when batch caching is off.
+
+        The disk switch remains useful independently, but it must not turn a
+        disabled one-shot cache into an eager all-segment text-encoder pass.
+        """
+        model_identity = _cache_model_identity(clip, vae, audio_vae)
+        effective_ref_mode = "manual" if use_manual_ref_short_edge else ref_image_size
+        fingerprint, details = _prompt_disk_fingerprint(
+            plan, generation_index, width, height, effective_ref_mode,
+            context_length, ref_short_edge, model_identity,
+        )
+        manifest = _load_prompt_disk_manifest(plan)
+        global_details = _prompt_disk_global_details(
+            plan, width, height, effective_ref_mode, context_length,
+            ref_short_edge, model_identity,
+            use_manual_ref_short_edge=use_manual_ref_short_edge,
+        )
+        global_signature = _stable_digest(global_details)
+        if manifest.get("global_signature") != global_signature:
+            manifest = {"schema": PROMPT_DISK_CACHE_SCHEMA,
+                        "global_signature": global_signature,
+                        "global_details": global_details,
+                        "segments": {}}
+        entry = (manifest.get("segments") or {}).get(str(generation_index), {})
+        cache_root, _manifest_path = _prompt_disk_paths(plan)
+        cache_file = cache_root / str(entry.get("file", ""))
+        if entry.get("fingerprint") == fingerprint and cache_file.is_file():
+            try:
+                LOG.info("H3 Auto Director: 当前片段命中提示词磁盘缓存（第 %d 段）", generation_index)
+                return _load_torch_cache(cache_file)
+            except Exception as exc:
+                LOG.warning("H3 Auto Director: 第 %d 段磁盘向量无法读取，将重新编码：%s",
+                            generation_index, exc)
+        conditioning = cls._encode_one(
+            clip, vae, audio_vae,
+            _previous_video_prompt(_segment(plan, generation_index).get("prompt", ""), refs),
+            width, height, length, effective_ref_mode, refs, plan=plan,
+            use_manual_ref_short_edge=use_manual_ref_short_edge,
+            ref_short_edge=ref_short_edge,
+        )
+        _save_prompt_disk_entry(plan, manifest, generation_index,
+                                fingerprint, conditioning, details)
+        LOG.info("H3 Auto Director: 已保存当前片段提示词向量到硬盘（第 %d 段）", generation_index)
+        return conditioning
+
+    @classmethod
     def encode(cls, plan, clip, vae, audio_vae, prompt, width, height, length,
                ref_image_size="match", context_length=FRAME_CONTEXT_DEFAULT, segment_index=0,
                use_auto_ref_image_size=True, use_manual_ref_short_edge=False, ref_short_edge=2048,
@@ -2745,12 +2756,19 @@ class H3AutoDirectorCachedReferenceToVideo:
         # hand-edited workflow contains both values, preset mode wins; if both
         # are off, preset mode is the deterministic fallback.
         manual_enabled = bool(use_manual_ref_short_edge) and not bool(use_auto_ref_image_size)
+        cache_all_enabled = _prompt_cache_all_enabled(plan)
         disk_enabled = _disk_cache_enabled(plan)
-        # Disk caching is useful across restarts even when the in-memory
-        # one-shot switch is off, so either switch enables the cache path.
-        if not bool(plan.get("cache_prompt_embeddings", False)) and not disk_enabled:
+        if not cache_all_enabled:
+            effective_refs = _cache_segment_references(plan, generation_index) if refs is None else refs
+            if disk_enabled:
+                return cls._encode_current_with_disk_cache(
+                    plan, clip, vae, audio_vae, prompt, width, height, length,
+                    ref_image_size, context_length, generation_index, effective_refs,
+                    use_manual_ref_short_edge=manual_enabled,
+                    ref_short_edge=ref_short_edge,
+                )
             return cls._encode_one(clip, vae, audio_vae, prompt, width, height, length,
-                                   ref_image_size, _cache_segment_references(plan, generation_index) if refs is None else refs,
+                                   ref_image_size, effective_refs,
                                    plan=plan, use_manual_ref_short_edge=manual_enabled,
                                    ref_short_edge=ref_short_edge)
         effective_ref_mode = "manual" if manual_enabled else ref_image_size
@@ -3208,10 +3226,16 @@ class H3AutoDirectorMotionContext:
         stage2_context = context_latent.get("h3_stage2_context_latent") if isinstance(context_latent, dict) else None
         def with_stage2(value):
             global _LAST_MOTION_CONTEXT_TRIM
-            _LAST_MOTION_CONTEXT_TRIM = int(value[1]) if isinstance(value, (list, tuple)) and len(value) > 1 else 0
+            context_trim = int(value[1]) if isinstance(value, (list, tuple)) and len(value) > 1 else 0
+            _LAST_MOTION_CONTEXT_TRIM = (
+                context_trim + CONTEXT_WARMUP_FRAMES if context_trim > 0 else 0
+            )
+            if context_trim > 0:
+                LOG.info("H3 Auto Director: 上下文裁剪=%d 帧，额外隐藏二采预热=%d 帧，总裁剪=%d 帧",
+                         context_trim, CONTEXT_WARMUP_FRAMES, _LAST_MOTION_CONTEXT_TRIM)
             if stage2_context is None:
-                return value
-            return (self._attach_stage2_context(value[0], stage2_context), value[1])
+                return (value[0], _LAST_MOTION_CONTEXT_TRIM) if isinstance(value, (list, tuple)) and len(value) > 1 else value
+            return (self._attach_stage2_context(value[0], stage2_context), _LAST_MOTION_CONTEXT_TRIM)
         if not use_video_context:
             if bool(use_audio_context) and context_latent is not None:
                 try:
@@ -3556,8 +3580,9 @@ def _default_context_trim_frames(plan, segment_index):
     # Existing workflows expose context_length on H3AutoDirectorSegment, but
     # older SaveSegment nodes do not receive that socket.  Use the node's
     # documented default; a connected trim_frames input overrides it.
-    return _h3_context_run(plan.get("_runtime_context_length",
-                                    plan.get("context_length", FRAME_CONTEXT_DEFAULT)))
+    return (_h3_context_run(plan.get("_runtime_context_length",
+                                     plan.get("context_length", FRAME_CONTEXT_DEFAULT)))
+            + CONTEXT_WARMUP_FRAMES)
 
 
 class H3AutoDirectorSaveSegment:
@@ -3602,9 +3627,13 @@ class H3AutoDirectorSaveSegment:
             LOG.info("H3 Auto Director: 保存第 %d 段时使用一采音频覆盖外部 AUDIO 输入", int(segment_index))
         global _LAST_MOTION_CONTEXT_TRIM
         requested_trim = int(trim_frames or 0)
-        if requested_trim <= 0 and _LAST_MOTION_CONTEXT_TRIM is not None:
-            requested_trim = int(_LAST_MOTION_CONTEXT_TRIM)
-        if requested_trim <= 0:
+        motion_trim = _LAST_MOTION_CONTEXT_TRIM
+        if requested_trim <= 0 and motion_trim is not None:
+            # A connected Motion Context output of zero is intentional for
+            # audio-only/no-context segments. Do not infer a video pre-roll
+            # from the project defaults in that case.
+            requested_trim = max(0, int(motion_trim))
+        if requested_trim <= 0 and motion_trim is None:
             requested_trim = _default_context_trim_frames(plan, segment_index)
         images, audio = _trim_context_prefix(images, audio, requested_trim, FPS)
         if requested_trim > 0:
