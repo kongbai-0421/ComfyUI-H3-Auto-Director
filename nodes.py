@@ -1464,11 +1464,7 @@ class H3AutoDirectorDualSampling:
                                       "label_on": "最终仅使用一采音频",
                                       "label_off": "使用二采音频",
                                       "tooltip": "二采继续细化画面，但最终 AV latent 使用第一阶段生成的音频。"}),
-        }, "optional": {
-            "upscale_model": ("UPSCALE_MODEL",),
-            "stage2_conditioning": ("CONDITIONING",),
-            "stage2_context_latent": ("LATENT",),
-        }}
+        }, "optional": {"upscale_model": ("UPSCALE_MODEL",)}}
 
     RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE")
     RETURN_NAMES = ("最终 AV latent", "第一阶段 AV latent", "放大预览", "第一阶段画面")
@@ -1581,12 +1577,25 @@ class H3AutoDirectorDualSampling:
         # must not replace the valid first-stage conditioning, otherwise the
         # second sampler fails with "需要有效的正向条件" after stage one has
         # already completed successfully.
+        def _has_positive_conditioning(value):
+            return isinstance(value, (list, tuple)) and any(
+                isinstance(entry, (list, tuple)) and len(entry) >= 2
+                and isinstance(entry[1], dict)
+                for entry in value
+            )
+
         stage2_input_conditioning = (
-            stage2_conditioning if stage2_conditioning else conditioning
+            stage2_conditioning if _has_positive_conditioning(stage2_conditioning)
+            else conditioning
         )
         final_conditioning = _prepare_stage2_conditioning(
             stage2_input_conditioning, refined, stage2_use_context, stage2_source
         )
+        if not _has_positive_conditioning(final_conditioning):
+            raise ValueError(
+                "二采正向条件为空：请确认多模态参考节点已输出 positive，"
+                "且不要把空的 stage2_conditioning 节点连接到双采样。"
+            )
         final = _dual_sample(model, final_conditioning, refined, sampler_name, scheduler, stage2_steps, stage2_denoise, int(seed) + 1)
         if bool(use_stage1_audio_only):
             final_parts = _av_latent_parts(final)
@@ -1632,8 +1641,7 @@ class H3AutoDirectorDualSamplingModel:
                                       "label_on": "最终仅使用一采音频",
                                       "label_off": "使用二采音频",
                                       "tooltip": "二采继续细化画面，但最终 AV latent 使用第一阶段生成的音频。"}),
-        }, "optional": {"upscale_model": ("UPSCALE_MODEL",), "stage2_conditioning": ("CONDITIONING",),
-            "stage2_context_latent": ("LATENT",)}}
+        }, "optional": {"upscale_model": ("UPSCALE_MODEL",)}}
 
     RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE")
     RETURN_NAMES = ("最终 AV latent", "第一阶段 AV latent", "放大预览", "第一阶段画面")
