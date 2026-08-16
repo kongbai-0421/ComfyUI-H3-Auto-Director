@@ -67,6 +67,9 @@ except ImportError:
 LOG = logging.getLogger("h3_auto_director")
 FPS = 24.0
 FRAME_CONTEXT_DEFAULT = 22
+# A guided H3 timeline needs a short settling window after the pinned
+# predecessor tail.  These frames are generated but removed before saving.
+CONTEXT_WARMUP_FRAMES = 16
 PROMPT_CACHE_MAX_PROJECTS = 2
 PROMPT_DISK_CACHE_SCHEMA = 1
 _PROMPT_CONDITIONING_CACHE = OrderedDict()
@@ -387,6 +390,14 @@ def _align_frames(frames: int) -> int:
     while frames % 17 != 5:
         frames += 1
     return frames
+
+
+def _align_frames_nearest(frames: int) -> int:
+    """Choose the nearest valid H3 duration for a pre-roll timeline."""
+    target = max(5, int(frames))
+    lower = max(5, target - ((target - 5) % 17))
+    upper = lower + 17
+    return lower if target - lower <= upper - target else upper
 
 
 def _segment(plan, index: int):
@@ -970,7 +981,10 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
         return _prepare_dual_sampling_conditioning(conditioning)
     target_video = parts[0]
     source_parts = _av_latent_parts(context_source) if context_source is not None else None
-    source_video, source_audio = source_parts if source_parts is not None else parts
+    # Never use the current segment's first-pass latent as a predecessor.
+    # Doing so makes the fallback appear to apply context while actually
+    # conditioning the second pass on the segment being generated now.
+    source_video, source_audio = source_parts if source_parts is not None else (None, None)
     prepared = []
     replaced_context = False
     for entry in _prepare_dual_sampling_conditioning(
@@ -990,7 +1004,7 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
             if isinstance(keyframes, (list, tuple)):
                 source_video_resized = _resize_h3_context_latent(
                     source_video, target_video.shape[-2], target_video.shape[-1]
-                )
+                ) if torch.is_tensor(source_video) else None
                 source_steps = int(source_video_resized.shape[2]) if torch.is_tensor(source_video_resized) else 0
                 # A native H3 guide may contain a continuous multi-step latent
                 # in one keyframe (the same form used by MiniMaxH3AddGuide).
@@ -1015,7 +1029,7 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
                     if source_tail is not None and item_steps > 0:
                         item["latent"] = source_tail[:, :, cursor:cursor + item_steps]
                         cursor += item_steps
-                    else:
+                    elif torch.is_tensor(item.get("latent")):
                         item["latent"] = _resize_h3_context_latent(
                             item.get("latent"), target_video.shape[-2], target_video.shape[-1]
                         )
@@ -1107,10 +1121,45 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
             # fallback guide injection below can add context independently.
             prepared.append([entry[0], values, *entry[2:]])
     # Some third-party prompt-cache nodes rebuild CONDITIONING and drop
-    # Auto Director's private marker.  In that case the first pass still has
-    # a valid continuation, but the second pass would silently refine without
-    # the predecessor.  Inject a conservative default guide into the first
-    # entry so enabling ``stage2_use_context`` cannot become a no-op.
+    # Auto Director's private marker.  The guide payload itself is still
+    # authoritative: keep it and adapt its spatial grid for stage two before
+    # considering any fallback source.
+    if not replaced_context and prepared:
+        retained_context = False
+        for index, entry in enumerate(prepared):
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2 or not isinstance(entry[1], dict):
+                continue
+            values = entry[1].copy()
+            keyframes = values.get("minimax_keyframes")
+            if not isinstance(keyframes, (list, tuple)):
+                continue
+            updated_keyframes = []
+            has_context_keyframe = False
+            for keyframe in keyframes:
+                item = dict(keyframe)
+                is_context_keyframe = bool(
+                    item.get(_NATIVE_CONTEXT_KEY)
+                    or item.get("h3_auto_director_legacy_frame_index") is not None
+                )
+                if is_context_keyframe and torch.is_tensor(item.get("latent")):
+                    item["latent"] = _resize_h3_context_latent(
+                        item["latent"], target_video.shape[-2], target_video.shape[-1]
+                    )
+                    has_context_keyframe = True
+                updated_keyframes.append(item)
+            if has_context_keyframe:
+                values["minimax_keyframes"] = updated_keyframes
+                values.pop(_MOTION_CONTEXT_MARKER, None)
+                values.pop("h3_stage2_context_latent", None)
+                prepared[index] = [entry[0], values, *entry[2:]]
+                retained_context = True
+        if retained_context:
+            replaced_context = True
+            LOG.info("H3 Auto Director: 二采复用已存在的上一段视频上下文 keyframe，并完成尺寸适配")
+
+    # If no context payload survived the conditioning path, inject only an
+    # explicitly supplied predecessor latent.  Never synthesize context from
+    # the current segment's first-pass latent.
     if not replaced_context and prepared and torch.is_tensor(source_video) and source_video.ndim == 5:
         run = _h3_context_run(FRAME_CONTEXT_DEFAULT)
         steps = {1: 1, 5: 2, 22: 7, 39: 12}[run]
@@ -2310,10 +2359,12 @@ class H3AutoDirectorSegment:
         use_audio = (bool(plan.get("continuation_mode", True)) and bool(seg.get("continue_audio", True))
                      and not restart and context_index > 0)
         target = round(float(seg["duration"]) * FPS)
-        # H3 Guide conditions overlap the target timeline at frame 0; they do
-        # not prepend a second video stream. Keep the requested segment length
-        # unchanged so its guided beginning remains in the saved clip.
-        physical = _align_frames(target)
+        # Guide rows anchor the beginning of the denoised timeline. Reserve a
+        # hidden context window plus a short settling pre-roll, then remove it
+        # in SaveSegment so every delivered segment keeps its requested length.
+        context_run = _h3_context_run(context_length)
+        physical = (_align_frames_nearest(target + context_run + CONTEXT_WARMUP_FRAMES)
+                    if use_video else _align_frames(target))
         refs = _segment_reference_specs(plan, generation_index)
         LOG.info(
             "H3 Auto Director: 第 %d 段解析：视频上下文=%s，音频上下文=%s，"
@@ -2506,8 +2557,12 @@ def _cache_segment_references(plan, generation_index):
 def _cache_frame_count(plan, generation_index, context_length):
     seg = _segment(plan, generation_index)
     target = round(float(seg["duration"]) * FPS)
-    # The cache must use the same physical timeline as Segment.resolve.
-    return _align_frames(target)
+    use_video = (not _use_previous_video_reference(plan, generation_index)
+                 and _video_context_enabled(plan)
+                 and bool(seg.get("continue_video", generation_index > 1))
+                 and generation_index > 1)
+    return (_align_frames_nearest(target + _h3_context_run(context_length) + CONTEXT_WARMUP_FRAMES)
+            if use_video else _align_frames(target))
 
 
 def _prompt_cache_key(plan, clip, vae, audio_vae, width, height, ref_image_size, context_length,
@@ -3247,9 +3302,10 @@ class H3AutoDirectorMotionContext:
                 values["minimax_refs"] = [{"kind": "audio", "ref_audio_t": audio_steps,
                                              "audio_latent": audio_tail,
                                              legacy.MC_AUDIO_KEY: float(run) + float(overhang) / (5.0 / 3.0)}]
-        # Native/legacy guides overlap the target timeline and do not append a
-        # generated prefix, so the save node keeps the complete target clip.
-        return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), 0
+        # The first context window plus a short settling pre-roll are hidden
+        # from the delivered clip; SaveSegment removes the same number of
+        # decoded frames and audio samples before writing it.
+        return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), run
 
     @staticmethod
     def _vae_context(conditioning, vae, latent, context_frames, context_length, use_audio_context):
@@ -3283,7 +3339,7 @@ class H3AutoDirectorMotionContext:
             values = {"minimax_keyframes": keyframes, _NATIVE_CONTEXT_KEY: True,
                       "h3_auto_director_context_run": int(run)}
             LOG.info("H3 Auto Director: 使用新版原生 Guide VAE 回退上下文：视频 keyframe=%d，音频上下文不可用", len(keyframes))
-            return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), 0
+            return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), run
         from . import legacy_h3_motion
         if not legacy_h3_motion.ensure_legacy_h3_motion_context():
             raise RuntimeError("当前旧版 ComfyUI 无法启用内置 H3 Motion Context 兼容层")
@@ -3299,7 +3355,7 @@ class H3AutoDirectorMotionContext:
                   "minimax_frame_count": _h3_pixel_frames(int(target_video.shape[2])),
                   "h3_auto_director_context_run": int(run)}
         LOG.info("H3 Auto Director: 使用内置旧版 Motion Context VAE 回退：视频 keyframe=%d，音频上下文不可用", len(keyframes))
-        return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), 0
+        return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), run
 
     def apply(self, conditioning, vae, latent, context_frames, use_video_context, use_audio_context, context_length, context_latent=None, use_video_latent=True):
         global _LAST_MOTION_CONTEXT_TRIM
@@ -3307,9 +3363,12 @@ class H3AutoDirectorMotionContext:
         def with_stage2(value):
             global _LAST_MOTION_CONTEXT_TRIM
             context_trim = int(value[1]) if isinstance(value, (list, tuple)) and len(value) > 1 else 0
-            _LAST_MOTION_CONTEXT_TRIM = max(0, context_trim)
+            _LAST_MOTION_CONTEXT_TRIM = (
+                context_trim + CONTEXT_WARMUP_FRAMES if context_trim > 0 else 0
+            )
             if context_trim > 0:
-                LOG.info("H3 Auto Director: 上下文裁剪=%d 帧", _LAST_MOTION_CONTEXT_TRIM)
+                LOG.info("H3 Auto Director: 上下文裁剪=%d 帧，隐藏二采预热=%d 帧，总裁剪=%d 帧",
+                         context_trim, CONTEXT_WARMUP_FRAMES, _LAST_MOTION_CONTEXT_TRIM)
             if stage2_context is None:
                 return (value[0], _LAST_MOTION_CONTEXT_TRIM) if isinstance(value, (list, tuple)) and len(value) > 1 else value
             return (self._attach_stage2_context(value[0], stage2_context), _LAST_MOTION_CONTEXT_TRIM)
@@ -3647,8 +3706,15 @@ def _trim_context_prefix(images, audio, trim_frames, fps=FPS):
 
 
 def _default_context_trim_frames(plan, segment_index):
-    """Return zero: H3 guide context overlaps the target timeline in-place."""
-    return 0
+    """Infer the hidden context pre-roll for workflows without a trim socket."""
+    index = int(segment_index)
+    if index <= 1 or not _video_context_enabled(plan):
+        return 0
+    segment = _segment(plan, index)
+    if _use_previous_video_reference(plan, index) or not bool(segment.get("continue_video", True)):
+        return 0
+    run = _h3_context_run(plan.get("_runtime_context_length", FRAME_CONTEXT_DEFAULT))
+    return run + CONTEXT_WARMUP_FRAMES
 
 
 class H3AutoDirectorSaveSegment:
