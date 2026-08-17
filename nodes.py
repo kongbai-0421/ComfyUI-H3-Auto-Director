@@ -67,9 +67,6 @@ except ImportError:
 LOG = logging.getLogger("h3_auto_director")
 FPS = 24.0
 FRAME_CONTEXT_DEFAULT = 22
-# A guided H3 timeline needs a short settling window after the pinned
-# predecessor tail.  These frames are generated but removed before saving.
-CONTEXT_WARMUP_FRAMES = 16
 PROMPT_CACHE_MAX_PROJECTS = 2
 PROMPT_DISK_CACHE_SCHEMA = 1
 _PROMPT_CONDITIONING_CACHE = OrderedDict()
@@ -393,7 +390,7 @@ def _align_frames(frames: int) -> int:
 
 
 def _align_frames_nearest(frames: int) -> int:
-    """Choose the nearest valid H3 duration for a pre-roll timeline."""
+    """Choose the nearest valid H3 duration for a context-prefixed timeline."""
     target = max(5, int(frames))
     lower = max(5, target - ((target - 5) % 17))
     upper = lower + 17
@@ -2344,7 +2341,7 @@ class H3AutoDirectorSegment:
         context_index = int(segment_index)
         generation_index = context_index + 1
         # SaveSegment can use this runtime-only value to remove the same
-        # pre-roll that was reserved for the current generation. It is not
+        # context prefix reserved for the current generation. It is not
         # persisted into project.json, so changing the workflow widget remains
         # immediately effective on the next queued segment.
         plan["_runtime_context_length"] = int(context_length)
@@ -2359,11 +2356,11 @@ class H3AutoDirectorSegment:
         use_audio = (bool(plan.get("continuation_mode", True)) and bool(seg.get("continue_audio", True))
                      and not restart and context_index > 0)
         target = round(float(seg["duration"]) * FPS)
-        # Guide rows anchor the beginning of the denoised timeline. Reserve a
-        # hidden context window plus a short settling pre-roll, then remove it
-        # in SaveSegment so every delivered segment keeps its requested length.
+        # Guide rows anchor the beginning of the denoised timeline. Reserve
+        # only the context window; SaveSegment removes that same window so the
+        # predecessor tail is not duplicated at the join.
         context_run = _h3_context_run(context_length)
-        physical = (_align_frames_nearest(target + context_run + CONTEXT_WARMUP_FRAMES)
+        physical = (_align_frames_nearest(target + context_run)
                     if use_video else _align_frames(target))
         refs = _segment_reference_specs(plan, generation_index)
         LOG.info(
@@ -2561,7 +2558,7 @@ def _cache_frame_count(plan, generation_index, context_length):
                  and _video_context_enabled(plan)
                  and bool(seg.get("continue_video", generation_index > 1))
                  and generation_index > 1)
-    return (_align_frames_nearest(target + _h3_context_run(context_length) + CONTEXT_WARMUP_FRAMES)
+    return (_align_frames_nearest(target + _h3_context_run(context_length))
             if use_video else _align_frames(target))
 
 
@@ -3302,9 +3299,9 @@ class H3AutoDirectorMotionContext:
                 values["minimax_refs"] = [{"kind": "audio", "ref_audio_t": audio_steps,
                                              "audio_latent": audio_tail,
                                              legacy.MC_AUDIO_KEY: float(run) + float(overhang) / (5.0 / 3.0)}]
-        # The first context window plus a short settling pre-roll are hidden
-        # from the delivered clip; SaveSegment removes the same number of
-        # decoded frames and audio samples before writing it.
+        # The guide context is hidden from the delivered clip; SaveSegment
+        # removes the same number of decoded frames and audio samples before
+        # writing it.
         return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), run
 
     @staticmethod
@@ -3363,12 +3360,10 @@ class H3AutoDirectorMotionContext:
         def with_stage2(value):
             global _LAST_MOTION_CONTEXT_TRIM
             context_trim = int(value[1]) if isinstance(value, (list, tuple)) and len(value) > 1 else 0
-            _LAST_MOTION_CONTEXT_TRIM = (
-                context_trim + CONTEXT_WARMUP_FRAMES if context_trim > 0 else 0
-            )
+            _LAST_MOTION_CONTEXT_TRIM = max(0, context_trim)
             if context_trim > 0:
-                LOG.info("H3 Auto Director: 上下文裁剪=%d 帧，隐藏二采预热=%d 帧，总裁剪=%d 帧",
-                         context_trim, CONTEXT_WARMUP_FRAMES, _LAST_MOTION_CONTEXT_TRIM)
+                LOG.info("H3 Auto Director: 上下文裁剪=%d 帧",
+                         _LAST_MOTION_CONTEXT_TRIM)
             if stage2_context is None:
                 return (value[0], _LAST_MOTION_CONTEXT_TRIM) if isinstance(value, (list, tuple)) and len(value) > 1 else value
             return (self._attach_stage2_context(value[0], stage2_context), _LAST_MOTION_CONTEXT_TRIM)
@@ -3706,7 +3701,7 @@ def _trim_context_prefix(images, audio, trim_frames, fps=FPS):
 
 
 def _default_context_trim_frames(plan, segment_index):
-    """Infer the hidden context pre-roll for workflows without a trim socket."""
+    """Infer the hidden guide-context prefix for workflows without a trim socket."""
     index = int(segment_index)
     if index <= 1 or not _video_context_enabled(plan):
         return 0
@@ -3714,7 +3709,7 @@ def _default_context_trim_frames(plan, segment_index):
     if _use_previous_video_reference(plan, index) or not bool(segment.get("continue_video", True)):
         return 0
     run = _h3_context_run(plan.get("_runtime_context_length", FRAME_CONTEXT_DEFAULT))
-    return run + CONTEXT_WARMUP_FRAMES
+    return run
 
 
 class H3AutoDirectorSaveSegment:
@@ -3762,7 +3757,7 @@ class H3AutoDirectorSaveSegment:
         motion_trim = _LAST_MOTION_CONTEXT_TRIM
         if requested_trim <= 0 and motion_trim is not None:
             # A connected Motion Context output of zero is intentional for
-            # audio-only/no-context segments. Do not infer a video pre-roll
+            # audio-only/no-context segments. Do not infer a video context
             # from the project defaults in that case.
             requested_trim = max(0, int(motion_trim))
         if requested_trim <= 0 and motion_trim is None:
