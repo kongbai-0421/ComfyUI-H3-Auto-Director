@@ -44,6 +44,21 @@ except ImportError:
     _minimax_h3 = None
     _H3ReferenceToVideo = None
 
+
+def _encode_ref_audio(audio_vae, audio):
+    """Encode a soundtrack with the H3 audio VAE.
+
+    ``_encode_ref_audio`` is a module-level function in current ComfyUI
+    (comfy_extras.nodes_minimax_h3).  Older builds exposed it on the
+    MiniMaxH3ReferenceToVideo class, so fall back to that when absent.
+    """
+    fn = getattr(_minimax_h3, "_encode_ref_audio", None)
+    if fn is None:
+        fn = getattr(_H3ReferenceToVideo, "_encode_ref_audio", None)
+    if fn is None:
+        raise RuntimeError("当前 ComfyUI 未提供 _encode_ref_audio 音频编码函数")
+    return fn(audio_vae, audio)
+
 try:
     import av
 except ImportError:
@@ -2687,7 +2702,7 @@ class H3AutoDirectorCachedReferenceToVideo:
             audio_latent, audio_length = (None, 0)
             soundtrack = video_audios.get("ref_video_audio_" + name.rsplit("_", 1)[-1])
             if soundtrack is not None:
-                audio_latent, audio_length = _H3ReferenceToVideo._encode_ref_audio(audio_vae, soundtrack)
+                audio_latent, audio_length = _encode_ref_audio(audio_vae, soundtrack)
                 ref_items.append({"type": "audio"})
             sample_indices = list(range(0, frames.shape[0], _minimax_h3.FPS // 2))
             ref_items.append({"type": "video", "data": frames[sample_indices],
@@ -2700,7 +2715,7 @@ class H3AutoDirectorCachedReferenceToVideo:
         for audio in ref_groups[3].values():
             if audio is None:
                 continue
-            audio_latent, audio_length = _H3ReferenceToVideo._encode_ref_audio(audio_vae, audio)
+            audio_latent, audio_length = _encode_ref_audio(audio_vae, audio)
             ref_items.append({"type": "audio"})
             ref_blocks.append({"kind": "audio", "ref_audio_t": audio_length,
                                "audio_latent": audio_latent})
