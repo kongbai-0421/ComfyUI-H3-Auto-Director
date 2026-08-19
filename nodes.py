@@ -812,7 +812,8 @@ def _has_positive_conditioning(value):
     return any(_is_conditioning_entry(entry) for entry in _conditioning_entries(value))
 
 
-def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, denoise, seed, enable_preview=False):
+def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, denoise, seed,
+                 enable_preview=False, sigmas=None):
     """Run one positive-only H3 sampling pass, matching BasicGuider semantics."""
     conditioning = _conditioning_entries(conditioning)
     if not _has_positive_conditioning(conditioning):
@@ -821,7 +822,19 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
     guider = Guider_Basic(model)
     guider.set_conds(conditioning)
     sampler = comfy.samplers.sampler_object(str(sampler_name))
-    sigmas = _h3_sigmas(model, scheduler, steps, denoise)
+    if sigmas is None:
+        sigmas = _h3_sigmas(model, scheduler, steps, denoise)
+    else:
+        if not torch.is_tensor(sigmas):
+            try:
+                sigmas = torch.as_tensor(sigmas, dtype=torch.float32)
+            except Exception as exc:
+                raise ValueError("外部 Sigmas 必须是有效的 SIGMAS 张量") from exc
+        sigmas = sigmas.flatten().contiguous()
+        if sigmas.numel() < 2:
+            raise ValueError("外部 Sigmas 至少需要包含 2 个值")
+        steps = int(sigmas.numel() - 1)
+        LOG.info("H3 Auto Director: 使用外部 Sigmas 调度（%d 步）", steps)
     if sigmas.numel() == 0:
         return dict(latent)
     latent_image = latent["samples"]
@@ -1000,12 +1013,48 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
     the target grid merely because it is connected to the optional context
     socket.
     """
-    if not bool(use_context):
-        return _prepare_dual_sampling_conditioning(conditioning, strip_motion_context=True)
     parts = _av_latent_parts(latent)
     if not parts or not torch.is_tensor(parts[0]) or parts[0].ndim != 5:
-        return _prepare_dual_sampling_conditioning(conditioning)
+        return _prepare_dual_sampling_conditioning(
+            conditioning, strip_motion_context=not bool(use_context)
+        )
     target_video = parts[0]
+
+    def adapt_keyframe_grids(prepared):
+        """Keep native guide keyframes on the active second-pass grid.
+
+        A cached first-pass conditioning can retain guide latents encoded at
+        the first-pass resolution.  PackedLayout uses the target grid for
+        keyframe rows, so leaving those latents unchanged makes its boolean
+        update mask longer than the actual condition rows.
+        """
+        adapted = []
+        for entry in prepared:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2 or not isinstance(entry[1], dict):
+                adapted.append(entry)
+                continue
+            values = entry[1].copy()
+            keyframes = values.get("minimax_keyframes")
+            if isinstance(keyframes, (list, tuple)):
+                updated = []
+                for keyframe in keyframes:
+                    if not isinstance(keyframe, dict):
+                        updated.append(keyframe)
+                        continue
+                    item = dict(keyframe)
+                    if torch.is_tensor(item.get("latent")):
+                        item["latent"] = _resize_h3_context_latent(
+                            item["latent"], target_video.shape[-2], target_video.shape[-1]
+                        )
+                    updated.append(item)
+                values["minimax_keyframes"] = updated
+            adapted.append([entry[0], values, *entry[2:]])
+        return adapted
+
+    if not bool(use_context):
+        return adapt_keyframe_grids(
+            _prepare_dual_sampling_conditioning(conditioning, strip_motion_context=True)
+        )
     source_parts = _av_latent_parts(context_source) if context_source is not None else None
     # Never use the current segment's first-pass latent as a predecessor.
     # Doing so makes the fallback appear to apply context while actually
@@ -1032,35 +1081,78 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
                     source_video, target_video.shape[-2], target_video.shape[-1]
                 ) if torch.is_tensor(source_video) else None
                 source_steps = int(source_video_resized.shape[2]) if torch.is_tensor(source_video_resized) else 0
-                # A native H3 guide may contain a continuous multi-step latent
-                # in one keyframe (the same form used by MiniMaxH3AddGuide).
-                # Do not equate keyframe count with temporal step count here:
-                # doing so replaced a 7-step context with one step in the
-                # second sampling pass and desynchronized PackedLayout from
-                # the payload's patchified condition rows.
+                # Only replace Auto Director's own continuation keyframe.
+                # User-inserted Guide keyframes are independent references and
+                # must not be overwritten by the predecessor video.
                 step_counts = [
                     int(item.get("latent").shape[2])
                     if isinstance(item, dict) and torch.is_tensor(item.get("latent"))
                     and item["latent"].ndim == 5 else 0
                     for item in keyframes
                 ]
-                required_steps = sum(step_counts)
-                source_tail = (source_video_resized[:, :, -required_steps:]
-                               if required_steps > 0 and source_steps >= required_steps else None)
+                context_flags = [
+                    isinstance(item, dict) and bool(
+                        item.get(_NATIVE_CONTEXT_KEY)
+                        or item.get("h3_auto_director_legacy_frame_index") is not None
+                    )
+                    for item in keyframes
+                ]
+                # Keep the complete context window so its temporal layout
+                # still matches SaveSegment's 22-frame crop.  The entire
+                # Auto Director keyframe must come from one source pass:
+                # mixing six stage-one tokens with one stage-two token creates
+                # a discontinuity inside the guide itself and appears as a
+                # soft/jumping first few frames. User-inserted guide keyframes
+                # remain untouched below.
+                context_run = int(values.get("h3_auto_director_context_run", FRAME_CONTEXT_DEFAULT) or FRAME_CONTEXT_DEFAULT)
+                context_run = _h3_context_run(context_run)
+                context_step_count = {1: 1, 5: 2, 22: 7, 39: 12}[context_run]
+                required_steps = sum(step_counts[index]
+                                     for index, is_context in enumerate(context_flags)
+                                     if is_context)
+                if required_steps:
+                    LOG.info(
+                        "H3 Auto Director: 二采使用上一段最终结果的完整视觉上下文（%d 个 latent 步）",
+                        int(required_steps),
+                    )
+                source_tail = (source_video_resized[:, :, -context_step_count:]
+                               if context_step_count > 0 and source_steps >= context_step_count else None)
                 resized = []
                 cursor = 0
                 for index, keyframe in enumerate(keyframes):
                     item = dict(keyframe)
                     item_steps = step_counts[index]
-                    if source_tail is not None and item_steps > 0:
-                        item["latent"] = source_tail[:, :, cursor:cursor + item_steps]
-                        cursor += item_steps
+                    if source_tail is not None and context_flags[index] and item_steps > 0:
+                        # The normal context keyframe occupies frame 0 and
+                        # must receive the complete predecessor tail. The
+                        # extra boundary keyframe at ``context_run`` reuses
+                        # the final token so it anchors the first delivered
+                        # frame after SaveSegment's crop. Legacy mode stores
+                        # the normal window as one-token keyframes, so retain
+                        # their chronological order with a cursor.
+                        frame_index = item.get("resolved_frame_index")
+                        if frame_index is None:
+                            frame_index = item.get("h3_auto_director_legacy_frame_index", 0)
+                        if int(frame_index or 0) >= context_run:
+                            item["latent"] = source_video_resized[:, :, -item_steps:]
+                        elif item_steps > 1:
+                            item["latent"] = source_tail[:, :, -item_steps:]
+                        else:
+                            end = min(int(source_tail.shape[2]), cursor + item_steps)
+                            start = max(0, end - item_steps)
+                            item["latent"] = source_tail[:, :, start:end]
+                            cursor = end
                     elif torch.is_tensor(item.get("latent")):
                         item["latent"] = _resize_h3_context_latent(
                             item.get("latent"), target_video.shape[-2], target_video.shape[-1]
                         )
                     resized.append(item)
                 values["minimax_keyframes"] = resized
+                # The predecessor tail is an exact continuity anchor in the
+                # second pass. H3's default 0.999 visual-condition noise is
+                # useful for ordinary references, but it can soften the
+                # first decoded frames when applied to this boundary guide.
+                values["visual_cond_noise_aug"] = 1.0
             refs = values.get("minimax_refs")
             if isinstance(refs, (list, tuple)) and torch.is_tensor(source_audio):
                 # Only replace the Motion Context audio ref. User-supplied
@@ -1152,6 +1244,9 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
     # considering any fallback source.
     if not replaced_context and prepared:
         retained_context = False
+        retained_source = _resize_h3_context_latent(
+            source_video, target_video.shape[-2], target_video.shape[-1]
+        ) if torch.is_tensor(source_video) else None
         for index, entry in enumerate(prepared):
             if not isinstance(entry, (list, tuple)) or len(entry) < 2 or not isinstance(entry[1], dict):
                 continue
@@ -1168,13 +1263,30 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
                     or item.get("h3_auto_director_legacy_frame_index") is not None
                 )
                 if is_context_keyframe and torch.is_tensor(item.get("latent")):
-                    item["latent"] = _resize_h3_context_latent(
-                        item["latent"], target_video.shape[-2], target_video.shape[-1]
-                    )
+                    # Prompt-vector caches may drop the private entry marker,
+                    # but the keyframe itself remains identifiable. Apply the
+                    # same complete-window replacement in that case.
+                    if retained_source is not None and retained_source.shape[2] > 0:
+                        item_steps = int(item["latent"].shape[2])
+                        if int(retained_source.shape[2]) >= item_steps:
+                            item["latent"] = retained_source[:, :, -item_steps:]
+                        else:
+                            # Very short legacy caches can be resumed too;
+                            # repeat their oldest available token rather than
+                            # changing the keyframe row count and breaking
+                            # PackedLayout's condition payload alignment.
+                            missing = item_steps - int(retained_source.shape[2])
+                            prefix = retained_source[:, :, :1].repeat(1, 1, missing, 1, 1)
+                            item["latent"] = torch.cat((prefix, retained_source), dim=2)
+                    else:
+                        item["latent"] = _resize_h3_context_latent(
+                            item["latent"], target_video.shape[-2], target_video.shape[-1]
+                        )
                     has_context_keyframe = True
                 updated_keyframes.append(item)
             if has_context_keyframe:
                 values["minimax_keyframes"] = updated_keyframes
+                values["visual_cond_noise_aug"] = 1.0
                 values.pop(_MOTION_CONTEXT_MARKER, None)
                 values.pop("h3_stage2_context_latent", None)
                 prepared[index] = [entry[0], values, *entry[2:]]
@@ -1188,6 +1300,8 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
     # the current segment's first-pass latent.
     if not replaced_context and prepared and torch.is_tensor(source_video) and source_video.ndim == 5:
         run = _h3_context_run(FRAME_CONTEXT_DEFAULT)
+        # Keep the same temporal context length as stage one. The fallback
+        # path has no existing keyframe to edit, so it injects the full tail.
         steps = {1: 1, 5: 2, 22: 7, 39: 12}[run]
         source_video_resized = _resize_h3_context_latent(
             source_video, target_video.shape[-2], target_video.shape[-1]
@@ -1210,6 +1324,7 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
                         device=target_video.device, dtype=target_video.dtype
                     )
                 values["minimax_keyframes"] = keyframes
+                values["visual_cond_noise_aug"] = 1.0
             else:
                 from . import legacy_h3_motion
                 if legacy_h3_motion.ensure_legacy_h3_motion_context():
@@ -1226,7 +1341,7 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
                 "H3 Auto Director: 二采上下文标记未保留，已将上一段最终二采尾部重新注入（%d latent steps）",
                 int(steps),
             )
-    return prepared
+    return adapt_keyframe_grids(prepared)
 
 
 def _flatten_video_frames(images):
@@ -1571,8 +1686,8 @@ class H3AutoDirectorDualSampling:
             "stage1_denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             "enable_stage2": ("BOOLEAN", {"default": True, "label_on": "启用二采", "label_off": "关闭二采",
                                "tooltip": "关闭后仅执行第一阶段采样，跳过放大、视频 VAE 重编码和第二阶段采样。"}),
-            "stage2_use_context": ("BOOLEAN", {"default": False, "label_on": "二采使用上下文", "label_off": "二采不使用上下文",
-                                    "tooltip": "开启后将上一段最终二采视频/音频上下文适配到二采尺寸后传入；关闭时仅使用一采已经接续的 latent。"}),
+            "stage2_use_context": ("BOOLEAN", {"default": False, "label_on": "二采使用上下文（实验性）", "label_off": "二采不使用上下文",
+                                    "tooltip": "实验性功能，当前效果不可用，默认应关闭。开启后会尝试将上一段最终二采视频/音频上下文适配到二采尺寸后传入。"}),
             "stage2_steps": ("INT", {"default": 8, "min": 1, "max": 100}),
             "stage2_denoise": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.0, "step": 0.01}),
             "upscale_mode": (DUAL_UPSCALE_CHOICES, {"default": "普通插值"}),
@@ -1590,6 +1705,8 @@ class H3AutoDirectorDualSampling:
         }, "optional": {
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
+            "stage1_sigmas": ("SIGMAS", {"tooltip": "可选。一采使用的完整 Sigmas 调度；连接后优先于一采步数、降噪和调度器。"}),
+            "stage2_sigmas": ("SIGMAS", {"tooltip": "可选。二采使用的完整 Sigmas 调度；连接后优先于二采步数、降噪和调度器。"}),
         }}
 
     RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE")
@@ -1603,7 +1720,7 @@ class H3AutoDirectorDualSampling:
                upscale_model=None, seed=0, stage2_conditioning=None, stage2_context_latent=None,
                use_stage1_audio_only=False, enable_preview=False, latent_upscale_model=None,
                latent_upscale_device="cuda", latent_upscale_precision="fp32",
-               stage2_model=None, **_legacy_unused):
+               stage2_model=None, stage1_sigmas=None, stage2_sigmas=None, **_legacy_unused):
         global _LAST_STAGE1_CONTEXT
         if stage1_model is None:
             stage1_model = _legacy_unused.get("model")
@@ -1615,7 +1732,8 @@ class H3AutoDirectorDualSampling:
         # Stage models are optional by design.  This keeps ordinary graphs
         # simple and lets users put the standard ComfyUI LoRA/optimization
         # nodes exactly where each stage needs them.
-        first = _dual_sample(first_model, stage1_conditioning, latent, sampler_name, scheduler, stage1_steps, stage1_denoise, seed, enable_preview)
+        first = _dual_sample(first_model, stage1_conditioning, latent, sampler_name, scheduler,
+                             stage1_steps, stage1_denoise, seed, enable_preview, stage1_sigmas)
         # SaveSegment consumes this immediately after the sampler.  Keeping it
         # here preserves compatibility with existing graphs that do not expose
         # the optional first-stage latent socket.
@@ -1734,7 +1852,8 @@ class H3AutoDirectorDualSampling:
                 "二采正向条件为空：请确认多模态参考节点已输出 positive，"
                 "且不要把空的 stage2_conditioning 节点连接到双采样。"
             )
-        final = _dual_sample(second_model, final_conditioning, refined, sampler_name, scheduler, stage2_steps, stage2_denoise, int(seed) + 1, enable_preview)
+        final = _dual_sample(second_model, final_conditioning, refined, sampler_name, scheduler,
+                             stage2_steps, stage2_denoise, int(seed) + 1, enable_preview, stage2_sigmas)
         if bool(use_stage1_audio_only):
             final_parts = _av_latent_parts(final)
             if final_parts is None:
@@ -1768,8 +1887,8 @@ class H3AutoDirectorDualSamplingModel:
             "stage1_denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             "enable_stage2": ("BOOLEAN", {"default": True, "label_on": "启用二采", "label_off": "关闭二采",
                                "tooltip": "关闭后仅执行第一阶段采样。"}),
-            "stage2_use_context": ("BOOLEAN", {"default": False, "label_on": "二采使用上下文", "label_off": "二采不使用上下文",
-                                    "tooltip": "开启后将上一段最终二采视频/音频上下文适配到二采尺寸后传入；关闭时仅使用一采已经接续的 latent。"}),
+            "stage2_use_context": ("BOOLEAN", {"default": False, "label_on": "二采使用上下文（实验性）", "label_off": "二采不使用上下文",
+                                    "tooltip": "实验性功能，当前效果不可用，默认应关闭。开启后会尝试将上一段最终二采视频/音频上下文适配到二采尺寸后传入。"}),
             "stage2_steps": ("INT", {"default": 8, "min": 1, "max": 100}),
             "stage2_denoise": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.0, "step": 0.01}),
             "upscale_mode": (DUAL_UPSCALE_CHOICES, {"default": "普通插值"}),
@@ -1787,6 +1906,8 @@ class H3AutoDirectorDualSamplingModel:
         }, "optional": {
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
+            "stage1_sigmas": ("SIGMAS", {"tooltip": "可选。一采使用的完整 Sigmas 调度；连接后优先于一采步数、降噪和调度器。"}),
+            "stage2_sigmas": ("SIGMAS", {"tooltip": "可选。二采使用的完整 Sigmas 调度；连接后优先于二采步数、降噪和调度器。"}),
         }}
         return base
 
@@ -1801,14 +1922,14 @@ class H3AutoDirectorDualSamplingModel:
                seed=0, upscale_model=None, stage2_conditioning=None, stage2_context_latent=None,
                use_stage1_audio_only=False, enable_preview=False, latent_upscale_model=None,
                latent_upscale_device="cuda", latent_upscale_precision="fp32",
-               stage2_model=None, **_legacy_unused):
+               stage2_model=None, stage1_sigmas=None, stage2_sigmas=None, **_legacy_unused):
         return H3AutoDirectorDualSampling().sample(
         stage1_model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
             stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
             target_width, target_height, enable_stage2, stage2_use_context, upscale_model, seed,
             stage2_conditioning, stage2_context_latent, use_stage1_audio_only,
             enable_preview, latent_upscale_model, latent_upscale_device,
-            latent_upscale_precision, stage2_model)
+            latent_upscale_precision, stage2_model, stage1_sigmas, stage2_sigmas)
 
 
 def _validate_reference_limits(refs, label="参考素材"):
@@ -3334,24 +3455,29 @@ class H3AutoDirectorContext:
         )
         video_path, latent_path = requested_video_path, requested_latent_path
         if context_stage == 1:
-            # A dual-sampled predecessor's final output is the authoritative
-            # continuation source for both passes.  The first-pass cache is
-            # retained only as a compatibility fallback for old/incomplete
-            # projects or while a predecessor is still being generated.
-            final_video_path, final_latent_path = _paths(
-                plan, int(segment_index), for_context=True, context_stage=2
+            # Keep the first pass independent from the final second-pass
+            # output.  Feeding a soft second-pass prefix into the next first
+            # pass creates a feedback loop: the blur is then refined and
+            # propagated through every subsequent segment.  The second pass
+            # receives the explicit stage-two source below when its context
+            # option is enabled.
+            LOG.info(
+                "H3 Auto Director: 一采上下文固定读取上一段一采源：视频=%s，latent=%s",
+                video_path, latent_path,
             )
-            if final_latent_path.is_file() and (not video_enabled or final_video_path.is_file()):
-                video_path, latent_path = final_video_path, final_latent_path
-                LOG.info(
-                    "H3 Auto Director: 一采上下文优先使用上一段最终二采源：视频=%s，latent=%s",
-                    video_path, latent_path,
+            if not latent_path.is_file():
+                # Pre-isolation projects did not always save a separate
+                # first-pass cache. Keep those projects resumable, but never
+                # prefer this fallback when the dedicated cache exists.
+                final_video_path, final_latent_path = _paths(
+                    plan, int(segment_index), for_context=True, context_stage=2
                 )
-            elif not requested_latent_path.exists():
-                # Projects created before dual-context caches existed remain
-                # resumable: use whatever final cache is available.
-                video_path, latent_path = final_video_path, final_latent_path
-                LOG.info("H3 Auto Director: 一采上下文 latent 不存在，回退读取二采上下文：%s", latent_path)
+                if final_latent_path.is_file() and (not video_enabled or final_video_path.is_file()):
+                    video_path, latent_path = final_video_path, final_latent_path
+                    LOG.warning(
+                        "H3 Auto Director: 一采缓存缺失，兼容回退到上一段最终二采上下文：%s",
+                        latent_path,
+                    )
         # Stage-one context intentionally stores the latent first.  Its video
         # preview is optional because latent-direct Motion Context does not
         # need a decoded frame stream; stage two keeps the normal video cache.
@@ -3497,6 +3623,14 @@ class H3AutoDirectorMotionContext:
             # is cached or references are also present.
             keyframes = [{"resolved_frame_index": 0, "latent": tail,
                           _NATIVE_CONTEXT_KEY: True}]
+            # SaveSegment removes the context prefix before concatenation.
+            # Add a one-token anchor exactly at that cut so the first visible
+            # frame is still tied to the predecessor's final latent instead
+            # of being allowed to jump after the hidden 22-frame transition.
+            if _h3_pixel_frames(int(target_video.shape[2])) > int(run):
+                keyframes.append({"resolved_frame_index": int(run),
+                                  "latent": tail[:, :, -1:],
+                                  _NATIVE_CONTEXT_KEY: True})
             values = {"minimax_keyframes": keyframes, _NATIVE_CONTEXT_KEY: True,
                       "h3_auto_director_context_run": int(run)}
         else:
@@ -3510,6 +3644,9 @@ class H3AutoDirectorMotionContext:
                 offset += frame_per_token[index % len(frame_per_token)]
             keyframes = [{"resolved_frame_index": 0, legacy.MC_KEY: frame, "latent": tail[:, :, index:index + 1]}
                          for index, frame in enumerate(offsets)]
+            if _h3_pixel_frames(int(target_video.shape[2])) > int(run):
+                keyframes.append({"resolved_frame_index": int(run), legacy.MC_KEY: int(run),
+                                  "latent": tail[:, :, -1:]})
             values = {"minimax_keyframes": keyframes,
                       "minimax_frame_count": _h3_pixel_frames(int(target_video.shape[2])),
                       "h3_auto_director_context_run": int(run)}
@@ -3560,6 +3697,11 @@ class H3AutoDirectorMotionContext:
         if _native_h3_add_guide_supported():
             keyframes = [{"resolved_frame_index": 0, "latent": encoded[:, :, :steps].to(
                 device=target_video.device, dtype=target_video.dtype), _NATIVE_CONTEXT_KEY: True}]
+            if _h3_pixel_frames(int(target_video.shape[2])) > int(run) and steps > 0:
+                keyframes.append({"resolved_frame_index": int(run),
+                                  "latent": encoded[:, :, steps - 1:steps].to(
+                                      device=target_video.device, dtype=target_video.dtype),
+                                  _NATIVE_CONTEXT_KEY: True})
             values = {"minimax_keyframes": keyframes, _NATIVE_CONTEXT_KEY: True,
                       "h3_auto_director_context_run": int(run)}
             LOG.info("H3 Auto Director: 使用新版原生 Guide VAE 回退上下文：视频 keyframe=%d，音频上下文不可用", len(keyframes))
@@ -3575,6 +3717,10 @@ class H3AutoDirectorMotionContext:
         keyframes = [{"resolved_frame_index": 0, legacy_h3_motion.MC_KEY: frame,
                       "latent": encoded[:, :, index:index + 1].to(device=target_video.device, dtype=target_video.dtype)}
                      for index, frame in enumerate(offsets)]
+        if _h3_pixel_frames(int(target_video.shape[2])) > int(run) and steps > 0:
+            keyframes.append({"resolved_frame_index": int(run), legacy_h3_motion.MC_KEY: int(run),
+                              "latent": encoded[:, :, steps - 1:steps].to(
+                                  device=target_video.device, dtype=target_video.dtype)})
         values = {"minimax_keyframes": keyframes,
                   "minimax_frame_count": _h3_pixel_frames(int(target_video.shape[2])),
                   "h3_auto_director_context_run": int(run)}

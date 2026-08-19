@@ -9,6 +9,8 @@ from __future__ import annotations
 import comfy.model_sampling
 import comfy.patcher_extension
 import logging
+import torch
+import torch.nn.functional as F
 
 try:
     import comfy.ldm.minimax.model as _minimax_model
@@ -60,7 +62,31 @@ class MiniMaxH3LegacyModelSampling(
         return 1.0
 
 
-def _refresh_legacy_h3_payload(kwargs, transformer_options):
+def _resize_keyframe_latent(latent, target_h, target_w):
+    """Adapt native H3 guide keyframes to the active target video grid."""
+    if not torch.is_tensor(latent) or latent.ndim != 5:
+        return latent
+    target_h, target_w = int(target_h), int(target_w)
+    if tuple(int(v) for v in latent.shape[-2:]) == (target_h, target_w):
+        return latent
+    b, c, t, h, w = latent.shape
+    if min(target_h, target_w, h, w) <= 0:
+        return latent
+    flat = latent.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w).float()
+    flat = F.interpolate(flat, size=(target_h, target_w), mode="bilinear", align_corners=False)
+    return flat.reshape(b, t, c, target_h, target_w).permute(0, 2, 1, 3, 4).to(
+        device=latent.device, dtype=latent.dtype
+    )
+
+
+def _target_video_from_x(x):
+    try:
+        return x[0]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+def _refresh_legacy_h3_payload(kwargs, transformer_options, target_video=None):
     """Drop cached H3 layout data before running the legacy sampler.
 
     H3 conditioning can be cached between segments, while the packed target
@@ -79,6 +105,18 @@ def _refresh_legacy_h3_payload(kwargs, transformer_options):
     refreshed.pop("layout", None)
     keyframes = refreshed.get("keyframes") or []
     refs = refreshed.get("refs") or []
+    if torch.is_tensor(target_video) and target_video.ndim == 5:
+        target_h, target_w = int(target_video.shape[-2]), int(target_video.shape[-1])
+        adapted = []
+        for keyframe in keyframes:
+            if not isinstance(keyframe, dict):
+                adapted.append(keyframe)
+                continue
+            item = dict(keyframe)
+            item["latent"] = _resize_keyframe_latent(item.get("latent"), target_h, target_w)
+            adapted.append(item)
+        keyframes = adapted
+        refreshed["keyframes"] = keyframes
     if keyframes or refs:
         refreshed["cond_video_latents"] = [item["latent"] for item in keyframes
                                             if isinstance(item, dict) and item.get("latent") is not None]
@@ -145,7 +183,7 @@ def _is_audio_layout_error(exc):
 
 
 def legacy_audio_sampling_wrapper(executor, x, timestep, context, transformer_options, **kwargs):
-    _refresh_legacy_h3_payload(kwargs, transformer_options)
+    _refresh_legacy_h3_payload(kwargs, transformer_options, _target_video_from_x(x))
     try:
         output = executor(x, timestep, context, transformer_options, **kwargs)
     except RuntimeError as exc:
@@ -178,7 +216,7 @@ def native_layout_refresh_wrapper(executor, x, timestep, context, transformer_op
     if not _NATIVE_REFRESH_LOGGED:
         _LOG.info("H3 Auto Director: v0.31 原生音频采样已启用跨片段布局刷新")
         _NATIVE_REFRESH_LOGGED = True
-    _refresh_legacy_h3_payload(kwargs, transformer_options)
+    _refresh_legacy_h3_payload(kwargs, transformer_options, _target_video_from_x(x))
     return executor(x, timestep, context, transformer_options, **kwargs)
 
 
