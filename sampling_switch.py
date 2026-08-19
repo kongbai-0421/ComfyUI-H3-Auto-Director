@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - only older ComfyUI builds
 PATCH_KEY = "h3_auto_director_legacy_audio_sampling"
 NATIVE_LAYOUT_PATCH_KEY = "h3_auto_director_native_layout_refresh"
 _LAYOUT_REFRESH_MARKER = "h3_auto_director_legacy_layout_refreshed"
+_NATIVE_AUDIO_RETRY_MARKER = "h3_auto_director_native_audio_context_disabled"
 _LOG = logging.getLogger("h3_auto_director")
 _NATIVE_REFRESH_LOGGED = False
 NATIVE_MODE = "ComfyUI v0.31.0版本方法"
@@ -99,9 +100,11 @@ def _refresh_legacy_h3_payload(kwargs, transformer_options, target_video=None):
     payload = kwargs.get("minimax_payload")
     if not isinstance(payload, dict):
         return
-    if "layout" not in payload and "keyframes" not in payload and "refs" not in payload:
-        return
     refreshed = dict(payload)
+    # Layout objects are built from the latent shape of the first sampling
+    # call. Prompt-vector caches may carry one from another segment, so never
+    # reuse it across a new target latent. The native H3 forward will rebuild
+    # it from the current video/audio shapes and the preserved blocks below.
     refreshed.pop("layout", None)
     keyframes = refreshed.get("keyframes") or []
     refs = refreshed.get("refs") or []
@@ -211,13 +214,41 @@ def legacy_audio_sampling_wrapper(executor, x, timestep, context, transformer_op
 
 
 def native_layout_refresh_wrapper(executor, x, timestep, context, transformer_options, **kwargs):
-    """Refresh cached H3 condition layout while keeping native AV behavior."""
+    """Refresh cached H3 layout and recover from stale audio-context rows.
+
+    A prompt/cache path can leave the native ``PackedLayout`` describing a
+    longer audio guide than the latent carried in ``cond_audio_latents``.  The
+    v0.31 model then fails while assigning packed rows (for example 470 vs
+    396).  Video continuation remains valid in that case, so retry once with
+    only Auto Director's audio guide removed.  The marker keeps all later
+    denoising steps on the repaired payload instead of repeating the failing
+    attempt on every step.
+    """
     global _NATIVE_REFRESH_LOGGED
     if not _NATIVE_REFRESH_LOGGED:
         _LOG.info("H3 Auto Director: v0.31 原生音频采样已启用跨片段布局刷新")
         _NATIVE_REFRESH_LOGGED = True
+    if transformer_options.get(_NATIVE_AUDIO_RETRY_MARKER):
+        payload = kwargs.get("minimax_payload")
+        retry_payload = _remove_legacy_motion_audio(payload)
+        if retry_payload is not None:
+            kwargs["minimax_payload"] = retry_payload
     _refresh_legacy_h3_payload(kwargs, transformer_options, _target_video_from_x(x))
-    return executor(x, timestep, context, transformer_options, **kwargs)
+    try:
+        return executor(x, timestep, context, transformer_options, **kwargs)
+    except RuntimeError as exc:
+        if not _is_audio_layout_error(exc):
+            raise
+        payload = kwargs.get("minimax_payload")
+        retry_payload = _remove_legacy_motion_audio(payload)
+        if retry_payload is None:
+            raise
+        _LOG.warning(
+            "H3 Auto Director: v0.31 音频上下文布局不兼容，已移除自动导演音频上下文并保留视频上下文后重试"
+        )
+        transformer_options[_NATIVE_AUDIO_RETRY_MARKER] = True
+        kwargs["minimax_payload"] = retry_payload
+        return executor(x, timestep, context, transformer_options, **kwargs)
 
 
 def _new_model_sampling(model, sampling_type, shift_video, shift_audio):
@@ -296,4 +327,32 @@ def apply_h3_sampling(model, mode, shift_video, shift_audio):
         )
     _LOG.info("H3 Auto Director: 音频采样=%s，视频偏移=%.3f，音频偏移=%.3f",
               NATIVE_MODE, float(shift_video), float(shift_audio))
+    return patched
+
+
+def ensure_h3_layout_refresh(model):
+    """Return a model clone that refreshes H3 packed layouts per forward.
+
+    The public audio-sampling node intentionally exposes only ``SIGMAS``. Its
+    temporary patched model therefore cannot be passed downstream to install
+    the layout wrapper. Dual sampling uses this helper internally so cached
+    conditioning never keeps a stale ``PackedLayout`` from another segment.
+    """
+    if model is None or not hasattr(model, "clone"):
+        return model
+    if not hasattr(comfy.patcher_extension, "WrappersMP"):
+        return model
+    try:
+        diffusion_model = model.get_model_object("diffusion_model")
+    except Exception:
+        return model
+    if not _is_h3_model(diffusion_model):
+        return model
+    patched = model.clone()
+    patched.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, NATIVE_LAYOUT_PATCH_KEY)
+    patched.add_wrapper_with_key(
+        comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
+        NATIVE_LAYOUT_PATCH_KEY,
+        native_layout_refresh_wrapper,
+    )
     return patched

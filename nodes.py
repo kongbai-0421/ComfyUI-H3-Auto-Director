@@ -35,7 +35,7 @@ import comfy.samplers
 import comfy.sample
 import comfy.sd
 import comfy.utils
-from .sampling_switch import LEGACY_MODE, NATIVE_MODE, apply_h3_sampling
+from .sampling_switch import LEGACY_MODE, NATIVE_MODE, apply_h3_sampling, ensure_h3_layout_refresh
 
 try:
     from comfy_extras import nodes_minimax_h3 as _minimax_h3
@@ -88,6 +88,10 @@ except ImportError:
 
 LOG = logging.getLogger("h3_auto_director")
 FPS = 24.0
+# Diagnostic mode: keep the complete generated timeline while investigating
+# continuation joins. Set the environment variable to ``1`` to restore the
+# old automatic context-prefix crop after the comparison is complete.
+AUTO_CONTEXT_CROP_DEFAULT = False
 FRAME_CONTEXT_DEFAULT = 22
 PROMPT_CACHE_MAX_PROJECTS = 2
 PROMPT_DISK_CACHE_SCHEMA = 1
@@ -812,6 +816,52 @@ def _has_positive_conditioning(value):
     return any(_is_conditioning_entry(entry) for entry in _conditioning_entries(value))
 
 
+def _without_auto_director_audio_context(conditioning):
+    """Remove only Auto Director's audio continuation guides.
+
+    H3's native packed layout reserves rows from the metadata blocks while the
+    model consumes the actual latent tensors.  A cached conditioning block can
+    retain an old audio window after the current segment's audio length has
+    changed.  Removing the private continuation audio is a safe recovery path:
+    video keyframes and user-provided audio references remain untouched.
+    """
+    changed = False
+    prepared = []
+    for entry in _conditioning_entries(conditioning):
+        if not _is_conditioning_entry(entry):
+            prepared.append(entry)
+            continue
+        values = entry[1].copy()
+        keyframes = values.get("minimax_keyframes")
+        if isinstance(keyframes, (list, tuple)):
+            updated = []
+            for keyframe in keyframes:
+                if not isinstance(keyframe, dict):
+                    updated.append(keyframe)
+                    continue
+                item = dict(keyframe)
+                if item.get(_NATIVE_CONTEXT_KEY) and item.get("audio_latent") is not None:
+                    item.pop("audio_latent", None)
+                    changed = True
+                updated.append(item)
+            values["minimax_keyframes"] = updated
+        refs = values.get("minimax_refs")
+        if isinstance(refs, (list, tuple)):
+            updated_refs = []
+            for ref in refs:
+                if not isinstance(ref, dict):
+                    updated_refs.append(ref)
+                    continue
+                if ("motion_context_audio_end_frame" in ref
+                        or "h3_auto_director_legacy_audio_end_frame" in ref):
+                    changed = True
+                    continue
+                updated_refs.append(ref)
+            values["minimax_refs"] = updated_refs
+        prepared.append([entry[0], values, *entry[2:]])
+    return prepared if changed else None
+
+
 def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, denoise, seed,
                  enable_preview=False, sigmas=None):
     """Run one positive-only H3 sampling pass, matching BasicGuider semantics."""
@@ -819,6 +869,10 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
     if not _has_positive_conditioning(conditioning):
         raise ValueError("双采样需要有效的正向条件")
     from comfy_extras.nodes_custom_sampler import Guider_Basic
+    # The public sampling-switch node returns SIGMAS by design. Install the
+    # H3 layout refresh internally so cached conditioning cannot retain a
+    # previous segment's audio row count (for example 470 vs 396).
+    model = ensure_h3_layout_refresh(model)
     guider = Guider_Basic(model)
     guider.set_conds(conditioning)
     sampler = comfy.samplers.sampler_object(str(sampler_name))
@@ -846,8 +900,30 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
             callback = latent_preview.prepare_callback(model, int(steps))
         except Exception as exc:
             LOG.warning("H3 Auto Director: 新版采样预览初始化失败，继续采样：%s", exc)
-    samples = guider.sample(noise, latent_image, sampler, sigmas,
-                            denoise_mask=latent.get("noise_mask"), callback=callback, seed=int(seed))
+    try:
+        samples = guider.sample(noise, latent_image, sampler, sigmas,
+                                denoise_mask=latent.get("noise_mask"), callback=callback, seed=int(seed))
+    except RuntimeError as exc:
+        # This is primarily for workflows where the sampling-switch node is
+        # used only for SIGMAS (its MODEL output was intentionally removed),
+        # so the native layout-refresh wrapper is not present on the model.
+        # Retry once with the private Auto Director audio guide removed; this
+        # preserves video continuation and all user audio references.
+        message = str(exc)
+        if not ("expanded size" in message and "5376" in message):
+            raise
+        repaired = _without_auto_director_audio_context(conditioning)
+        if repaired is None:
+            raise
+        LOG.warning(
+            "H3 Auto Director: 检测到音频上下文行数不匹配，已移除自动导演音频上下文并保留视频上下文后重试"
+        )
+        retry_guider = Guider_Basic(model)
+        retry_guider.set_conds(repaired)
+        retry_noise = comfy.sample.prepare_noise(latent_image, int(seed), latent.get("batch_index"))
+        samples = retry_guider.sample(retry_noise, latent_image, sampler, sigmas,
+                                      denoise_mask=latent.get("noise_mask"), callback=callback,
+                                      seed=int(seed))
     result = dict(latent)
     result["samples"] = samples
     return result
@@ -1208,13 +1284,25 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
             if torch.is_tensor(source_audio) and source_audio.ndim == 4:
                 native_keyframes = values.get("minimax_keyframes")
                 if isinstance(native_keyframes, (list, tuple)):
+                    # Native keyframes loaded from a cached conditioning can
+                    # carry the whole previous segment's audio (for example
+                    # 198/235 latent steps). A continuation guide must contain
+                    # only the configured context tail on H3's 40 Hz axis;
+                    # otherwise its packed rows no longer describe the current
+                    # segment and the audio transition is over-conditioned.
+                    context_audio_steps = max(
+                        1, int(round(float(context_run) / FPS * 40.0))
+                    )
+                    context_audio_steps = min(
+                        context_audio_steps, int(source_audio.shape[-1])
+                    )
                     updated_keyframes = []
                     for keyframe in native_keyframes:
                         item = dict(keyframe)
                         old_audio = item.get("audio_latent")
                         if (item.get(_NATIVE_CONTEXT_KEY) and torch.is_tensor(old_audio)
                                 and old_audio.ndim == 4):
-                            actual_t = min(int(old_audio.shape[-1]), int(source_audio.shape[-1]))
+                            actual_t = min(context_audio_steps, int(old_audio.shape[-1]))
                             if actual_t > 0:
                                 item["audio_latent"] = source_audio[..., -actual_t:].to(
                                     device=target_video.device, dtype=target_video.dtype)
@@ -1852,8 +1940,15 @@ class H3AutoDirectorDualSampling:
                 "二采正向条件为空：请确认多模态参考节点已输出 positive，"
                 "且不要把空的 stage2_conditioning 节点连接到双采样。"
             )
+        # A single external schedule can drive both passes.  When a dedicated
+        # second-pass SIGMAS socket is not connected, reuse the first-pass
+        # schedule instead of silently falling back to a different scheduler.
+        effective_stage2_sigmas = stage2_sigmas if stage2_sigmas is not None else stage1_sigmas
+        if stage2_sigmas is None and stage1_sigmas is not None:
+            LOG.info("H3 Auto Director: 二采 Sigmas 未连接，复用一采 Sigmas")
         final = _dual_sample(second_model, final_conditioning, refined, sampler_name, scheduler,
-                             stage2_steps, stage2_denoise, int(seed) + 1, enable_preview, stage2_sigmas)
+                             stage2_steps, stage2_denoise, int(seed) + 1, enable_preview,
+                             effective_stage2_sigmas)
         if bool(use_stage1_audio_only):
             final_parts = _av_latent_parts(final)
             if final_parts is None:
@@ -2545,9 +2640,6 @@ class H3AutoDirectorDualStageModelLoader:
             "stage2_model": (models, {"default": models[0] if models else "", "tooltip": "二采多模态参考模型（Ref2VA）。"}),
             "stage2_base_model": (models, {"default": models[0] if models else "", "tooltip": "二采混合时使用的画面基础模型（FL2VA）。"}),
             "stage2_enable_hybrid": ("BOOLEAN", {"default": False, "label_on": "启用 H3 混合模型", "label_off": "关闭（仅 Ref2VA）"}),
-            "sampling_mode": ([NATIVE_MODE, LEGACY_MODE], {"default": NATIVE_MODE}),
-            "shift_video": ("FLOAT", {"default": 12.0, "min": 0.01, "max": 100.0, "step": 0.01}),
-            "shift_audio": ("FLOAT", {"default": 3.0, "min": 0.01, "max": 100.0, "step": 0.01}),
             "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"], {"default": "default", "advanced": True}),
         }}
 
@@ -2560,8 +2652,8 @@ class H3AutoDirectorDualStageModelLoader:
 
     def load(self, stage1_model, stage1_base_model="", stage1_enable_hybrid=False,
              stage2_model=None, stage2_base_model="", stage2_enable_hybrid=False,
-             sampling_mode=NATIVE_MODE, shift_video=12.0, shift_audio=3.0,
-             weight_dtype="default", **_legacy_unused):
+             weight_dtype="default",
+             **_legacy_unused):
         if not stage2_model:
             # A missing second-stage socket is a supported configuration, not
             # an invalid model name.  Mirror the dual sampler's fallback here
@@ -2585,11 +2677,9 @@ class H3AutoDirectorDualStageModelLoader:
                       and bool(stage2_enable_hybrid) == bool(stage1_enable_hybrid)
                       and stage2_base_model == stage1_base_model)
         first = load_one(stage1_model, stage1_enable_hybrid, stage1_base_model)
-        first = apply_h3_sampling(first, sampling_mode, float(shift_video), float(shift_audio))
         if same_stage:
             return (first, first)
         second = load_one(stage2_model, stage2_enable_hybrid, stage2_base_model)
-        second = apply_h3_sampling(second, sampling_mode, float(shift_video), float(shift_audio))
         return (first, second)
 
 
@@ -3653,6 +3743,10 @@ class H3AutoDirectorMotionContext:
         if use_audio_context:
             audio_tail, audio_steps, overhang = _h3_audio_tail_from_latent(context_latent, run)
             audio_tail = audio_tail.to(device=target_video.device, dtype=target_video.dtype)
+            LOG.info(
+                "H3 Auto Director: 音频上下文尾部=%d latent 步（来源总长=%d，H3 40Hz，context=%d帧）",
+                int(audio_steps), int(context_parts[1].shape[-1]), int(run),
+            )
             if native_guides:
                 # MiniMaxH3AddGuide anchors audio at the keyframe's frame
                 # index. Context audio is the *start* of the carried window,
@@ -4085,6 +4179,13 @@ def _default_context_trim_frames(plan, segment_index):
     return run
 
 
+def _auto_context_crop_enabled():
+    value = os.environ.get("H3_AUTO_DIRECTOR_AUTO_CROP")
+    if value is None:
+        return AUTO_CONTEXT_CROP_DEFAULT
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "开启", "是"}
+
+
 class H3AutoDirectorSaveSegment:
     @classmethod
     def INPUT_TYPES(cls):
@@ -4100,6 +4201,9 @@ class H3AutoDirectorSaveSegment:
         }, "optional": {
             "trim_frames": ("INT", {"default": 0, "min": 0, "max": 4096,
                               "tooltip": "去除上一段上下文固定在本段开头的帧，避免拼接重复；连接运动上下文节点的裁剪帧数输出。"}),
+            "auto_context_crop": ("BOOLEAN", {"default": False,
+                                  "label_on": "开启", "label_off": "关闭",
+                                  "tooltip": "开启后保存时自动去除上下文固定在片段开头的帧；关闭则保留完整解码时间轴。"}),
             "audio": ("AUDIO",),
             "stage1_latent": ("LATENT",),
             "stage1_images": ("IMAGE",),
@@ -4115,7 +4219,7 @@ class H3AutoDirectorSaveSegment:
     CATEGORY = "H3 自动导演"
     OUTPUT_NODE = True
 
-    def save(self, plan, segment_index, latent, images, fps, output_root="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量", color_correction="关闭", scene_cut_protection=True, scene_cut_threshold=0.18, correction_strength=0.75, residual_strength=0.2, trim_frames=0, audio=None, stage1_latent=None, stage1_images=None):
+    def save(self, plan, segment_index, latent, images, fps, output_root="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量", color_correction="关闭", scene_cut_protection=True, scene_cut_threshold=0.18, correction_strength=0.75, residual_strength=0.2, trim_frames=0, auto_context_crop=False, audio=None, stage1_latent=None, stage1_images=None):
         global _LAST_STAGE1_CONTEXT
         # The dual sampler attaches this only when "最终仅使用一采音频"
         # is enabled.  Prefer it over a separately connected AUDIO decode so
@@ -4135,6 +4239,17 @@ class H3AutoDirectorSaveSegment:
             requested_trim = max(0, int(motion_trim))
         if requested_trim <= 0 and motion_trim is None:
             requested_trim = _default_context_trim_frames(plan, segment_index)
+        # The node switch is authoritative.  The environment variable remains
+        # available only for older programmatic callers that pass None.
+        crop_enabled = (_auto_context_crop_enabled() if auto_context_crop is None
+                        else bool(auto_context_crop))
+        if not crop_enabled:
+            if requested_trim > 0:
+                LOG.info(
+                    "H3 Auto Director: 自动裁剪暂时关闭，保留第 %d 段完整上下文时间轴（原计划裁剪 %d 帧）",
+                    int(segment_index), int(requested_trim),
+                )
+            requested_trim = 0
         images, audio = _trim_context_prefix(images, audio, requested_trim, FPS)
         if requested_trim > 0:
             LOG.info("H3 Auto Director: 保存第 %d 段前裁剪上下文头部 %d 帧，避免拼接重复", int(segment_index), requested_trim)
@@ -4445,7 +4560,13 @@ class H3AutoDirectorTTSController(H3AutoDirectorController):
 
 
 class H3AutoDirectorSamplingSwitch:
-    """Select the v0.31 AV audio sampler or the v0.30 legacy audio sampler."""
+    """Select H3 audio sampling and expose a matching SIGMAS schedule.
+
+    Scheduler, step count and denoise are intentionally fixed here.  The
+    switch is only responsible for selecting the H3 audio-sampling
+    implementation and its video/audio shifts; exposing a second set of
+    schedule controls caused it to fight the main dual-sampling node.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -4456,13 +4577,15 @@ class H3AutoDirectorSamplingSwitch:
             "shift_audio": ("FLOAT", {"default": 3.0, "min": 0.01, "max": 100.0, "step": 0.01}),
         }}
 
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("模型",)
+    RETURN_TYPES = ("SIGMAS",)
+    RETURN_NAMES = ("SIGMAS",)
     FUNCTION = "apply"
     CATEGORY = "H3 自动导演/音频采样"
 
-    def apply(self, model, sampling_mode, shift_video, shift_audio):
-        return (apply_h3_sampling(model, sampling_mode, float(shift_video), float(shift_audio)),)
+    def apply(self, model, sampling_mode, shift_video, shift_audio, **_legacy_unused):
+        patched = apply_h3_sampling(model, sampling_mode, float(shift_video), float(shift_audio))
+        sigmas = _h3_sigmas(patched, "simple", 8, 1.0)
+        return (sigmas,)
 
 
 NODE_CLASS_MAPPINGS = {

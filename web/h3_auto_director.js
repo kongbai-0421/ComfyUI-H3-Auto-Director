@@ -34,6 +34,43 @@ function widget(node, name) {
   return (node.widgets || []).find((item) => item.name === name);
 }
 
+function isRetiredPort(port, names) {
+  if (!port) return false;
+  return [port.name, port.label, port.localized_name]
+    .some((value) => names.has(String(value || "")));
+}
+
+function removeRetiredPorts(node, inputNames = [], outputNames = inputNames) {
+  if (!node) return false;
+  const inputs = new Set(inputNames);
+  const outputs = new Set(outputNames);
+  let changed = false;
+  // Remove backwards-compatible sockets from the end so LiteGraph indices
+  // remain stable while links are detached by removeInput/removeOutput.
+  for (let index = (node.inputs || []).length - 1; index >= 0; index -= 1) {
+    if (!isRetiredPort(node.inputs[index], inputs)) continue;
+    node.removeInput?.(index);
+    changed = true;
+  }
+  for (let index = (node.outputs || []).length - 1; index >= 0; index -= 1) {
+    if (!isRetiredPort(node.outputs[index], outputs)) continue;
+    node.removeOutput?.(index);
+    changed = true;
+  }
+  if (changed) node.setDirtyCanvas?.(true, true);
+  return changed;
+}
+
+function cleanDualStageLoaderPorts(node) {
+  const names = ["stage1_sigmas", "stage2_sigmas", "一采 Sigmas 调度", "二采 Sigmas 调度",
+    "一采 Sigmas", "二采 Sigmas", "一采 Sigma", "二采 Sigma"];
+  return removeRetiredPorts(node, names, names);
+}
+
+function cleanSamplingSwitchPorts(node) {
+  return removeRetiredPorts(node, ["scheduler", "steps", "denoise", "调度器", "采样步数", "降噪"]);
+}
+
 function readDirectories() {
   try {
     return { image: "h3_refs/images", video: "h3_refs/videos", audio: "h3_refs/audio", ...JSON.parse(localStorage.getItem(DIR_KEY) || "{}") };
@@ -268,7 +305,7 @@ function applyChineseLabels(node) {
     conditioning: "条件", latent: "潜变量", context_frames: "上下文画面", context_latent: "上下文潜变量",
     use_video_context: "使用视频上下文", use_audio_context: "使用音频上下文", use_video_latent: "使用视频潜空间",
     fps: "帧率", images: "视频画面", use_stage1_audio_only: "最终仅使用一采音频",
-    audio: "音频", saved_video: nodeClass === "H3AutoDirectorTTSController" ? "已保存音频" : "已保存视频", segment_node_id: "片段节点 ID", trim_frames: "上下文裁剪帧数", match_tail: "匹配音频尾部",
+    audio: "音频", saved_video: nodeClass === "H3AutoDirectorTTSController" ? "已保存音频" : "已保存视频", segment_node_id: "片段节点 ID", trim_frames: "上下文裁剪帧数", auto_context_crop: "自动裁剪上下文", match_tail: "匹配音频尾部",
     clip_index: "片段序号", latent_path: "潜变量路径",
     aspect_ratio: "宽高比", megapixels: "目标像素数（MP）", multiple: "尺寸倍数",
     use_preset_ratio: "使用预设比例", use_custom_ratio: "使用自定义比例", aspect_preset: "宽高比预设", custom_ratio: "自定义比例（宽,高）",
@@ -278,7 +315,7 @@ function applyChineseLabels(node) {
     video_format: "视频格式", video_codec: "编码格式", encoder_device: "编码设备", quality: "编码质量", color_correction: "上下文色彩校正",
     scene_cut_protection: "场景切换保护", scene_cut_threshold: "场景切换阈值",
     correction_strength: "校色强度", residual_strength: "残余漂移强度",
-    cleanup_after_final: "最终完成后清理显存", sampling_mode: "音频采样切换",
+    cleanup_after_final: "最终完成后清理显存", sampling_mode: "音频采样切换", scheduler: "调度器", steps: "采样步数", denoise: "降噪",
     stage1_steps: "第一阶段步数", stage1_denoise: "第一阶段降噪", enable_stage2: "启用第二阶段采样", stage2_use_context: "二采使用上下文接续（实验性，不可用）", stage2_steps: "第二阶段步数", stage2_denoise: "第二阶段降噪",
     stage1_sigmas: "一采 Sigmas 调度", stage2_sigmas: "二采 Sigmas 调度",
     upscale_mode: "视频放大方式", target_width: "第二阶段宽度", target_height: "第二阶段高度", upscale_model: "普通放大模型", latent_upscale_model: "H3 latent 学习型放大模型", latent_upscale_device: "latent 放大设备", latent_upscale_precision: "latent 放大精度", enable_preview: "新版采样预览", seed: "双采样种子",
@@ -296,6 +333,8 @@ function applyChineseLabels(node) {
   const apply = (item) => {
     const stageLabel = nodeClass === DUAL_SAMPLING_NODE
       ? { stage1_model: "一采模型（可接外部 LoRA/显存优化）", stage2_model: "二采模型（未连接复用一采）" }[item?.name]
+      : nodeClass === SAMPLING_SWITCH_NODE && item?.name === "model"
+        ? "模型（仅用于计算 Sigmas）"
       : null;
     const label = stageLabel || labels[item?.name];
     if (!label) return;
@@ -310,6 +349,8 @@ function applyChineseLabels(node) {
 function decorateNode(node) {
   const nodeClass = node.comfyClass || node.type;
   if (!H3_NODE_CLASSES.has(nodeClass)) return;
+  if (nodeClass === DUAL_STAGE_LOADER_NODE) cleanDualStageLoaderPorts(node);
+  if (nodeClass === SAMPLING_SWITCH_NODE) cleanSamplingSwitchPorts(node);
   if (nodeClass === NODE && !widget(node, "edit_segments")) {
     const button = node.addWidget("button", "edit_segments", "编辑片段", () => openEditor(node));
     button.label = "编辑片段";
@@ -1135,6 +1176,53 @@ app.registerExtension({
             ...info,
             widgets_values: [old[0], "MiniMax-H3\\minimax_h3_fl2va_pruned_int8_convrot.safetensors", false,
               old[1], old[2], old[3], old[4] ?? "default", old[5] ?? "minimax"],
+          };
+        }
+        return originalConfigure?.call(this, info);
+      };
+    }
+    if (nodeData.name === DUAL_STAGE_LOADER_NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        // The loader only owns model selection. Remove the retired sampling
+        // and Sigma sockets from old serialized workflows before LiteGraph
+        // restores them, including stale outputs that were never connected.
+        const inputs = Array.isArray(info?.inputs) ? info.inputs : [];
+        const names = inputs.map((input) => input?.name);
+        const retired = new Set(["sampling_mode", "shift_video", "shift_audio", "stage1_sigmas", "stage2_sigmas"]);
+        const oldValues = Array.isArray(info?.widgets_values) ? info.widgets_values : null;
+        const hasRetired = names.some((name) => retired.has(name))
+          || (Array.isArray(info?.outputs) && info.outputs.some((output) => retired.has(output?.name)));
+        if (hasRetired) {
+          const values = Object.fromEntries(names.map((name, index) => [name, oldValues?.[index]]));
+          const keep = ["stage1_model", "stage1_base_model", "stage1_enable_hybrid",
+            "stage2_model", "stage2_base_model", "stage2_enable_hybrid", "weight_dtype"];
+          info = {
+            ...info,
+            inputs: inputs.filter((input) => !retired.has(input?.name)),
+            outputs: Array.isArray(info.outputs)
+              ? info.outputs.filter((output) => !retired.has(output?.name))
+              : info.outputs,
+            widgets_values: keep.map((name) => values[name]),
+          };
+        }
+        return originalConfigure?.call(this, info);
+      };
+    }
+    if (nodeData.name === SAMPLING_SWITCH_NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        // Remove the retired schedule controls from old serialized nodes.
+        // The switch keeps only mode + video/audio shifts and still emits
+        // SIGMAS using its stable H3 default schedule.
+        const names = Array.isArray(info?.inputs) ? info.inputs.map((input) => input?.name) : [];
+        const values = Array.isArray(info?.widgets_values) ? info.widgets_values : null;
+        const retired = new Set(["scheduler", "steps", "denoise"]);
+        if (values && names.some((name) => retired.has(name))) {
+          info = {
+            ...info,
+            inputs: (info.inputs || []).filter((input) => !retired.has(input?.name)),
+            widgets_values: values.slice(0, 3),
           };
         }
         return originalConfigure?.call(this, info);
