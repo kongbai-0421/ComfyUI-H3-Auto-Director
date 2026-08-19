@@ -12,6 +12,8 @@ ComfyUI/custom_nodes/ComfyUI-H3-Auto-Director
 
 重启 ComfyUI。连续视频/音频上下文已内置：新版 ComfyUI 使用核心的 `MiniMaxH3AddGuide` 原生任意帧锚定；旧版 ComfyUI 会自动启用插件内置的 Motion Context 兼容层。因此不再必须安装 `ComfyUI-H3-Motion-Context`。多模态参考仍依赖 ComfyUI 中的 `MiniMaxH3ReferenceToVideo`、`VHS_LoadVideo`、核心 `LoadAudio` 和 `ResolutionSelector` 节点。
 
+如果出现节点注册、采样、张量形状或音频异常，请先将 ComfyUI 更新到最新版本，并重启实际运行工作流的 ComfyUI 进程，再检查模型和外部节点版本是否兼容。
+
 ## H3 音频采样切换
 
 插件内置 `H3 自动导演｜音频采样切换` 节点，不需要额外安装
@@ -22,7 +24,7 @@ ComfyUI/custom_nodes/ComfyUI-H3-Auto-Director
 
 旧工作流中保存的旧版本字符串仍会自动转换为对应的新选项。
 
-把它放在 UNET、LoRA、SageAttention 等模型补丁之后，连接到 `BasicGuider` 和
+把它放在 UNET、LoRA 等模型补丁之后，连接到 `BasicGuider` 和
 `BasicScheduler` 的 `model` 输入。`shift_video` 和 `shift_audio` 默认保持
 `12.00 / 3.00`。每次只使用一个音频采样切换节点；它会输出一个模型供后续两路共同使用。
 当前模式会覆盖上游 H3 调度对象，旧版模式还会安装音频输出转换包装器，因此不应再串联核心
@@ -56,18 +58,17 @@ RuntimeError: The expanded size of the tensor (414) must match the existing size
 
 v0.30 方法在独立片段、普通多模态参考和仅视频上下文场景仍可使用。v0.30 和 v0.31 两条采样路径现在都会在每次 H3 前向前丢弃跨片段缓存的 `PackedLayout`，并按当前 keyframe/ref latent 重建条件列表，避免不同片段的音频长度串用。v0.30 路径如果仍遇到音频布局错误，会自动移除自动导演注入的音频上下文、保留视频上下文并重试；原生 v0.31 路径则保留音频上下文并使用刷新后的布局。插件会在旧版核心上启用内置的 Motion Context 兼容层；该兼容层不等于把新版核心的 AV 音频布局强行改回旧版。如果仍出现新的布局尺寸错误，请提供重启后的完整 traceback，并检查是否串联了外部 LegacySampling 节点。
 
-## 注意力加速与 Turbo LoRA
+## 模型补丁与兼容性
 
-`MiniMax H3 Mem Eff Sage Attention Patch`（Sage Attention）与 `SolAttnPatch`
-（Sol-Attn）都是对同一 H3 模型注意力路径的替换。两者必须二选一：一条模型链中只启用其中一个，
-不要串联，也不要同时解除两者的静音/旁路状态。它们不会叠加加速效果，同时启用会覆盖前一个补丁或造成
-不兼容的注意力状态。需要对比时，用相同模型、提示词、素材、种子和采样参数分别运行。
+自动导演不内置 LoRA 或其他外部性能补丁。需要使用这些外部节点时，请按对应项目当前版本的
+说明自行连接；本仓库不规定特定外部性能补丁、连接顺序或二选一配置。遇到节点注册、采样、张量形状
+或音频异常时，请先将 ComfyUI 更新到最新版本并重启实际运行工作流的进程，再确认 H3 模型、VAE、
+参考素材节点与外部补丁来自兼容版本。
 
 可选的 H3 Turbo 加速 LoRA 可从
 [lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo/tree/main)
-下载。将其放入 ComfyUI LoRA 目录后，通过标准 `LoraLoaderModelOnly` 接到 UNET 模型链。Turbo LoRA
-可能与带独立音频参考或视频音轨参考的附加时间条件不兼容；遇到 `3 vs 2` tensor 错误时，先断开 Turbo
-LoRA 验证基础 H3 流程。
+下载，并通过标准 `LoraLoaderModelOnly` 接到模型链。Turbo LoRA 可能与带独立音频参考或视频音轨
+参考的附加时间条件不兼容；出现张量形状错误时，请先更新 ComfyUI，再断开 Turbo LoRA 验证基础流程。
 
 ## 可选混合模型
 
@@ -197,6 +198,9 @@ H3 混合模型加载与 FL2VA/Ref2VA 组合方案参考 [ComfyUI-MiniMax-H3-Hyb
 
 高级色彩校正的设计参考了 [ComfyUI-CustomNodeKit](https://github.com/user2318/ComfyUI-CustomNodeKit) 的色彩漂移校正思路；H3 版本采用独立的保守实现，并增加场景切换保护。
 
+潜空间放大功能参考并鸣谢 [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)。
+潜空间放大模型的下载地址、文件名和安装要求请以前述插件的 README 为准；本仓库不重新分发模型文件。
+
 音频采样切换节点中的旧版音频调度实现参考 [ComfyUI-MiniMax-H3-LegacySampling](https://github.com/starsFriday/ComfyUI-MiniMax-H3-LegacySampling)，感谢 starsFriday 提供的兼容性实现。本仓库已将该实现内置，使用旧版模式时不需要再安装外部节点；重新发布或修改相关代码时请保留上游署名并遵守其许可证。
 
 MiniMax H3 模型与核心节点属于其各自的项目和许可证。本仓库只提供 ComfyUI 编排、项目管理、参考素材解析、缓存、保存和连续排队逻辑。
@@ -205,6 +209,31 @@ MiniMax H3 模型与核心节点属于其各自的项目和许可证。本仓库
 
 本项目代码以 GPL-3.0-or-later 发布，详见 `LICENSE`。第三方依赖、模型、工作流中引用的输入素材和生成视频不包含在本许可证授权范围内。
 ## 实验工作流说明
+
+### 双采样 latent 学习型放大与分阶段模型
+
+双阶段采样节点新增 `H3 Latent 学习型放大`。它直接在 H3 视频 latent 的空间维运行上游
+[Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)
+的 3D 网络，保持时间轴和音频 latent 不变，避免一采视频的 VAE 解码、像素放大、再编码损失。
+模型文件放在 `ComfyUI/models/latent_upscale_models/`；当前本地示例使用
+`minimax_h3_latent_upscaler_3d_fp32.pth`。普通插值、普通放大模型和 RTX 路径仍保留。
+
+`H3 自动导演｜一采/二采模型加载` 可分别选择两次采样的 Ref2VA 模型，并可分别开启
+H3 混合模型：开启后用对应的 FL2VA 作为画面基础、Ref2VA 作为多模态覆盖；关闭时只加载
+Ref2VA。需要 LoRA 时请在该节点输出后连接标准 ComfyUI `LoraLoaderModelOnly`，再把处理后的
+模型连接到双采样节点对应阶段；节点本身不再加载或管理 LoRA。双采样节点的“一采模型”和
+“二采模型”都是可选输入，二采输入未连接时会自动复用一采模型，因此只使用一套模型时无需
+额外复制模型链。
+新版采样预览是可选开关，依赖当前 ComfyUI 的 `latent_preview` 接口；旧版没有该接口时会自动
+回退为无预览采样，不影响生成。
+
+项目计划的每个图片、视频、音频参考卡片都有“插入时间（秒 + 帧）”。两项均为 `0` 时素材只
+作为普通多模态参考；任一项非零时，插件在新版 ComfyUI 中追加对应时间点的 `MiniMaxH3AddGuide`
+（视频音频按该素材的“传递音频”开关决定）。旧版核心没有 Guide 接口时仍保留普通参考，不会
+把素材静默丢弃。帧位置按 24 fps 计算，秒和帧相加后作为目标帧索引。
+
+该放大模型和按时间插入 Guide 都属于实验性功能。推荐先用两段短视频、关闭二采上下文验证
+边界帧和显存占用，再用于长项目。
 
 新增 `H3 自动导演｜动作迁移项目计划`，用于把一个参考动作视频按设定秒数切成多个 H3 片段。点击节点中的“编辑动作迁移计划”，即可集中上传参考动作视频、主体图片和独立音频，并设置统一提示词、每段秒数、音频接续、重新生成音频片段、上段视频参考、最终音频来源、一次性提示词缓存和自动连续生成。节点会按 24 fps 计算段数，最后一段使用剩余时长；参考视频窗口不足 H3 的 `17k+5` 帧网格时只在参考编码侧重复尾帧，不会修改该段的请求时长。提示词在所有片段复用，重新生成音频和上段视频参考使用 1-based 片段编号，支持中文逗号、英文逗号混用。
 

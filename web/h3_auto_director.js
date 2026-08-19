@@ -4,6 +4,7 @@ const NODE = "H3AutoDirectorPlan";
 const TRANSFER_NODE = "H3AutoDirectorVideoTransferPlan";
 const TRANSFER_LOADER_NODE = "H3AutoDirectorTransferModelLoader";
 const HYBRID_LOADER_NODE = "H3AutoDirectorHybridModelLoader";
+const DUAL_STAGE_LOADER_NODE = "H3AutoDirectorDualStageModelLoader";
 const TTS_NODE = "H3AutoDirectorTTSPlan";
 const SEGMENT_NODE = "H3AutoDirectorSegment";
 const REFERENCE_NODE = "H3AutoDirectorReferenceResolver";
@@ -21,7 +22,7 @@ const H3_RESOLUTION_NODE = "H3AutoDirectorResolution";
 const SAVE_NODE = "H3AutoDirectorSaveSegment";
 const CONTROLLER_NODE = "H3AutoDirectorController";
 const SAMPLING_SWITCH_NODE = "H3AutoDirectorSamplingSwitch";
-const H3_NODE_CLASSES = new Set([NODE, TRANSFER_NODE, TRANSFER_LOADER_NODE, HYBRID_LOADER_NODE, TTS_NODE, SEGMENT_NODE, REFERENCE_NODE, CACHED_REFERENCE_NODE, DUAL_SAMPLING_NODE, AV_DECODE_NODE, CONTEXT_NODE, RESUME_NODE, MOTION_CONTEXT_NODE, MOTION_TRIM_NODE, MOTION_SAVE_LATENT_NODE, MOTION_LOAD_LATENT_NODE, RESOLUTION_NODE, H3_RESOLUTION_NODE, SAVE_NODE, CONTROLLER_NODE, SAMPLING_SWITCH_NODE]);
+const H3_NODE_CLASSES = new Set([NODE, TRANSFER_NODE, TRANSFER_LOADER_NODE, HYBRID_LOADER_NODE, DUAL_STAGE_LOADER_NODE, TTS_NODE, SEGMENT_NODE, REFERENCE_NODE, CACHED_REFERENCE_NODE, DUAL_SAMPLING_NODE, AV_DECODE_NODE, CONTEXT_NODE, RESUME_NODE, MOTION_CONTEXT_NODE, MOTION_TRIM_NODE, MOTION_SAVE_LATENT_NODE, MOTION_LOAD_LATENT_NODE, RESOLUTION_NODE, H3_RESOLUTION_NODE, SAVE_NODE, CONTROLLER_NODE, SAMPLING_SWITCH_NODE]);
 const MAX_REFS = { image: 9, video: 3, audio: 3 };
 const MAX_TOTAL_REFS = 12;
 const DIR_KEY = "h3-auto-director-picker-dirs";
@@ -70,10 +71,12 @@ function normalizeSegment(value) {
     references: Array.isArray(seg.references) ? seg.references.map((ref) => {
       if (typeof ref === "string") return { type: "image", name: ref, path: ref };
       const normalized = { ...ref };
-      // Image references condition the whole generated segment. They do not
-      // have an independent duration; remove legacy values on load/save.
+      // ``duration`` is source-media metadata only. Explicit insert fields
+      // control the H3 timeline guide; 0/0 preserves reference-only behavior.
       if (normalized.type === "image") delete normalized.duration;
       else normalized.duration = Number(ref?.duration) > 0 ? Number(ref.duration) : 1;
+      normalized.insert_seconds = Math.max(0, Number(ref?.insert_seconds) || 0);
+      normalized.insert_frames = Math.max(0, Math.floor(Number(ref?.insert_frames) || 0));
       return normalized;
     }) : [],
   };
@@ -277,9 +280,10 @@ function applyChineseLabels(node) {
     correction_strength: "校色强度", residual_strength: "残余漂移强度",
     cleanup_after_final: "最终完成后清理显存", sampling_mode: "音频采样切换",
     stage1_steps: "第一阶段步数", stage1_denoise: "第一阶段降噪", enable_stage2: "启用第二阶段采样", stage2_use_context: "二采使用上下文接续", stage2_steps: "第二阶段步数", stage2_denoise: "第二阶段降噪",
-    upscale_mode: "视频放大方式", target_width: "第二阶段宽度", target_height: "第二阶段高度", upscale_model: "普通放大模型", seed: "双采样种子",
+    upscale_mode: "视频放大方式", target_width: "第二阶段宽度", target_height: "第二阶段高度", upscale_model: "普通放大模型", latent_upscale_model: "H3 latent 学习型放大模型", latent_upscale_device: "latent 放大设备", latent_upscale_precision: "latent 放大精度", enable_preview: "新版采样预览", seed: "双采样种子",
     shift_video: "视频调度偏移", shift_audio: "音频调度偏移",
     unet_name: nodeClass === HYBRID_LOADER_NODE || nodeClass === TRANSFER_LOADER_NODE ? "多模态参考模型（Ref2VA）" : "扩散模型",
+    stage1_model: "一采多模态参考模型（Ref2VA）", stage2_model: "二采多模态参考模型（Ref2VA）", stage1_enable_hybrid: "一采启用 H3 混合模型", stage1_base_model: "一采画面基础模型（FL2VA）", stage2_enable_hybrid: "二采启用 H3 混合模型", stage2_base_model: "二采画面基础模型（FL2VA）",
     base_model: "画面基础模型（FL2VA）", enable_hybrid: "启用 H3 混合模型", weight_dtype: "权重数据类型",
     reference_video_json: "参考动作视频", reference_assets_json: "附加参考素材",
     segment_seconds: "每段秒数", pass_reference_video_audio: "传递参考视频音频",
@@ -289,7 +293,10 @@ function applyChineseLabels(node) {
     concat_final_audio: "拼接最终长音频", edit_tts: "编辑 TTS 片段",
   };
   const apply = (item) => {
-    const label = labels[item?.name];
+    const stageLabel = nodeClass === DUAL_SAMPLING_NODE
+      ? { stage1_model: "一采模型（可接外部 LoRA/显存优化）", stage2_model: "二采模型（未连接复用一采）" }[item?.name]
+      : null;
+    const label = stageLabel || labels[item?.name];
     if (!label) return;
     item.label = label;
     item.localized_name = label;
@@ -847,7 +854,10 @@ function openEditor(node) {
   const createRefCard = (seg, ref, type, renderRefs) => {
     const promptNumber = referencePromptNumber(seg, ref, type);
     const promptTag = `<${type === "image" ? "Picture" : type === "video" ? "Video" : "Audio"} ${promptNumber}>`;
-    const mediaDetails = () => `提示词标签：${promptTag} | 时长：${formatDuration(ref.duration)}`;
+    const mediaDetails = () => {
+      const position = Number(ref.insert_seconds) || Number(ref.insert_frames) ? ` | 插入：${Number(ref.insert_seconds) || 0} 秒 + ${Number(ref.insert_frames) || 0} 帧` : " | 仅多模态参考";
+      return `提示词标签：${promptTag} | 时长：${formatDuration(ref.duration)}${position}`;
+    };
     const card = document.createElement("div");
     card.style.cssText = `position:relative;display:grid;grid-template-columns:${type === "audio" ? "1fr 30px" : "110px 1fr 30px"};gap:8px;align-items:center;padding:6px;background:#15191d;border:1px solid #424b55;border-radius:5px`;
     const preview = document.createElement("div");
@@ -908,6 +918,10 @@ function openEditor(node) {
     const name = document.createElement("div"); name.textContent = ref.originalName || ref.name || "未命名素材"; name.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap"; info.appendChild(name);
     const meta = document.createElement("div"); meta.textContent = type === "image" ? `提示词标签：${promptTag}` : mediaDetails(); meta.style.cssText = "font-size:11px;color:#aeb7c1"; mediaMeta = meta; info.appendChild(meta);
     const path = document.createElement("input"); path.type = "text"; path.value = ref.path || ""; path.placeholder = "上传后自动填写，也可手动输入 input 下路径"; path.style.cssText = "width:100%;box-sizing:border-box;background:#0d1013;color:#ddd;border:1px solid #424b55;padding:4px"; path.oninput = () => { ref.path = path.value; ref.name = path.value.split("/").pop(); renderRefs(); }; info.appendChild(path);
+    const insert = document.createElement("div"); insert.style.cssText = "display:flex;align-items:center;gap:5px;flex-wrap:wrap;font-size:11px;color:#c7d0da";
+    const insertSeconds = document.createElement("input"); insertSeconds.type = "number"; insertSeconds.min = "0"; insertSeconds.step = "0.01"; insertSeconds.value = Number(ref.insert_seconds) || 0; insertSeconds.style.cssText = "width:72px;background:#0d1013;color:#ddd;border:1px solid #424b55;padding:3px"; insertSeconds.oninput = () => { ref.insert_seconds = Math.max(0, Number(insertSeconds.value) || 0); mediaMeta.textContent = type === "image" ? `提示词标签：${promptTag} | 插入：${ref.insert_seconds} 秒 + ${Number(ref.insert_frames) || 0} 帧` : mediaDetails(); };
+    const insertFrames = document.createElement("input"); insertFrames.type = "number"; insertFrames.min = "0"; insertFrames.step = "1"; insertFrames.value = Math.max(0, Math.floor(Number(ref.insert_frames) || 0)); insertFrames.style.cssText = "width:62px;background:#0d1013;color:#ddd;border:1px solid #424b55;padding:3px"; insertFrames.oninput = () => { ref.insert_frames = Math.max(0, Math.floor(Number(insertFrames.value) || 0)); mediaMeta.textContent = type === "image" ? `提示词标签：${promptTag} | 插入：${Number(ref.insert_seconds) || 0} 秒 + ${ref.insert_frames} 帧` : mediaDetails(); };
+    insert.append("插入时间", insertSeconds, "秒 +", insertFrames, "帧（均为 0 时仅作参考）"); info.appendChild(insert);
     card.appendChild(info);
     card.appendChild(makeButton("×", () => { seg.references.splice(seg.references.indexOf(ref), 1); renderRefs(); }, "删除素材"));
     return card;
@@ -1054,6 +1068,8 @@ function openEditor(node) {
       notice.textContent = `第 ${videoInvalid + 1} 段启用上片段视频参考时，最多只能上传 1 个视频参考素材。`;
       return;
     }
+    const insertInvalid = segments.findIndex((seg) => (seg.references || []).some((ref) => Number(ref.insert_seconds) < 0 || Number(ref.insert_frames) < 0));
+    if (insertInvalid >= 0) { notice.textContent = `第 ${insertInvalid + 1} 段存在无效的素材插入时间。`; return; }
     writeSegments(node, segments); shade.remove();
   }));
   panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade);

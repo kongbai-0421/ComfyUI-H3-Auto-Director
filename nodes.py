@@ -40,9 +40,16 @@ from .sampling_switch import LEGACY_MODE, NATIVE_MODE, apply_h3_sampling
 try:
     from comfy_extras import nodes_minimax_h3 as _minimax_h3
     from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo as _H3ReferenceToVideo
+    from comfy_extras.nodes_minimax_h3 import MiniMaxH3AddGuide as _H3AddGuide
 except ImportError:
     _minimax_h3 = None
     _H3ReferenceToVideo = None
+    _H3AddGuide = None
+
+try:
+    from . import latent_upscaler as _h3_latent_upscaler
+except ImportError:
+    _h3_latent_upscaler = None
 
 
 def _encode_ref_audio(audio_vae, audio):
@@ -104,7 +111,7 @@ ENCODER_DEVICES = ("CPU", "GPU")
 COLOR_CORRECTION_CHOICES = ("关闭", "匹配首段", "匹配上段")
 CONTEXT_DIR_NAME = "context"
 CONTEXT_STAGE1_DIR_NAME = "context_stage1"
-DUAL_UPSCALE_CHOICES = ("普通插值", "普通放大模型", "RTX Video Super Resolution", "自动（RTX→普通模型→插值）")
+DUAL_UPSCALE_CHOICES = ("普通插值", "H3 Latent 学习型放大", "普通放大模型", "RTX Video Super Resolution", "自动（RTX→普通模型→插值）")
 _MOTION_CONTEXT_MARKER = "_h3_auto_director_motion_context"
 _NATIVE_CONTEXT_KEY = "_h3_auto_director_native_context"
 _LAST_STAGE1_CONTEXT = None
@@ -805,7 +812,7 @@ def _has_positive_conditioning(value):
     return any(_is_conditioning_entry(entry) for entry in _conditioning_entries(value))
 
 
-def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, denoise, seed):
+def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, denoise, seed, enable_preview=False):
     """Run one positive-only H3 sampling pass, matching BasicGuider semantics."""
     conditioning = _conditioning_entries(conditioning)
     if not _has_positive_conditioning(conditioning):
@@ -819,8 +826,15 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
         return dict(latent)
     latent_image = latent["samples"]
     noise = comfy.sample.prepare_noise(latent_image, int(seed), latent.get("batch_index"))
+    callback = None
+    if bool(enable_preview):
+        try:
+            import latent_preview
+            callback = latent_preview.prepare_callback(model, int(steps))
+        except Exception as exc:
+            LOG.warning("H3 Auto Director: 新版采样预览初始化失败，继续采样：%s", exc)
     samples = guider.sample(noise, latent_image, sampler, sigmas,
-                            denoise_mask=latent.get("noise_mask"), seed=int(seed))
+                            denoise_mask=latent.get("noise_mask"), callback=callback, seed=int(seed))
     result = dict(latent)
     result["samples"] = samples
     return result
@@ -1548,7 +1562,8 @@ class H3AutoDirectorDualSampling:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "model": ("MODEL",), "conditioning": ("CONDITIONING",), "latent": ("LATENT",),
+            "stage1_model": ("MODEL", {"tooltip": "一采模型。可直接连接模型加载器或外部 LoRA/显存优化链。"}),
+            "conditioning": ("CONDITIONING",), "latent": ("LATENT",),
             "video_vae": ("VAE",), "audio_vae": ("VAE",),
             "sampler_name": (comfy.samplers.SAMPLER_NAMES, {"default": "res_multistep"}),
             "scheduler": (comfy.samplers.SCHEDULER_NAMES, {"default": "simple"}),
@@ -1568,21 +1583,39 @@ class H3AutoDirectorDualSampling:
                                       "label_on": "最终仅使用一采音频",
                                       "label_off": "使用二采音频",
                                       "tooltip": "二采继续细化画面，但最终 AV latent 使用第一阶段生成的音频。"}),
-        }, "optional": {"upscale_model": ("UPSCALE_MODEL",)}}
+            "enable_preview": ("BOOLEAN", {"default": False, "label_on": "开启新版采样预览", "label_off": "关闭新版采样预览"}),
+            "latent_upscale_model": ((_h3_latent_upscaler.available_models() if _h3_latent_upscaler else ["(未加载 H3 latent 放大器)"]), {"default": (_h3_latent_upscaler.available_models()[0] if _h3_latent_upscaler and _h3_latent_upscaler.available_models() else "")}),
+            "latent_upscale_device": (["cuda", "cpu"], {"default": "cuda"}),
+            "latent_upscale_precision": (["fp32", "fp16", "bf16"], {"default": "fp32"}),
+        }, "optional": {
+            "upscale_model": ("UPSCALE_MODEL",),
+            "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
+        }}
 
     RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE")
     RETURN_NAMES = ("最终 AV latent", "第一阶段 AV latent", "放大预览", "第一阶段画面")
     FUNCTION = "sample"
     CATEGORY = "H3 自动导演/采样"
 
-    def sample(self, model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
+    def sample(self, stage1_model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
                stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
                target_width, target_height, enable_stage2=True, stage2_use_context=False,
                upscale_model=None, seed=0, stage2_conditioning=None, stage2_context_latent=None,
-               use_stage1_audio_only=False, **_legacy_unused):
+               use_stage1_audio_only=False, enable_preview=False, latent_upscale_model=None,
+               latent_upscale_device="cuda", latent_upscale_precision="fp32",
+               stage2_model=None, **_legacy_unused):
         global _LAST_STAGE1_CONTEXT
+        if stage1_model is None:
+            stage1_model = _legacy_unused.get("model")
+        if stage1_model is None:
+            raise ValueError("一采模型未连接：请将模型加载器或外部模型补丁链连接到双采样的一采模型输入")
         stage1_conditioning = _prepare_dual_sampling_conditioning(conditioning)
-        first = _dual_sample(model, stage1_conditioning, latent, sampler_name, scheduler, stage1_steps, stage1_denoise, seed)
+        first_model = stage1_model
+        second_model = stage2_model or first_model
+        # Stage models are optional by design.  This keeps ordinary graphs
+        # simple and lets users put the standard ComfyUI LoRA/optimization
+        # nodes exactly where each stage needs them.
+        first = _dual_sample(first_model, stage1_conditioning, latent, sampler_name, scheduler, stage1_steps, stage1_denoise, seed, enable_preview)
         # SaveSegment consumes this immediately after the sampler.  Keeping it
         # here preserves compatibility with existing graphs that do not expose
         # the optional first-stage latent socket.
@@ -1636,7 +1669,15 @@ class H3AutoDirectorDualSampling:
         else:
             expected_frames = _expected_decoded_frames(video_vae, first_video)
             mode = str(upscale_mode)
-            if mode == "RTX Video Super Resolution":
+            if mode == "H3 Latent 学习型放大":
+                if _h3_latent_upscaler is None:
+                    raise RuntimeError("H3 latent 放大器未加载")
+                encoded_video = _h3_latent_upscaler.upscale_video(
+                    first_video, latent_upscale_model,
+                    target_latent_size[0], target_latent_size[1],
+                    latent_upscale_device, latent_upscale_precision)
+                preview = _decode_h3_video(video_vae, encoded_video)
+            elif mode == "RTX Video Super Resolution":
                 preview = _upscale_rtx(decoded, width, height, "高")
             elif mode == "普通放大模型":
                 preview = _upscale_with_model(upscale_model, decoded)
@@ -1654,8 +1695,9 @@ class H3AutoDirectorDualSampling:
             # the second VAE encode; spatial scaling must never change time.
             if expected_frames is not None:
                 preview = _match_video_frame_count(preview, expected_frames)
-            encoded_video = _encode_h3_video(video_vae, preview)
-            encoded_video = _match_latent_time(encoded_video, first_video.shape[2])
+            if mode != "H3 Latent 学习型放大":
+                encoded_video = _encode_h3_video(video_vae, preview)
+                encoded_video = _match_latent_time(encoded_video, first_video.shape[2])
         import comfy.nested_tensor
         # The two branches can be returned on different devices/dtypes by
         # custom VAEs.  Normalize audio before rebuilding H3's AV container.
@@ -1692,7 +1734,7 @@ class H3AutoDirectorDualSampling:
                 "二采正向条件为空：请确认多模态参考节点已输出 positive，"
                 "且不要把空的 stage2_conditioning 节点连接到双采样。"
             )
-        final = _dual_sample(model, final_conditioning, refined, sampler_name, scheduler, stage2_steps, stage2_denoise, int(seed) + 1)
+        final = _dual_sample(second_model, final_conditioning, refined, sampler_name, scheduler, stage2_steps, stage2_denoise, int(seed) + 1, enable_preview)
         if bool(use_stage1_audio_only):
             final_parts = _av_latent_parts(final)
             if final_parts is None:
@@ -1716,8 +1758,9 @@ class H3AutoDirectorDualSamplingModel:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {
-            "model": ("MODEL",), "conditioning": ("CONDITIONING",), "latent": ("LATENT",),
+        base = {"required": {
+            "stage1_model": ("MODEL", {"tooltip": "一采模型。可直接连接模型加载器或外部 LoRA/显存优化链。"}),
+            "conditioning": ("CONDITIONING",), "latent": ("LATENT",),
             "video_vae": ("VAE",), "audio_vae": ("VAE",),
             "sampler_name": (comfy.samplers.SAMPLER_NAMES, {"default": "res_multistep"}),
             "scheduler": (comfy.samplers.SCHEDULER_NAMES, {"default": "simple"}),
@@ -1737,23 +1780,35 @@ class H3AutoDirectorDualSamplingModel:
                                       "label_on": "最终仅使用一采音频",
                                       "label_off": "使用二采音频",
                                       "tooltip": "二采继续细化画面，但最终 AV latent 使用第一阶段生成的音频。"}),
-        }, "optional": {"upscale_model": ("UPSCALE_MODEL",)}}
+            "enable_preview": ("BOOLEAN", {"default": False, "label_on": "开启新版采样预览", "label_off": "关闭新版采样预览"}),
+            "latent_upscale_model": ((_h3_latent_upscaler.available_models() if _h3_latent_upscaler else ["(未加载 H3 latent 放大器)"]), {"default": (_h3_latent_upscaler.available_models()[0] if _h3_latent_upscaler and _h3_latent_upscaler.available_models() else "")}),
+            "latent_upscale_device": (["cuda", "cpu"], {"default": "cuda"}),
+            "latent_upscale_precision": (["fp32", "fp16", "bf16"], {"default": "fp32"}),
+        }, "optional": {
+            "upscale_model": ("UPSCALE_MODEL",),
+            "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
+        }}
+        return base
 
     RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE")
     RETURN_NAMES = ("最终 AV latent", "第一阶段 AV latent", "放大预览", "第一阶段画面")
     FUNCTION = "sample"
     CATEGORY = "H3 自动导演/采样"
 
-    def sample(self, model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
+    def sample(self, stage1_model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
                stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
                target_width, target_height, enable_stage2=True, stage2_use_context=False,
                seed=0, upscale_model=None, stage2_conditioning=None, stage2_context_latent=None,
-               use_stage1_audio_only=False, **_legacy_unused):
+               use_stage1_audio_only=False, enable_preview=False, latent_upscale_model=None,
+               latent_upscale_device="cuda", latent_upscale_precision="fp32",
+               stage2_model=None, **_legacy_unused):
         return H3AutoDirectorDualSampling().sample(
-        model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
+        stage1_model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
             stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
             target_width, target_height, enable_stage2, stage2_use_context, upscale_model, seed,
-            stage2_conditioning, stage2_context_latent, use_stage1_audio_only)
+            stage2_conditioning, stage2_context_latent, use_stage1_audio_only,
+            enable_preview, latent_upscale_model, latent_upscale_device,
+            latent_upscale_precision, stage2_model)
 
 
 def _validate_reference_limits(refs, label="参考素材"):
@@ -1830,7 +1885,21 @@ class H3AutoDirectorPlan:
             # Reference images condition the full clip; H3 has no per-image
             # duration input, so discard this legacy UI field on every save.
             row.pop("image_duration", None)
-            row["references"] = list(row.get("references", []))
+            raw_references = row.get("references", [])
+            if not isinstance(raw_references, list):
+                raise ValueError("每段参考素材必须是 JSON 列表")
+            references = []
+            for reference in raw_references:
+                if not isinstance(reference, dict):
+                    continue
+                reference = dict(reference)
+                try:
+                    reference["insert_seconds"] = max(0.0, float(reference.get("insert_seconds", 0) or 0))
+                    reference["insert_frames"] = max(0, int(reference.get("insert_frames", 0) or 0))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("素材插入时间必须是非负秒数和帧数") from exc
+                references.append(reference)
+            row["references"] = references
             _validate_reference_limits(row["references"], f"第 {len(normalized) + 1} 段参考素材")
             normalized.append(row)
         # The UI keeps this field in sync for compatibility, but the global
@@ -2338,6 +2407,71 @@ class H3AutoDirectorTransferModelLoader:
         return (model, clip, video_vae, audio_vae)
 
 
+class H3AutoDirectorDualStageModelLoader:
+    """Load independent first/second-pass H3 models with optional FL2VA/Ref2VA hybrid weights.
+
+    LoRA deliberately lives outside this node.  Standard ComfyUI model-only
+    LoRA and memory/attention patches can therefore be inserted per stage.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        models = folder_paths.get_filename_list("diffusion_models")
+        return {"required": {
+            "stage1_model": (models, {"default": models[0] if models else "", "tooltip": "一采多模态参考模型（Ref2VA）。"}),
+            "stage1_base_model": (models, {"default": models[0] if models else "", "tooltip": "一采混合时使用的画面基础模型（FL2VA）。"}),
+            "stage1_enable_hybrid": ("BOOLEAN", {"default": False, "label_on": "启用 H3 混合模型", "label_off": "关闭（仅 Ref2VA）"}),
+            "stage2_model": (models, {"default": models[0] if models else "", "tooltip": "二采多模态参考模型（Ref2VA）。"}),
+            "stage2_base_model": (models, {"default": models[0] if models else "", "tooltip": "二采混合时使用的画面基础模型（FL2VA）。"}),
+            "stage2_enable_hybrid": ("BOOLEAN", {"default": False, "label_on": "启用 H3 混合模型", "label_off": "关闭（仅 Ref2VA）"}),
+            "sampling_mode": ([NATIVE_MODE, LEGACY_MODE], {"default": NATIVE_MODE}),
+            "shift_video": ("FLOAT", {"default": 12.0, "min": 0.01, "max": 100.0, "step": 0.01}),
+            "shift_audio": ("FLOAT", {"default": 3.0, "min": 0.01, "max": 100.0, "step": 0.01}),
+            "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"], {"default": "default", "advanced": True}),
+        }}
+
+    RETURN_TYPES = ("MODEL", "MODEL")
+    RETURN_NAMES = ("一采模型", "二采模型")
+    FUNCTION = "load"
+    CATEGORY = "H3 自动导演/模型加载"
+
+    _MODEL_CACHE = {}
+
+    def load(self, stage1_model, stage1_base_model="", stage1_enable_hybrid=False,
+             stage2_model=None, stage2_base_model="", stage2_enable_hybrid=False,
+             sampling_mode=NATIVE_MODE, shift_video=12.0, shift_audio=3.0,
+             weight_dtype="default", **_legacy_unused):
+        if not stage2_model:
+            # A missing second-stage socket is a supported configuration, not
+            # an invalid model name.  Mirror the dual sampler's fallback here
+            # so direct API callers and older workflows behave identically.
+            stage2_model = stage1_model
+            stage2_enable_hybrid = stage1_enable_hybrid
+            stage2_base_model = stage1_base_model
+        def load_one(ref_name, use_hybrid, base_name):
+            key = (str(ref_name), bool(use_hybrid), str(base_name), str(weight_dtype))
+            if key not in self._MODEL_CACHE:
+                if bool(use_hybrid):
+                    base_path = folder_paths.get_full_path_or_raise("diffusion_models", base_name)
+                    overlay_path = folder_paths.get_full_path_or_raise("diffusion_models", ref_name)
+                    LOG.info("[H3AutoDirector] 分阶段加载器启用 H3 混合模型：FL2VA=%s Ref2VA=%s blocks=25..49",
+                             os.path.basename(base_path), os.path.basename(overlay_path))
+                    self._MODEL_CACHE[key] = _load_h3_hybrid_model(base_path, overlay_path, weight_dtype)
+                else:
+                    self._MODEL_CACHE[key] = nodes.UNETLoader().load_unet(ref_name, weight_dtype)[0]
+            return self._MODEL_CACHE[key]
+        same_stage = (stage2_model == stage1_model
+                      and bool(stage2_enable_hybrid) == bool(stage1_enable_hybrid)
+                      and stage2_base_model == stage1_base_model)
+        first = load_one(stage1_model, stage1_enable_hybrid, stage1_base_model)
+        first = apply_h3_sampling(first, sampling_mode, float(shift_video), float(shift_audio))
+        if same_stage:
+            return (first, first)
+        second = load_one(stage2_model, stage2_enable_hybrid, stage2_base_model)
+        second = apply_h3_sampling(second, sampling_mode, float(shift_video), float(shift_audio))
+        return (first, second)
+
+
 class H3AutoDirectorSegment:
     @classmethod
     def INPUT_TYPES(cls):
@@ -2525,6 +2659,77 @@ def _resolve_reference_groups(refs, plan=None):
     )
 
 
+def _reference_insert_frame(ref):
+    """Return a 24-fps guide position; 0/0 intentionally means no guide."""
+    if not isinstance(ref, dict):
+        return None
+    try:
+        seconds = max(0.0, float(ref.get("insert_seconds", 0) or 0))
+        frames = max(0, int(ref.get("insert_frames", 0) or 0))
+    except (TypeError, ValueError):
+        raise ValueError("素材插入时间必须是非负秒数和帧数")
+    if seconds == 0 and frames == 0:
+        return None
+    return max(0, int(round(seconds * FPS)) + frames)
+
+
+def _apply_reference_insert_guides(conditioning, latent, refs, vae, audio_vae):
+    """Add explicitly timed image/video/audio guides on top of Ref2VA refs.
+
+    The ordinary reference path remains unchanged.  This compatibility layer
+    only runs for references carrying a non-zero insert position and only on
+    cores that expose MiniMaxH3AddGuide; old ComfyUI versions still receive
+    the same multimodal reference conditioning without a timed guide.
+    """
+    timed = [(ref, _reference_insert_frame(ref)) for ref in (refs or [])]
+    timed = [(ref, pos) for ref, pos in timed if pos is not None]
+    if not timed:
+        return conditioning
+    if _H3AddGuide is None:
+        LOG.warning("H3 Auto Director: 当前 ComfyUI 没有 MiniMaxH3AddGuide，插入时间仅保留为参考素材")
+        return conditioning
+    output = conditioning
+    parts = _av_latent_parts(latent)
+    total_frames = _h3_pixel_frames(parts[0].shape[2]) if parts is not None else 0
+    for ref, frame_idx in timed:
+        kind = str(ref.get("type", "image")).lower()
+        name = ref.get("path") or ref.get("name")
+        if not name:
+            continue
+        image = audio = None
+        if kind == "image":
+            image = _load_reference_image(name)
+        elif kind == "video":
+            image, soundtrack = _load_reference_video(name)
+            # MiniMaxH3AddGuide requires an entire guide clip to fit after its
+            # anchor. Keep as much of the source window as the generated
+            # timeline permits; a very short remainder deliberately becomes a
+            # one-frame guide instead of failing the complete project.
+            remaining = max(0, total_frames - int(frame_idx))
+            if image is not None and image.shape[0] > remaining:
+                if remaining < 5:
+                    image = image[:1]
+                else:
+                    guide_frames = 5 + 17 * ((remaining - 5) // 17)
+                    image = image[:guide_frames]
+            if ref.get("video_audio_enabled", True) is not False:
+                audio = soundtrack
+        elif kind == "audio":
+            audio = _load_reference_audio(name)
+        else:
+            continue
+        if total_frames and int(frame_idx) >= total_frames:
+            LOG.warning("H3 Auto Director: 素材插入位置 %d 超出本段 %d 帧，已跳过", frame_idx, total_frames)
+            continue
+        result = _H3AddGuide.execute(output, latent, frame_idx, vae=vae,
+                                     audio_vae=audio_vae, image=image, audio=audio)
+        try:
+            output = result[0]
+        except (TypeError, IndexError, KeyError):
+            output = getattr(result, "result", result)
+    return output
+
+
 class H3AutoDirectorReferenceResolver:
     """Resolve the selected per-segment files into typed Ref2VA inputs."""
 
@@ -2638,14 +2843,17 @@ class H3AutoDirectorCachedReferenceToVideo:
             prepared = H3AutoDirectorCachedReferenceToVideo._prepare_references(
                 vae, audio_vae, width, height, length, "manual", refs, plan=plan,
                 ref_short_edge=ref_short_edge)
-            return H3AutoDirectorCachedReferenceToVideo._encode_prepared_prompt(
+            cond = H3AutoDirectorCachedReferenceToVideo._encode_prepared_prompt(
                 clip, prompt, *prepared)
+            cond = _apply_reference_insert_guides(cond, prepared[0], refs, vae, audio_vae)
+            return cond, prepared[0]
         ref_groups = _resolve_reference_groups(refs, plan=plan)
         result = _H3ReferenceToVideo.execute(
             clip, vae, audio_vae, prompt, int(width), int(height), int(length), str(ref_image_size),
             ref_images=ref_groups[0], ref_videos=ref_groups[1],
             ref_video_audios=ref_groups[2], ref_audios=ref_groups[3])
-        return result[0], result[1]
+        cond = _apply_reference_insert_guides(result[0], result[1], refs, vae, audio_vae)
+        return cond, result[1]
 
     @staticmethod
     def _prepare_references(vae, audio_vae, width, height, length, ref_image_size, refs,
@@ -2801,8 +3009,12 @@ class H3AutoDirectorCachedReferenceToVideo:
         for generation_index, prepared_segment in prepared.items():
             seg = _segment(plan, generation_index)
             refs = _cache_segment_references(plan, generation_index)
-            cache[generation_index] = cls._encode_prepared_prompt(
+            encoded = cls._encode_prepared_prompt(
                 clip, _previous_video_prompt(seg.get("prompt", ""), refs), *prepared_segment)
+            cache[generation_index] = (
+                _apply_reference_insert_guides(encoded[0], prepared_segment[0], refs, vae, audio_vae),
+                encoded[1],
+            )
             if disk_enabled:
                 fingerprint, details = fingerprint_by_segment[generation_index]
                 _save_prompt_disk_entry(plan, disk_manifest, generation_index,
@@ -4113,6 +4325,7 @@ NODE_CLASS_MAPPINGS = {
     "H3AutoDirectorVideoTransferPlan": H3AutoDirectorVideoTransferPlan,
     "H3AutoDirectorHybridModelLoader": H3AutoDirectorHybridModelLoader,
     "H3AutoDirectorTransferModelLoader": H3AutoDirectorTransferModelLoader,
+    "H3AutoDirectorDualStageModelLoader": H3AutoDirectorDualStageModelLoader,
     "H3AutoDirectorSegment": H3AutoDirectorSegment,
     "H3AutoDirectorReferenceResolver": H3AutoDirectorReferenceResolver,
     "H3AutoDirectorCachedReferenceToVideo": H3AutoDirectorCachedReferenceToVideo,
@@ -4136,6 +4349,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3AutoDirectorVideoTransferPlan": "H3 自动导演｜动作迁移项目计划",
     "H3AutoDirectorHybridModelLoader": "H3 自动导演｜多模态参考模型加载",
     "H3AutoDirectorTransferModelLoader": "H3 自动导演｜动作迁移模型加载",
+    "H3AutoDirectorDualStageModelLoader": "H3 自动导演｜一采/二采模型加载",
     "H3AutoDirectorSegment": "H3 自动导演｜片段设置",
     "H3AutoDirectorReferenceResolver": "H3 自动导演｜多模态素材解析",
     "H3AutoDirectorCachedReferenceToVideo": "MiniMax H3 多模态参考生成｜提示词缓存",

@@ -41,3 +41,12 @@ Advanced color-drift correction ideas were evaluated against
 [ComfyUI-CustomNodeKit](https://github.com/user2318/ComfyUI-CustomNodeKit). The
 H3 implementation is an independent, conservative adaptation with scene-cut
 protection; the original project and its license remain acknowledged here.
+
+## Comfyui_Minimax_h3_latent_Upscaler
+
+The optional H3 latent upscaling path is informed by
+[Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)
+by LBH-123-AI. This repository contains an independent integration and does
+not redistribute the upstream latent upscaling model. Refer to the upstream
+README for model download links, file names, installation instructions, and
+license terms.
