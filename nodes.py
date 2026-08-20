@@ -1812,7 +1812,7 @@ class H3AutoDirectorDualSampling:
         }, "optional": {
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
-            "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’的 SIGMAS 调度信息；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
+            "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’的采样调度信息；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
             "stage1_sigmas": ("SIGMAS", {"tooltip": "可选。一采使用的完整 Sigmas 调度；连接后优先于一采步数、降噪和调度器。"}),
             "stage2_sigmas": ("SIGMAS", {"tooltip": "可选。二采使用的完整 Sigmas 调度；连接后优先于二采步数、降噪和调度器。"}),
         }}
@@ -2022,7 +2022,7 @@ class H3AutoDirectorDualSamplingModel:
         }, "optional": {
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
-            "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’的 SIGMAS 调度信息；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
+            "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’的采样调度信息；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
             "stage1_sigmas": ("SIGMAS", {"tooltip": "可选。一采使用的完整 Sigmas 调度；连接后优先于一采步数、降噪和调度器。"}),
             "stage2_sigmas": ("SIGMAS", {"tooltip": "可选。二采使用的完整 Sigmas 调度；连接后优先于二采步数、降噪和调度器。"}),
         }}
@@ -4582,11 +4582,7 @@ class H3AutoDirectorTTSController(H3AutoDirectorController):
 
 
 class H3AutoDirectorSamplingSwitch:
-    """Provide the H3 audio-sampling method and video/audio shift values.
-
-    This node deliberately does not create a SIGMAS schedule.  Step count,
-    denoise, and scheduler belong to the dual-sampling node.
-    """
+    """Provide H3 audio-sampling metadata and a step-free SIGMAS base."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -4594,21 +4590,41 @@ class H3AutoDirectorSamplingSwitch:
             "sampling_mode": ([NATIVE_MODE, LEGACY_MODE], {"default": NATIVE_MODE}),
             "shift_video": ("FLOAT", {"default": 12.0, "min": 0.01, "max": 100.0, "step": 0.01}),
             "shift_audio": ("FLOAT", {"default": 3.0, "min": 0.01, "max": 100.0, "step": 0.01}),
+        }, "optional": {
+            "model": ("MODEL", {"tooltip": "可选。连接后，SIGMAS 输出会使用已应用视频/音频偏移的模型端点；未连接时输出安全的默认端点。"}),
         }}
 
-    RETURN_TYPES = ("H3_AUDIO_SAMPLING",)
-    RETURN_NAMES = ("SIGMAS 调度信息",)
+    RETURN_TYPES = ("H3_AUDIO_SAMPLING", "SIGMAS")
+    RETURN_NAMES = ("采样调度信息", "SIGMAS")
     FUNCTION = "apply"
     CATEGORY = "H3 自动导演/音频采样"
 
-    def apply(self, sampling_mode, shift_video, shift_audio, **_legacy_unused):
+    def apply(self, sampling_mode, shift_video, shift_audio, model=None, **_legacy_unused):
         video_shift = float(shift_video)
         audio_shift = float(shift_audio)
-        return ({
+        sampling_info = {
             "sampling_mode": str(sampling_mode),
             "shift_video": video_shift,
             "shift_audio": audio_shift,
-        },)
+        }
+        # This output deliberately contains only the two endpoints.  It is a
+        # valid SIGMAS tensor for ExtendIntermediateSigmas, whose own `steps`
+        # control determines the final number of sampling steps.  Do not call
+        # _h3_sigmas() here: doing so would make this node silently own a step
+        # count and override the user's sampler settings.
+        sigma_max = 1.0
+        if model is not None:
+            try:
+                patched = apply_h3_sampling(model, sampling_info["sampling_mode"], video_shift, audio_shift)
+                model_sampling = patched.get_model_object("model_sampling")
+                sigma_max = float(model_sampling.sigma_max)
+            except Exception as exc:
+                LOG.warning("H3 Auto Director: 无法读取应用音频采样配置后的 sigma_max，SIGMAS 使用默认端点：%s", exc)
+                sigma_max = 1.0
+        if not math.isfinite(sigma_max) or sigma_max <= 0.0:
+            LOG.warning("H3 Auto Director: 模型 sigma_max 无效，SIGMAS 使用默认端点")
+            sigma_max = 1.0
+        return (sampling_info, torch.tensor([sigma_max, 0.0], dtype=torch.float32))
 
 
 class H3AutoDirectorApplyAudioSampling:

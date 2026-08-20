@@ -70,18 +70,22 @@ function cleanDualStageLoaderPorts(node) {
 
 function cleanSamplingSwitchPorts(node) {
   const changed = removeRetiredPorts(node,
-    ["model", "模型", "模型（仅用于计算 Sigmas）", "scheduler", "steps", "denoise", "调度器", "采样步数", "降噪"],
-    ["SIGMAS", "Sigmas", "模型", "MODEL", "视频调度偏移", "音频调度偏移"]);
+    ["scheduler", "steps", "denoise", "调度器", "采样步数", "降噪"],
+    ["模型", "MODEL", "视频调度偏移", "音频调度偏移"]);
   let added = false;
   if (!(node.outputs || []).some((output) => String(output?.type || "") === "H3_AUDIO_SAMPLING")) {
-    node.addOutput?.("SIGMAS 调度信息", "H3_AUDIO_SAMPLING");
+    node.addOutput?.("采样调度信息", "H3_AUDIO_SAMPLING");
+    added = true;
+  }
+  if (!(node.outputs || []).some((output) => String(output?.type || "") === "SIGMAS")) {
+    node.addOutput?.("SIGMAS", "SIGMAS");
     added = true;
   }
   for (const output of node.outputs || []) {
     if (String(output?.type || "") !== "H3_AUDIO_SAMPLING") continue;
-    output.name = "SIGMAS 调度信息";
-    output.label = "SIGMAS 调度信息";
-    output.localized_name = "SIGMAS 调度信息";
+    output.name = "采样调度信息";
+    output.label = "采样调度信息";
+    output.localized_name = "采样调度信息";
   }
   if (added) {
     node.setDirtyCanvas?.(true, true);
@@ -334,7 +338,7 @@ function applyChineseLabels(node) {
     video_format: "视频格式", video_codec: "编码格式", encoder_device: "编码设备", quality: "编码质量", color_correction: "上下文色彩校正",
     scene_cut_protection: "场景切换保护", scene_cut_threshold: "场景切换阈值",
     correction_strength: "校色强度", residual_strength: "残余漂移强度",
-    cleanup_after_final: "最终完成后清理显存", sampling_mode: "音频采样切换", audio_sampling: "SIGMAS 调度信息", scheduler: "调度器", steps: "采样步数", denoise: "降噪",
+    cleanup_after_final: "最终完成后清理显存", sampling_mode: "音频采样切换", audio_sampling: "音频采样方法", scheduler: "调度器", steps: "采样步数", denoise: "降噪",
     stage1_steps: "第一阶段步数", stage1_denoise: "第一阶段降噪", enable_stage2: "启用第二阶段采样", stage2_use_context: "二采使用上下文接续（实验性，不可用）", stage2_steps: "第二阶段步数", stage2_denoise: "第二阶段降噪",
     stage1_sigmas: "一采 Sigmas 调度", stage2_sigmas: "二采 Sigmas 调度",
     upscale_mode: "视频放大方式", target_width: "第二阶段宽度", target_height: "第二阶段高度", upscale_model: "普通放大模型", latent_upscale_model: "H3 latent 学习型放大模型", latent_upscale_device: "latent 放大设备", latent_upscale_precision: "latent 放大精度", enable_preview: "新版采样预览", seed: "双采样种子",
@@ -352,6 +356,8 @@ function applyChineseLabels(node) {
   const apply = (item) => {
     const stageLabel = nodeClass === DUAL_SAMPLING_NODE
       ? { stage1_model: "一采模型（可接外部 LoRA/显存优化）", stage2_model: "二采模型（未连接复用一采）" }[item?.name]
+      : nodeClass === SAMPLING_SWITCH_NODE && item?.name === "model"
+        ? "模型（仅用于原版 SIGMAS）"
       : null;
     const label = stageLabel || labels[item?.name];
     if (!label) return;
@@ -1229,20 +1235,19 @@ app.registerExtension({
     if (nodeData.name === SAMPLING_SWITCH_NODE) {
       const originalConfigure = nodeType.prototype.onConfigure;
       nodeType.prototype.onConfigure = function (info) {
-        // The switch now carries only the H3 mode and video/audio shifts.
-        // Strip the old MODEL/schedule inputs and SIGMAS output so a legacy
-        // serialized link cannot override the dual sampler's stage steps.
+        // The current switch keeps the optional MODEL input for its original
+        // SIGMAS branch, but owns neither scheduler controls nor stage steps.
         const names = Array.isArray(info?.inputs) ? info.inputs.map((input) => input?.name) : [];
         const values = Array.isArray(info?.widgets_values) ? info.widgets_values : null;
-        const retired = new Set(["model", "scheduler", "steps", "denoise"]);
-        const hasLegacyPorts = names.some((name) => retired.has(name))
-          || (Array.isArray(info?.outputs) && info.outputs.some((output) => ["SIGMAS", "MODEL"].includes(output?.type)));
+        const retired = new Set(["scheduler", "steps", "denoise"]);
+        const hasLegacyPorts = names.some((name) => retired.has(name));
         if (values && hasLegacyPorts) {
           info = {
             ...info,
             inputs: (info.inputs || []).filter((input) => !retired.has(input?.name)),
             outputs: [
-              { name: "SIGMAS 调度信息", label: "SIGMAS 调度信息", type: "H3_AUDIO_SAMPLING" },
+              { name: "采样调度信息", label: "采样调度信息", type: "H3_AUDIO_SAMPLING" },
+              { name: "SIGMAS", label: "SIGMAS", type: "SIGMAS" },
             ],
             // MODEL is an input socket, not a widget. Serialized values have
             // always been [sampling_mode, shift_video, shift_audio].
