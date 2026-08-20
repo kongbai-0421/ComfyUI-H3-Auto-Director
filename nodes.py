@@ -815,6 +815,24 @@ def _extend_intermediate_sigmas(sigmas, steps, start_at_sigma, end_at_sigma, spa
     return torch.FloatTensor(extended_sigmas)
 
 
+_AUDIO_SAMPLING_SIGMAS_MARKER = "_h3_auto_director_audio_sampling_base"
+_AUDIO_SAMPLING_SIGMAS_INFO = "_h3_auto_director_audio_sampling_info"
+
+
+def _audio_sampling_from_base_sigmas(value):
+    """Return audio sampling metadata only for this node's raw Sigma output.
+
+    A core Sigma node produces a fresh tensor and intentionally drops this
+    marker. That makes a schedule expanded by the core node an ordinary,
+    user-authored external schedule, while a direct connection keeps the
+    dual-sampler stage controls authoritative.
+    """
+    if not torch.is_tensor(value) or not bool(getattr(value, _AUDIO_SAMPLING_SIGMAS_MARKER, False)):
+        return None
+    info = getattr(value, _AUDIO_SAMPLING_SIGMAS_INFO, None)
+    return dict(info) if isinstance(info, dict) else None
+
+
 def _is_conditioning_entry(value):
     """Return whether *value* is one ComfyUI CONDITIONING entry.
 
@@ -912,7 +930,8 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
     guider = Guider_Basic(model)
     guider.set_conds(conditioning)
     sampler = comfy.samplers.sampler_object(str(sampler_name))
-    if sigmas is None:
+    base_sampling_info = _audio_sampling_from_base_sigmas(sigmas)
+    if sigmas is None or base_sampling_info is not None:
         sigmas = _h3_sigmas(model, scheduler, steps, denoise)
         if bool(extend_sigmas):
             sigmas = _extend_intermediate_sigmas(
@@ -921,6 +940,8 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
             )
             steps = int(sigmas.numel() - 1)
             LOG.info("H3 Auto Director: 使用原版 ExtendIntermediateSigmas 扩展调度（%d 步）", steps)
+        elif base_sampling_info is not None:
+            LOG.info("H3 Auto Director: 音频采样切换基础 SIGMAS 已直接连接，保留阶段调度（%d 步）", steps)
     else:
         if not torch.is_tensor(sigmas):
             try:
@@ -1892,6 +1913,15 @@ class H3AutoDirectorDualSampling:
             stage1_model = _legacy_unused.get("model")
         if stage1_model is None:
             raise ValueError("一采模型未连接：请将模型加载器或外部模型补丁链连接到双采样的一采模型输入")
+        # A direct connection from the audio switch's SIGMAS socket is an
+        # alternative to its metadata socket.  It still applies the embedded
+        # video/audio shifts, but must not replace the stage's full schedule
+        # with the raw two-endpoint base Tensor.
+        if audio_sampling is None:
+            audio_sampling = (
+                _audio_sampling_from_base_sigmas(stage1_sigmas)
+                or _audio_sampling_from_base_sigmas(stage2_sigmas)
+            )
         stage1_conditioning = _prepare_dual_sampling_conditioning(conditioning)
         first_model = _apply_audio_sampling_config(stage1_model, audio_sampling, "一采模型")
         second_source_model = stage2_model or stage1_model
@@ -4702,7 +4732,10 @@ class H3AutoDirectorSamplingSwitch:
         if not math.isfinite(sigma_max) or sigma_max <= 0.0:
             LOG.warning("H3 Auto Director: 模型 sigma_max 无效，SIGMAS 使用默认端点")
             sigma_max = 1.0
-        return (sampling_info, torch.tensor([sigma_max, 0.0], dtype=torch.float32))
+        base_sigmas = torch.tensor([sigma_max, 0.0], dtype=torch.float32)
+        setattr(base_sigmas, _AUDIO_SAMPLING_SIGMAS_MARKER, True)
+        setattr(base_sigmas, _AUDIO_SAMPLING_SIGMAS_INFO, dict(sampling_info))
+        return (sampling_info, base_sigmas)
 
 
 class H3AutoDirectorApplyAudioSampling:
