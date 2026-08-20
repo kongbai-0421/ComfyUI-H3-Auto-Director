@@ -1812,7 +1812,7 @@ class H3AutoDirectorDualSampling:
         }, "optional": {
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
-            "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
+            "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’的 SIGMAS 调度信息；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
             "stage1_sigmas": ("SIGMAS", {"tooltip": "可选。一采使用的完整 Sigmas 调度；连接后优先于一采步数、降噪和调度器。"}),
             "stage2_sigmas": ("SIGMAS", {"tooltip": "可选。二采使用的完整 Sigmas 调度；连接后优先于二采步数、降噪和调度器。"}),
         }}
@@ -2022,7 +2022,7 @@ class H3AutoDirectorDualSamplingModel:
         }, "optional": {
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
-            "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
+            "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’的 SIGMAS 调度信息；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
             "stage1_sigmas": ("SIGMAS", {"tooltip": "可选。一采使用的完整 Sigmas 调度；连接后优先于一采步数、降噪和调度器。"}),
             "stage2_sigmas": ("SIGMAS", {"tooltip": "可选。二采使用的完整 Sigmas 调度；连接后优先于二采步数、降噪和调度器。"}),
         }}
@@ -4596,8 +4596,8 @@ class H3AutoDirectorSamplingSwitch:
             "shift_audio": ("FLOAT", {"default": 3.0, "min": 0.01, "max": 100.0, "step": 0.01}),
         }}
 
-    RETURN_TYPES = ("H3_AUDIO_SAMPLING", "FLOAT", "FLOAT")
-    RETURN_NAMES = ("音频采样配置", "视频调度偏移", "音频调度偏移")
+    RETURN_TYPES = ("H3_AUDIO_SAMPLING",)
+    RETURN_NAMES = ("SIGMAS 调度信息",)
     FUNCTION = "apply"
     CATEGORY = "H3 自动导演/音频采样"
 
@@ -4608,7 +4608,7 @@ class H3AutoDirectorSamplingSwitch:
             "sampling_mode": str(sampling_mode),
             "shift_video": video_shift,
             "shift_audio": audio_shift,
-        }, video_shift, audio_shift)
+        },)
 
 
 class H3AutoDirectorApplyAudioSampling:
