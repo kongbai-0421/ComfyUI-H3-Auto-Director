@@ -869,8 +869,7 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
     if not _has_positive_conditioning(conditioning):
         raise ValueError("双采样需要有效的正向条件")
     from comfy_extras.nodes_custom_sampler import Guider_Basic
-    # The public sampling-switch node returns SIGMAS by design. Install the
-    # H3 layout refresh internally so cached conditioning cannot retain a
+    # Always install the layout refresh so cached conditioning cannot retain a
     # previous segment's audio row count (for example 470 vs 396).
     model = ensure_h3_layout_refresh(model)
     guider = Guider_Basic(model)
@@ -904,11 +903,10 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
         samples = guider.sample(noise, latent_image, sampler, sigmas,
                                 denoise_mask=latent.get("noise_mask"), callback=callback, seed=int(seed))
     except RuntimeError as exc:
-        # This is primarily for workflows where the sampling-switch node is
-        # used only for SIGMAS (its MODEL output was intentionally removed),
-        # so the native layout-refresh wrapper is not present on the model.
-        # Retry once with the private Auto Director audio guide removed; this
-        # preserves video continuation and all user audio references.
+        # Retry once with the private Auto Director audio guide removed. This
+        # preserves video continuation and all user audio references when a
+        # legacy graph or an incompatible core still reports a packed-layout
+        # audio-row mismatch.
         message = str(exc)
         if not ("expanded size" in message and "5376" in message):
             raise
@@ -927,6 +925,27 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
     result = dict(latent)
     result["samples"] = samples
     return result
+
+
+def _apply_audio_sampling_config(model, audio_sampling, stage_label):
+    """Apply the optional audio-sampling configuration without owning SIGMAS.
+
+    The dual sampler remains the sole owner of scheduler, step count and
+    denoise.  Keeping this separate prevents a fixed schedule from silently
+    overriding the stage controls in a workflow.
+    """
+    if audio_sampling is None:
+        return model
+    if not isinstance(audio_sampling, dict):
+        raise ValueError("音频采样配置必须来自‘H3 自动导演｜音频采样切换’节点")
+    try:
+        sampling_mode = audio_sampling["sampling_mode"]
+        shift_video = float(audio_sampling["shift_video"])
+        shift_audio = float(audio_sampling["shift_audio"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("音频采样配置不完整：需要采样方法、视频偏移和音频偏移") from exc
+    LOG.info("H3 Auto Director: 对%s应用音频采样配置", stage_label)
+    return apply_h3_sampling(model, sampling_mode, shift_video, shift_audio)
 
 
 def _mark_motion_context(conditioning):
@@ -1793,6 +1812,7 @@ class H3AutoDirectorDualSampling:
         }, "optional": {
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
+            "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
             "stage1_sigmas": ("SIGMAS", {"tooltip": "可选。一采使用的完整 Sigmas 调度；连接后优先于一采步数、降噪和调度器。"}),
             "stage2_sigmas": ("SIGMAS", {"tooltip": "可选。二采使用的完整 Sigmas 调度；连接后优先于二采步数、降噪和调度器。"}),
         }}
@@ -1808,15 +1828,16 @@ class H3AutoDirectorDualSampling:
                upscale_model=None, seed=0, stage2_conditioning=None, stage2_context_latent=None,
                use_stage1_audio_only=False, enable_preview=False, latent_upscale_model=None,
                latent_upscale_device="cuda", latent_upscale_precision="fp32",
-               stage2_model=None, stage1_sigmas=None, stage2_sigmas=None, **_legacy_unused):
+               stage2_model=None, audio_sampling=None, stage1_sigmas=None, stage2_sigmas=None, **_legacy_unused):
         global _LAST_STAGE1_CONTEXT
         if stage1_model is None:
             stage1_model = _legacy_unused.get("model")
         if stage1_model is None:
             raise ValueError("一采模型未连接：请将模型加载器或外部模型补丁链连接到双采样的一采模型输入")
         stage1_conditioning = _prepare_dual_sampling_conditioning(conditioning)
-        first_model = stage1_model
-        second_model = stage2_model or first_model
+        first_model = _apply_audio_sampling_config(stage1_model, audio_sampling, "一采模型")
+        second_source_model = stage2_model or stage1_model
+        second_model = _apply_audio_sampling_config(second_source_model, audio_sampling, "二采模型")
         # Stage models are optional by design.  This keeps ordinary graphs
         # simple and lets users put the standard ComfyUI LoRA/optimization
         # nodes exactly where each stage needs them.
@@ -2001,6 +2022,7 @@ class H3AutoDirectorDualSamplingModel:
         }, "optional": {
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
+            "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
             "stage1_sigmas": ("SIGMAS", {"tooltip": "可选。一采使用的完整 Sigmas 调度；连接后优先于一采步数、降噪和调度器。"}),
             "stage2_sigmas": ("SIGMAS", {"tooltip": "可选。二采使用的完整 Sigmas 调度；连接后优先于二采步数、降噪和调度器。"}),
         }}
@@ -2017,14 +2039,14 @@ class H3AutoDirectorDualSamplingModel:
                seed=0, upscale_model=None, stage2_conditioning=None, stage2_context_latent=None,
                use_stage1_audio_only=False, enable_preview=False, latent_upscale_model=None,
                latent_upscale_device="cuda", latent_upscale_precision="fp32",
-               stage2_model=None, stage1_sigmas=None, stage2_sigmas=None, **_legacy_unused):
+               stage2_model=None, audio_sampling=None, stage1_sigmas=None, stage2_sigmas=None, **_legacy_unused):
         return H3AutoDirectorDualSampling().sample(
         stage1_model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
             stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
             target_width, target_height, enable_stage2, stage2_use_context, upscale_model, seed,
             stage2_conditioning, stage2_context_latent, use_stage1_audio_only,
             enable_preview, latent_upscale_model, latent_upscale_device,
-            latent_upscale_precision, stage2_model, stage1_sigmas, stage2_sigmas)
+            latent_upscale_precision, stage2_model, audio_sampling, stage1_sigmas, stage2_sigmas)
 
 
 def _validate_reference_limits(refs, label="参考素材"):
@@ -4560,32 +4582,52 @@ class H3AutoDirectorTTSController(H3AutoDirectorController):
 
 
 class H3AutoDirectorSamplingSwitch:
-    """Select H3 audio sampling and expose a matching SIGMAS schedule.
+    """Provide the H3 audio-sampling method and video/audio shift values.
 
-    Scheduler, step count and denoise are intentionally fixed here.  The
-    switch is only responsible for selecting the H3 audio-sampling
-    implementation and its video/audio shifts; exposing a second set of
-    schedule controls caused it to fight the main dual-sampling node.
+    This node deliberately does not create a SIGMAS schedule.  Step count,
+    denoise, and scheduler belong to the dual-sampling node.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "model": ("MODEL",),
             "sampling_mode": ([NATIVE_MODE, LEGACY_MODE], {"default": NATIVE_MODE}),
             "shift_video": ("FLOAT", {"default": 12.0, "min": 0.01, "max": 100.0, "step": 0.01}),
             "shift_audio": ("FLOAT", {"default": 3.0, "min": 0.01, "max": 100.0, "step": 0.01}),
         }}
 
-    RETURN_TYPES = ("SIGMAS",)
-    RETURN_NAMES = ("SIGMAS",)
+    RETURN_TYPES = ("H3_AUDIO_SAMPLING", "FLOAT", "FLOAT")
+    RETURN_NAMES = ("音频采样配置", "视频调度偏移", "音频调度偏移")
     FUNCTION = "apply"
     CATEGORY = "H3 自动导演/音频采样"
 
-    def apply(self, model, sampling_mode, shift_video, shift_audio, **_legacy_unused):
-        patched = apply_h3_sampling(model, sampling_mode, float(shift_video), float(shift_audio))
-        sigmas = _h3_sigmas(patched, "simple", 8, 1.0)
-        return (sigmas,)
+    def apply(self, sampling_mode, shift_video, shift_audio, **_legacy_unused):
+        video_shift = float(shift_video)
+        audio_shift = float(shift_audio)
+        return ({
+            "sampling_mode": str(sampling_mode),
+            "shift_video": video_shift,
+            "shift_audio": audio_shift,
+        }, video_shift, audio_shift)
+
+
+class H3AutoDirectorApplyAudioSampling:
+    """Apply an audio-sampling configuration to a model for standard samplers."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "audio_sampling": ("H3_AUDIO_SAMPLING",),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("模型",)
+    FUNCTION = "apply"
+    CATEGORY = "H3 自动导演/音频采样"
+
+    def apply(self, model, audio_sampling):
+        return (_apply_audio_sampling_config(model, audio_sampling, "模型"),)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -4611,6 +4653,7 @@ NODE_CLASS_MAPPINGS = {
     "H3AutoDirectorController": H3AutoDirectorController,
     "H3AutoDirectorTTSController": H3AutoDirectorTTSController,
     "H3AutoDirectorSamplingSwitch": H3AutoDirectorSamplingSwitch,
+    "H3AutoDirectorApplyAudioSampling": H3AutoDirectorApplyAudioSampling,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3AutoDirectorPlan": "H3 自动导演｜项目计划",
@@ -4635,4 +4678,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3AutoDirectorController": "H3 自动导演｜拼接最终视频",
     "H3AutoDirectorTTSController": "H3 TTS｜拼接最终音频",
     "H3AutoDirectorSamplingSwitch": "H3 自动导演｜音频采样切换",
+    "H3AutoDirectorApplyAudioSampling": "H3 自动导演｜应用音频采样配置",
 }
