@@ -341,6 +341,8 @@ function applyChineseLabels(node) {
     cleanup_after_final: "最终完成后清理显存", sampling_mode: "音频采样切换", audio_sampling: "音频采样方法", scheduler: "调度器", steps: "采样步数", denoise: "降噪",
     stage1_steps: "第一阶段步数", stage1_denoise: "第一阶段降噪", enable_stage2: "启用第二阶段采样", stage2_use_context: "二采使用上下文接续（实验性，不可用）", stage2_steps: "第二阶段步数", stage2_denoise: "第二阶段降噪",
     stage1_sigmas: "一采 Sigmas 调度", stage2_sigmas: "二采 Sigmas 调度",
+    stage1_extend_sigmas: "一采插值扩展 Sigmas", stage1_extend_steps: "一采插值步数", stage1_start_at_sigma: "一采起始 Sigma", stage1_end_at_sigma: "一采结束 Sigma", stage1_spacing: "一采间距方式",
+    stage2_extend_sigmas: "二采插值扩展 Sigmas", stage2_extend_steps: "二采插值步数", stage2_start_at_sigma: "二采起始 Sigma", stage2_end_at_sigma: "二采结束 Sigma", stage2_spacing: "二采间距方式",
     upscale_mode: "视频放大方式", target_width: "第二阶段宽度", target_height: "第二阶段高度", upscale_model: "普通放大模型", latent_upscale_model: "H3 latent 学习型放大模型", latent_upscale_device: "latent 放大设备", latent_upscale_precision: "latent 放大精度", enable_preview: "新版采样预览", seed: "双采样种子",
     shift_video: "视频调度偏移", shift_audio: "音频调度偏移",
     unet_name: nodeClass === HYBRID_LOADER_NODE || nodeClass === TRANSFER_LOADER_NODE ? "多模态参考模型（Ref2VA）" : "扩散模型",

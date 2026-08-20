@@ -780,6 +780,41 @@ def _h3_sigmas(model, scheduler, steps, denoise):
     return sigmas[-(steps + 1):]
 
 
+def _extend_intermediate_sigmas(sigmas, steps, start_at_sigma, end_at_sigma, spacing):
+    """Run ComfyUI's ExtendIntermediateSigmas algorithm unchanged.
+
+    This intentionally mirrors ``comfy_extras.nodes_custom_sampler``.  The
+    dual sampler only supplies the stage's already-generated base schedule;
+    all four controls retain the core node's exact meaning and output shape.
+    """
+    if start_at_sigma < 0:
+        start_at_sigma = float("inf")
+
+    interpolator = {
+        "linear": lambda x: x,
+        "cosine": lambda x: torch.sin(x * math.pi / 2),
+        "sine": lambda x: 1 - torch.cos(x * math.pi / 2),
+    }[spacing]
+
+    x = torch.linspace(0, 1, steps + 1, device=sigmas.device)[1:-1]
+    computed_spacing = interpolator(x)
+
+    extended_sigmas = []
+    for i in range(len(sigmas) - 1):
+        sigma_current = sigmas[i]
+        sigma_next = sigmas[i + 1]
+        extended_sigmas.append(sigma_current)
+
+        if end_at_sigma <= sigma_current <= start_at_sigma:
+            interpolated_steps = computed_spacing * (sigma_next - sigma_current) + sigma_current
+            extended_sigmas.extend(interpolated_steps.tolist())
+
+    if len(sigmas) > 0:
+        extended_sigmas.append(sigmas[-1])
+
+    return torch.FloatTensor(extended_sigmas)
+
+
 def _is_conditioning_entry(value):
     """Return whether *value* is one ComfyUI CONDITIONING entry.
 
@@ -863,7 +898,9 @@ def _without_auto_director_audio_context(conditioning):
 
 
 def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, denoise, seed,
-                 enable_preview=False, sigmas=None):
+                 enable_preview=False, sigmas=None, extend_sigmas=False,
+                 extend_steps=2, extend_start_at_sigma=-1.0,
+                 extend_end_at_sigma=12.0, extend_spacing="linear"):
     """Run one positive-only H3 sampling pass, matching BasicGuider semantics."""
     conditioning = _conditioning_entries(conditioning)
     if not _has_positive_conditioning(conditioning):
@@ -877,6 +914,13 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
     sampler = comfy.samplers.sampler_object(str(sampler_name))
     if sigmas is None:
         sigmas = _h3_sigmas(model, scheduler, steps, denoise)
+        if bool(extend_sigmas):
+            sigmas = _extend_intermediate_sigmas(
+                sigmas, int(extend_steps), float(extend_start_at_sigma),
+                float(extend_end_at_sigma), str(extend_spacing)
+            )
+            steps = int(sigmas.numel() - 1)
+            LOG.info("H3 Auto Director: 使用原版 ExtendIntermediateSigmas 扩展调度（%d 步）", steps)
     else:
         if not torch.is_tensor(sigmas):
             try:
@@ -1809,6 +1853,16 @@ class H3AutoDirectorDualSampling:
             "latent_upscale_model": ((_h3_latent_upscaler.available_models() if _h3_latent_upscaler else ["(未加载 H3 latent 放大器)"]), {"default": (_h3_latent_upscaler.available_models()[0] if _h3_latent_upscaler and _h3_latent_upscaler.available_models() else "")}),
             "latent_upscale_device": (["cuda", "cpu"], {"default": "cuda"}),
             "latent_upscale_precision": (["fp32", "fp16", "bf16"], {"default": "fp32"}),
+            "stage1_extend_sigmas": ("BOOLEAN", {"default": False, "label_on": "开启一采 Sigmas 扩展", "label_off": "关闭一采 Sigmas 扩展", "tooltip": "开启后按 ComfyUI ExtendIntermediateSigmas 原版算法扩展一采调度。"}),
+            "stage1_extend_steps": ("INT", {"default": 2, "min": 1, "max": 100}),
+            "stage1_start_at_sigma": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 20000.0, "step": 0.01, "round": False}),
+            "stage1_end_at_sigma": ("FLOAT", {"default": 12.0, "min": 0.0, "max": 20000.0, "step": 0.01, "round": False}),
+            "stage1_spacing": (["linear", "cosine", "sine"], {"default": "linear"}),
+            "stage2_extend_sigmas": ("BOOLEAN", {"default": False, "label_on": "开启二采 Sigmas 扩展", "label_off": "关闭二采 Sigmas 扩展", "tooltip": "开启后按 ComfyUI ExtendIntermediateSigmas 原版算法扩展二采调度。"}),
+            "stage2_extend_steps": ("INT", {"default": 2, "min": 1, "max": 100}),
+            "stage2_start_at_sigma": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 20000.0, "step": 0.01, "round": False}),
+            "stage2_end_at_sigma": ("FLOAT", {"default": 12.0, "min": 0.0, "max": 20000.0, "step": 0.01, "round": False}),
+            "stage2_spacing": (["linear", "cosine", "sine"], {"default": "linear"}),
         }, "optional": {
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
@@ -1828,7 +1882,11 @@ class H3AutoDirectorDualSampling:
                upscale_model=None, seed=0, stage2_conditioning=None, stage2_context_latent=None,
                use_stage1_audio_only=False, enable_preview=False, latent_upscale_model=None,
                latent_upscale_device="cuda", latent_upscale_precision="fp32",
-               stage2_model=None, audio_sampling=None, stage1_sigmas=None, stage2_sigmas=None, **_legacy_unused):
+               stage2_model=None, audio_sampling=None, stage1_sigmas=None, stage2_sigmas=None,
+               stage1_extend_sigmas=False, stage1_extend_steps=2, stage1_start_at_sigma=-1.0,
+               stage1_end_at_sigma=12.0, stage1_spacing="linear", stage2_extend_sigmas=False,
+               stage2_extend_steps=2, stage2_start_at_sigma=-1.0, stage2_end_at_sigma=12.0,
+               stage2_spacing="linear", **_legacy_unused):
         global _LAST_STAGE1_CONTEXT
         if stage1_model is None:
             stage1_model = _legacy_unused.get("model")
@@ -1842,7 +1900,9 @@ class H3AutoDirectorDualSampling:
         # simple and lets users put the standard ComfyUI LoRA/optimization
         # nodes exactly where each stage needs them.
         first = _dual_sample(first_model, stage1_conditioning, latent, sampler_name, scheduler,
-                             stage1_steps, stage1_denoise, seed, enable_preview, stage1_sigmas)
+                             stage1_steps, stage1_denoise, seed, enable_preview, stage1_sigmas,
+                             stage1_extend_sigmas, stage1_extend_steps, stage1_start_at_sigma,
+                             stage1_end_at_sigma, stage1_spacing)
         # SaveSegment consumes this immediately after the sampler.  Keeping it
         # here preserves compatibility with existing graphs that do not expose
         # the optional first-stage latent socket.
@@ -1969,7 +2029,8 @@ class H3AutoDirectorDualSampling:
             LOG.info("H3 Auto Director: 二采 Sigmas 未连接，复用一采 Sigmas")
         final = _dual_sample(second_model, final_conditioning, refined, sampler_name, scheduler,
                              stage2_steps, stage2_denoise, int(seed) + 1, enable_preview,
-                             effective_stage2_sigmas)
+                             effective_stage2_sigmas, stage2_extend_sigmas, stage2_extend_steps,
+                             stage2_start_at_sigma, stage2_end_at_sigma, stage2_spacing)
         if bool(use_stage1_audio_only):
             final_parts = _av_latent_parts(final)
             if final_parts is None:
@@ -2019,6 +2080,16 @@ class H3AutoDirectorDualSamplingModel:
             "latent_upscale_model": ((_h3_latent_upscaler.available_models() if _h3_latent_upscaler else ["(未加载 H3 latent 放大器)"]), {"default": (_h3_latent_upscaler.available_models()[0] if _h3_latent_upscaler and _h3_latent_upscaler.available_models() else "")}),
             "latent_upscale_device": (["cuda", "cpu"], {"default": "cuda"}),
             "latent_upscale_precision": (["fp32", "fp16", "bf16"], {"default": "fp32"}),
+            "stage1_extend_sigmas": ("BOOLEAN", {"default": False, "label_on": "开启一采 Sigmas 扩展", "label_off": "关闭一采 Sigmas 扩展", "tooltip": "开启后按 ComfyUI ExtendIntermediateSigmas 原版算法扩展一采调度。"}),
+            "stage1_extend_steps": ("INT", {"default": 2, "min": 1, "max": 100}),
+            "stage1_start_at_sigma": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 20000.0, "step": 0.01, "round": False}),
+            "stage1_end_at_sigma": ("FLOAT", {"default": 12.0, "min": 0.0, "max": 20000.0, "step": 0.01, "round": False}),
+            "stage1_spacing": (["linear", "cosine", "sine"], {"default": "linear"}),
+            "stage2_extend_sigmas": ("BOOLEAN", {"default": False, "label_on": "开启二采 Sigmas 扩展", "label_off": "关闭二采 Sigmas 扩展", "tooltip": "开启后按 ComfyUI ExtendIntermediateSigmas 原版算法扩展二采调度。"}),
+            "stage2_extend_steps": ("INT", {"default": 2, "min": 1, "max": 100}),
+            "stage2_start_at_sigma": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 20000.0, "step": 0.01, "round": False}),
+            "stage2_end_at_sigma": ("FLOAT", {"default": 12.0, "min": 0.0, "max": 20000.0, "step": 0.01, "round": False}),
+            "stage2_spacing": (["linear", "cosine", "sine"], {"default": "linear"}),
         }, "optional": {
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
@@ -2039,14 +2110,21 @@ class H3AutoDirectorDualSamplingModel:
                seed=0, upscale_model=None, stage2_conditioning=None, stage2_context_latent=None,
                use_stage1_audio_only=False, enable_preview=False, latent_upscale_model=None,
                latent_upscale_device="cuda", latent_upscale_precision="fp32",
-               stage2_model=None, audio_sampling=None, stage1_sigmas=None, stage2_sigmas=None, **_legacy_unused):
+               stage2_model=None, audio_sampling=None, stage1_sigmas=None, stage2_sigmas=None,
+               stage1_extend_sigmas=False, stage1_extend_steps=2, stage1_start_at_sigma=-1.0,
+               stage1_end_at_sigma=12.0, stage1_spacing="linear", stage2_extend_sigmas=False,
+               stage2_extend_steps=2, stage2_start_at_sigma=-1.0, stage2_end_at_sigma=12.0,
+               stage2_spacing="linear", **_legacy_unused):
         return H3AutoDirectorDualSampling().sample(
         stage1_model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
             stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
             target_width, target_height, enable_stage2, stage2_use_context, upscale_model, seed,
             stage2_conditioning, stage2_context_latent, use_stage1_audio_only,
             enable_preview, latent_upscale_model, latent_upscale_device,
-            latent_upscale_precision, stage2_model, audio_sampling, stage1_sigmas, stage2_sigmas)
+            latent_upscale_precision, stage2_model, audio_sampling, stage1_sigmas, stage2_sigmas,
+            stage1_extend_sigmas, stage1_extend_steps, stage1_start_at_sigma, stage1_end_at_sigma,
+            stage1_spacing, stage2_extend_sigmas, stage2_extend_steps, stage2_start_at_sigma,
+            stage2_end_at_sigma, stage2_spacing)
 
 
 def _validate_reference_limits(refs, label="参考素材"):
