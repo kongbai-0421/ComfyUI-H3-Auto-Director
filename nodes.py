@@ -2197,6 +2197,8 @@ class H3AutoDirectorPlan:
             "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": False, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
         }, "optional": {
             "global_assets_json": ("STRING", {"default": "[]", "multiline": True}),
+            "auto_context_crop_frames": ("INT", {"default": 0, "min": 0, "max": 4096,
+                "tooltip": "自动裁剪上下文时使用的帧数；0 表示按上下文长度自动计算；大于 0 时自动启用裁剪。"}),
         }, "hidden": {"project_dir": "STRING"}}
 
     RETURN_TYPES = ("H3_AUTO_PLAN",)
@@ -2204,7 +2206,7 @@ class H3AutoDirectorPlan:
     FUNCTION = "create"
     CATEGORY = "H3 自动导演"
 
-    def create(self, project_id, segments_json, duration, global_reference_set, auto_run, continuation_mode=True, cache_prompt_embeddings=False, output_root="h3_projects", cache_prompt_embeddings_to_disk=False, global_assets_json="[]", project_dir="", **_legacy_inputs):
+    def create(self, project_id, segments_json, duration, global_reference_set, auto_run, continuation_mode=True, cache_prompt_embeddings=False, output_root="h3_projects", cache_prompt_embeddings_to_disk=False, global_assets_json="[]", auto_context_crop_frames=0, project_dir="", **_legacy_inputs):
         try:
             segments = json.loads(segments_json)
             assets = json.loads(global_assets_json or "[]")
@@ -2214,6 +2216,10 @@ class H3AutoDirectorPlan:
             raise ValueError("At least one H3 segment is required")
         if not isinstance(assets, list):
             raise ValueError("global_assets_json must be a JSON list")
+        try:
+            auto_context_crop_frames = max(0, min(4096, int(auto_context_crop_frames or 0)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("自动裁剪上下文帧数必须是 0 到 4096 的整数") from exc
         normalized = []
         for item in segments:
             if not isinstance(item, dict):
@@ -2279,6 +2285,7 @@ class H3AutoDirectorPlan:
                 "auto_run": bool(auto_run), "continuation_mode": bool(continuation_mode),
                 "cache_prompt_embeddings": bool(cache_prompt_embeddings),
                 "cache_prompt_embeddings_to_disk": bool(cache_prompt_embeddings_to_disk),
+                "auto_context_crop_frames": int(auto_context_crop_frames),
                 "global_assets": assets, "segments": normalized,
                 "project_dir": str(project_dir)}
         if legacy_project_dir is not None:
@@ -2884,15 +2891,70 @@ def _load_reference_image(name):
 
 def _load_reference_video(name):
     clean = _reference_name(name)
+    video_path = (_input_root() / clean).resolve()
     loader = nodes.NODE_CLASS_MAPPINGS.get("VHS_LoadVideoPath")
     if loader is None:
         loader = nodes.NODE_CLASS_MAPPINGS.get("VHS_LoadVideo")
     if loader is None:
         raise RuntimeError("需要安装 VideoHelperSuite 才能加载视频参考素材")
-    result = loader().load_video(video=str((_input_root() / clean).resolve()), force_rate=24,
+    result = loader().load_video(video=str(video_path), force_rate=24,
                                  custom_width=0, custom_height=0, frame_load_cap=0,
                                  skip_first_frames=0, select_every_nth=1)
-    return result[0], result[2]
+    soundtrack = result[2]
+    # VHS exposes audio as a lazy mapping.  A silent video therefore looks
+    # valid until the mapping is touched, at which point ffmpeg raises
+    # "Output file does not contain any stream".  Inspect the container before
+    # retaining that lazy object and pass a real None soundtrack for silent
+    # references.  This keeps video-only conditioning usable.
+    has_audio = _reference_video_has_audio(video_path)
+    if has_audio is False:
+        soundtrack = None
+    elif has_audio is True and soundtrack is not None:
+        try:
+            # Force VHS's lazy map once so a malformed audio stream is handled
+            # here instead of aborting the later H3 conditioning step.
+            soundtrack["waveform"]
+        except Exception as exc:
+            LOG.warning("H3 Auto Director: 参考视频音轨无法读取，已仅传递画面：%s", exc)
+            soundtrack = None
+    return result[0], soundtrack
+
+
+def _reference_video_has_audio(path):
+    """Return True/False when the container stream layout is readable."""
+    if av is not None:
+        container = None
+        try:
+            container = av.open(str(path))
+            return bool(container.streams.audio)
+        except Exception:
+            pass
+        finally:
+            if container is not None:
+                try:
+                    container.close()
+                except Exception:
+                    pass
+    # PyAV is optional in some ComfyUI environments.  ffmpeg itself is
+    # sufficient for the stream-layout check and, unlike VHS's lazy audio
+    # mapping, does not fail when a file simply has no audio stream.
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg:
+        try:
+            result = subprocess.run(
+                [ffmpeg, "-hide_banner", "-i", str(path)],
+                capture_output=True, text=True, timeout=20,
+            )
+            details = (result.stdout or "") + "\n" + (result.stderr or "")
+            if re.search(r"Stream #\d+:\d+[^\n]*Audio:", details, re.IGNORECASE):
+                return True
+            if re.search(r"Stream #\d+:\d+[^\n]*Video:", details, re.IGNORECASE):
+                return False
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # A probe failure is deliberately unknown rather than silent.  In that
+    # case VHS may still provide a valid lazy soundtrack for the caller.
+    return None
 
 
 def _load_transfer_video_segment(ref):
@@ -2930,10 +2992,19 @@ def _load_transfer_video_audio(ref):
     clean = _reference_name(ref.get("path") or ref.get("name"))
     start_seconds = max(0.0, float(ref.get("start_frame", 0)) / FPS)
     duration_seconds = max(0.1, float(ref.get("source_frames", 5)) / FPS)
-    result = loader().load_audio(
-        audio_file=str((_input_root() / clean).resolve()), seek_seconds=start_seconds,
-        duration=duration_seconds)
-    return result[0]
+    video_path = (_input_root() / clean).resolve()
+    if _reference_video_has_audio(video_path) is False:
+        return None
+    try:
+        result = loader().load_audio(
+            audio_file=str(video_path), seek_seconds=start_seconds,
+            duration=duration_seconds)
+        return result[0]
+    except Exception as exc:
+        # Reference video audio is optional.  A missing/corrupt audio stream
+        # must not prevent the video frames from reaching H3.
+        LOG.warning("H3 Auto Director: 参考视频没有可用音轨，已仅传递画面：%s", exc)
+        return None
 
 
 def _load_reference_audio(name):
@@ -4305,6 +4376,9 @@ def _default_context_trim_frames(plan, segment_index):
     segment = _segment(plan, index)
     if _use_previous_video_reference(plan, index) or not bool(segment.get("continue_video", True)):
         return 0
+    configured = max(0, int(plan.get("auto_context_crop_frames", 0) or 0))
+    if configured > 0:
+        return configured
     run = _h3_context_run(plan.get("_runtime_context_length", FRAME_CONTEXT_DEFAULT))
     return run
 
@@ -4362,17 +4436,23 @@ class H3AutoDirectorSaveSegment:
         global _LAST_MOTION_CONTEXT_TRIM
         requested_trim = int(trim_frames or 0)
         motion_trim = _LAST_MOTION_CONTEXT_TRIM
-        if requested_trim <= 0 and motion_trim is not None:
+        configured_trim = max(0, int(plan.get("auto_context_crop_frames", 0) or 0))
+        automatic_trim = _default_context_trim_frames(plan, segment_index)
+        if requested_trim <= 0 and configured_trim > 0 and automatic_trim > 0:
+            # A project-level value overrides the Motion Context node's
+            # calculated default while preserving explicit no-context zeros.
+            requested_trim = configured_trim
+        elif requested_trim <= 0 and motion_trim is not None:
             # A connected Motion Context output of zero is intentional for
             # audio-only/no-context segments. Do not infer a video context
             # from the project defaults in that case.
             requested_trim = max(0, int(motion_trim))
         if requested_trim <= 0 and motion_trim is None:
-            requested_trim = _default_context_trim_frames(plan, segment_index)
+            requested_trim = automatic_trim
         # The node switch is authoritative.  The environment variable remains
         # available only for older programmatic callers that pass None.
         crop_enabled = (_auto_context_crop_enabled() if auto_context_crop is None
-                        else bool(auto_context_crop))
+                        else bool(auto_context_crop)) or configured_trim > 0
         if not crop_enabled:
             if requested_trim > 0:
                 LOG.info(

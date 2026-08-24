@@ -232,7 +232,12 @@ async function probeVideoAudio(path) {
   let result = {};
   try { result = await response.json(); } catch (_) { /* handled below */ }
   if (!response.ok) throw new Error(result.error || `视频音轨检测失败（${response.status}）`);
-  return result.has_audio === true;
+  // Keep an unknown probe result distinct from a confirmed silent video.
+  // Older plans and environments without ffprobe must still expose the
+  // per-video audio toggle instead of hiding it permanently.
+  if (result.has_audio === true) return true;
+  if (result.has_audio === false) return false;
+  return null;
 }
 
 async function probeVideoInfo(path) {
@@ -259,7 +264,8 @@ async function uploadOne(file, type) {
   const path = [result.subfolder, result.name].filter(Boolean).join("/");
   const ref = { type, name: result.name, path, originalName: file.name };
   if (type === "video") {
-    ref.has_audio = await probeVideoAudio(path).catch(() => false);
+    const hasAudio = await probeVideoAudio(path).catch(() => null);
+    if (hasAudio !== null) ref.has_audio = hasAudio;
     ref.video_audio_enabled = true;
   }
   return ref;
@@ -274,7 +280,7 @@ function totalRefs(segment) {
 }
 
 function videoAudioRefs(segment) {
-  return (segment.references || []).filter((ref) => ref.type === "video" && ref.has_audio === true && ref.video_audio_enabled !== false);
+  return (segment.references || []).filter((ref) => ref.type === "video" && ref.has_audio !== false && ref.video_audio_enabled !== false);
 }
 
 function segmentHasContent(segment) {
@@ -319,7 +325,7 @@ function applyChineseLabels(node) {
   if (!H3_NODE_CLASSES.has(nodeClass)) return;
   const labels = {
     project: "项目计划", project_id: "总文件夹名称", segments_json: "片段配置", duration: "默认片段时长",
-    global_reference_set: "统一参考集", auto_run: "自动连续生成", continuation_mode: "接续模式",
+    global_reference_set: "统一参考集", auto_run: "自动连续生成", continuation_mode: "接续模式", auto_context_crop_frames: "自动裁剪上下文帧数",
     cache_prompt_embeddings: "一次性缓存提示词向量", cache_prompt_embeddings_to_disk: "缓存提示词向量到硬盘", global_assets_json: "统一参考素材",
     segment_index: nodeClass === SEGMENT_NODE || nodeClass === CONTEXT_NODE || nodeClass === RESUME_NODE ? "上下文片段序号" : "片段序号",
     context_length: "上下文长度", prompt: "提示词", references_json: "参考素材 JSON",
@@ -400,6 +406,7 @@ function decorateNode(node) {
     global_reference_set: "统一参考集",
     auto_run: "自动连续生成",
     continuation_mode: "接续模式",
+    auto_context_crop_frames: "自动裁剪上下文帧数",
     cache_prompt_embeddings: "一次性缓存提示词向量",
     cache_prompt_embeddings_to_disk: "缓存提示词向量到硬盘",
     global_assets_json: "统一参考素材",
@@ -695,8 +702,16 @@ function openTTSPlanEditor(node) {
         const refs = unified.checked && index > 0 ? segments[0].references : seg.references;
         refs.forEach((ref) => {
           const type = ref.type; if (type !== "image" && type !== "video" && type !== "audio") return;
+          if (type === "video" && ref.path && ref.has_audio === undefined && !VIDEO_AUDIO_PROBES.has(ref)) {
+            VIDEO_AUDIO_PROBES.add(ref);
+            probeVideoAudio(ref.path).then((hasAudio) => {
+              ref.has_audio = hasAudio;
+              if (ref.video_audio_enabled === undefined) ref.video_audio_enabled = true;
+              renderRefs();
+            }).catch(() => { ref.has_audio = null; renderRefs(); });
+          }
           const row = document.createElement("div"); row.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px;background:#15191d;border:1px solid #424b55;border-radius:4px";
-          row.append(refLabel(ref, type, refs)); if (type === "video" && ref.has_audio === true) { const toggle = document.createElement("label"); toggle.style.cssText = "margin-left:auto;display:flex;align-items:center;gap:4px;font-size:12px"; const input = document.createElement("input"); input.type = "checkbox"; input.checked = ref.video_audio_enabled !== false; input.disabled = !editable; input.onchange = () => { ref.video_audio_enabled = input.checked; renderRefs(); }; toggle.append(input, "传递音频"); row.appendChild(toggle); }
+          row.append(refLabel(ref, type, refs)); if (type === "video") { const toggle = document.createElement("label"); toggle.style.cssText = "margin-left:auto;display:flex;align-items:center;gap:4px;font-size:12px;white-space:nowrap"; const input = document.createElement("input"); input.type = "checkbox"; input.checked = ref.video_audio_enabled !== false; input.disabled = !editable; input.title = "关闭后只传递视频画面"; input.onchange = () => { ref.video_audio_enabled = input.checked; renderRefs(); }; toggle.append(input, ref.has_audio === false ? "传递视频音频（未检测到音轨）" : "传递视频音频"); row.appendChild(toggle); }
           if (editable) row.appendChild(makeButton("删除", () => { seg.references.splice(seg.references.indexOf(ref), 1); renderRefs(); }));
           (type === "audio" ? audioList : mediaList).appendChild(row);
         });
@@ -900,6 +915,16 @@ function openEditor(node) {
   }));
   panel.appendChild(segmentCountPanel);
 
+  const cropPanel = document.createElement("div"); cropPanel.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px;font-size:12px";
+  cropPanel.append("自动裁剪上下文帧数");
+  const cropWidget = widget(node, "auto_context_crop_frames");
+  const cropFrames = document.createElement("input"); cropFrames.type = "number"; cropFrames.min = "0"; cropFrames.max = "4096"; cropFrames.step = "1";
+  cropFrames.value = String(Math.max(0, Math.floor(Number(cropWidget?.value) || 0)));
+  cropFrames.title = "0 表示按当前上下文长度自动计算；大于 0 时使用指定帧数";
+  cropFrames.style.cssText = "width:88px;background:#15191d;color:#eee;border:1px solid #59636e;padding:5px";
+  cropPanel.append(cropFrames, "帧（0=自动计算；大于 0 时自动启用裁剪）");
+  panel.appendChild(cropPanel);
+
   const list = document.createElement("div");
   list.style.cssText = "flex:1;overflow:auto;padding-right:4px";
   panel.appendChild(list);
@@ -915,7 +940,7 @@ function openEditor(node) {
 
   const videoAudioPromptNumber = (seg, ref) => {
     const videos = (seg.references || []).filter((item) => item.type === "video");
-    return videos.slice(0, videos.indexOf(ref) + 1).filter((item) => item.has_audio === true && item.video_audio_enabled !== false).length;
+    return videos.slice(0, videos.indexOf(ref) + 1).filter((item) => item.has_audio !== false && item.video_audio_enabled !== false).length;
   };
 
   const createRefCard = (seg, ref, type, renderRefs) => {
@@ -945,7 +970,7 @@ function openEditor(node) {
             ref.has_audio = hasAudio;
             if (ref.video_audio_enabled === undefined) ref.video_audio_enabled = true;
             renderRefs();
-          }).catch(() => { ref.has_audio = false; renderRefs(); });
+          }).catch(() => { ref.has_audio = null; renderRefs(); });
         }
         // Use a canvas-extracted first frame as the stable thumbnail. Keeping
         // the video element hidden avoids animated previews and layout jumps.
@@ -1003,11 +1028,13 @@ function openEditor(node) {
     const info = document.createElement("div");
     info.style.cssText = "min-width:0;display:flex;flex-direction:column;gap:5px";
     const title = document.createElement("div");
-    title.textContent = `视频音频 ${number}`;
+    title.textContent = number > 0 ? `视频音频 ${number}` : "视频音频（未检测到音轨）";
     title.style.cssText = "font-weight:700;color:#f0f3f6";
     info.appendChild(title);
     const meta = document.createElement("div");
-    meta.textContent = `提示词标签：<Audio ${number}> | 来源：${videoRef.originalName || videoRef.name || "视频参考"}`;
+    meta.textContent = number > 0
+      ? `提示词标签：<Audio ${number}> | 来源：${videoRef.originalName || videoRef.name || "视频参考"}`
+      : `未检测到音轨；仍可保留开关设置 | 来源：${videoRef.originalName || videoRef.name || "视频参考"}`;
     meta.style.cssText = "font-size:11px;color:#aeb7c1";
     info.appendChild(meta);
     const toggle = document.createElement("label");
@@ -1063,7 +1090,7 @@ function openEditor(node) {
           const heading = document.createElement("div"); heading.textContent = type === "image" ? "图片参考（提示词标签从 <Picture 1> 起始编号）" : type === "video" ? "视频参考（提示词标签从 <Video 1> 起始编号）" : "音频参考（按上传顺序使用 <Audio 1>、<Audio 2>…）"; heading.style.cssText = "grid-column:1/-1;color:#c7d0da;font-size:12px"; group.appendChild(heading);
           refs.forEach((ref) => {
             group.appendChild(createRefCard(seg, ref, type, () => { summary.textContent = `多模态参考素材（${totalRefs(seg)}/${MAX_TOTAL_REFS} / 图片${countRefs(seg, "image")}/9，视频${countRefs(seg, "video")}/3，音频${countRefs(seg, "audio")}/3）`; renderRefs(); }));
-            if (type === "video" && ref.has_audio === true) group.appendChild(createVideoAudioCard(seg, ref, renderRefs));
+            if (type === "video") group.appendChild(createVideoAudioCard(seg, ref, renderRefs));
           });
           refList.appendChild(group);
         });
@@ -1137,7 +1164,12 @@ function openEditor(node) {
     }
     const insertInvalid = segments.findIndex((seg) => (seg.references || []).some((ref) => Number(ref.insert_seconds) < 0 || Number(ref.insert_frames) < 0));
     if (insertInvalid >= 0) { notice.textContent = `第 ${insertInvalid + 1} 段存在无效的素材插入时间。`; return; }
-    writeSegments(node, segments); shade.remove();
+    writeSegments(node, segments);
+    if (cropWidget) {
+      cropWidget.value = Math.max(0, Math.min(4096, Math.floor(Number(cropFrames.value) || 0)));
+      cropWidget.callback?.(cropWidget.value);
+    }
+    shade.remove();
   }));
   panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade);
 }
