@@ -1,4 +1,5 @@
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
 const NODE = "H3AutoDirectorPlan";
 const TRANSFER_NODE = "H3AutoDirectorVideoTransferPlan";
@@ -23,7 +24,17 @@ const SAVE_NODE = "H3AutoDirectorSaveSegment";
 const CONTROLLER_NODE = "H3AutoDirectorController";
 const SAMPLING_SWITCH_NODE = "H3AutoDirectorSamplingSwitch";
 const APPLY_AUDIO_SAMPLING_NODE = "H3AutoDirectorApplyAudioSampling";
-const H3_NODE_CLASSES = new Set([NODE, TRANSFER_NODE, TRANSFER_LOADER_NODE, HYBRID_LOADER_NODE, DUAL_STAGE_LOADER_NODE, TTS_NODE, SEGMENT_NODE, REFERENCE_NODE, CACHED_REFERENCE_NODE, DUAL_SAMPLING_NODE, AV_DECODE_NODE, CONTEXT_NODE, RESUME_NODE, MOTION_CONTEXT_NODE, MOTION_TRIM_NODE, MOTION_SAVE_LATENT_NODE, MOTION_LOAD_LATENT_NODE, RESOLUTION_NODE, H3_RESOLUTION_NODE, SAVE_NODE, CONTROLLER_NODE, SAMPLING_SWITCH_NODE, APPLY_AUDIO_SAMPLING_NODE]);
+const CONTROL_PREPROCESS_NODE = "H3AutoDirectorControlPreprocess";
+const CONTROL_CONFIG_NODE = "H3AutoDirectorControlConfig";
+const CONTROL_EXPORT_NODE = "H3AutoDirectorControlExport";
+const CONTROL_CHECK_NODE = "H3AutoDirectorControlBackendCheck";
+// Retired video super-resolution nodes are intentionally kept as sentinel
+// names so old saved graphs can be recognized without re-enabling their UI.
+const VIDEO_LOAD_NODE = "__H3_RETIRED_VIDEO_LOAD__";
+const VIDEO_STREAM_NODE = "__H3_RETIRED_VIDEO_STREAM__";
+const LOAD_SAVED_AV_LATENT_NODE = "H3AutoDirectorLoadSavedAVLatent";
+const DECODE_SAVE_VIDEO_NODE = "H3AutoDirectorDecodeSaveVideo";
+const H3_NODE_CLASSES = new Set([NODE, TRANSFER_NODE, TRANSFER_LOADER_NODE, DUAL_STAGE_LOADER_NODE, TTS_NODE, SEGMENT_NODE, REFERENCE_NODE, CACHED_REFERENCE_NODE, DUAL_SAMPLING_NODE, AV_DECODE_NODE, CONTEXT_NODE, RESUME_NODE, MOTION_CONTEXT_NODE, MOTION_TRIM_NODE, MOTION_SAVE_LATENT_NODE, MOTION_LOAD_LATENT_NODE, RESOLUTION_NODE, H3_RESOLUTION_NODE, SAVE_NODE, CONTROLLER_NODE, SAMPLING_SWITCH_NODE, APPLY_AUDIO_SAMPLING_NODE, CONTROL_PREPROCESS_NODE, CONTROL_CONFIG_NODE, CONTROL_EXPORT_NODE, CONTROL_CHECK_NODE, LOAD_SAVED_AV_LATENT_NODE, DECODE_SAVE_VIDEO_NODE, HYBRID_LOADER_NODE]);
 const MAX_REFS = { image: 9, video: 3, audio: 3 };
 const MAX_TOTAL_REFS = 12;
 const DIR_KEY = "h3-auto-director-picker-dirs";
@@ -271,6 +282,40 @@ async function uploadOne(file, type) {
   return ref;
 }
 
+// Keep the standalone video loader compatible with VHS_LoadVideo's native
+// uploader.  In particular, use ComfyUI's apiURL/auth handling and the exact
+// multipart field name expected by /upload/image instead of fetch()'s custom
+// request path.
+async function uploadVideoWithComfyUI(file, node) {
+  const body = new FormData();
+  const relative = String(file.webkitRelativePath || "");
+  const slash = relative.lastIndexOf("/");
+  const subfolder = slash > 0 ? relative.slice(0, slash + 1) : "";
+  const upload = new File([file], file.name, { type: file.type, lastModified: file.lastModified });
+  body.append("image", upload);
+  if (subfolder) body.append("subfolder", subfolder);
+  const response = await new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.upload.onprogress = (event) => { if (event.lengthComputable) node.progress = event.loaded / event.total; };
+    request.onload = () => resolve(request);
+    request.onerror = () => reject(new Error("视频上传网络连接失败"));
+    request.open("POST", api.apiURL("/upload/image"), true);
+    Promise.resolve(api.getAuthStore?.()).then(async (store) => {
+      const headers = store ? await store.getAuthHeader() : {};
+      Object.entries(headers || {}).forEach(([key, value]) => request.setRequestHeader(key, value));
+      request.send(body);
+    }).catch(reject);
+  });
+  node.progress = undefined;
+  if (response.status !== 200) {
+    let detail = `${response.status} ${response.statusText}`;
+    if (response.status === 413) detail += "：文件超过 ComfyUI 的上传大小限制，请提高 --max-upload-size 或先放入 input 目录";
+    throw new Error(`视频上传失败（${detail}）`);
+  }
+  const result = JSON.parse(response.responseText || "{}");
+  return [result.subfolder, result.name].filter(Boolean).join("/");
+}
+
 function countRefs(segment, type) {
   return (segment.references || []).filter((ref) => ref.type === type).length;
 }
@@ -320,28 +365,71 @@ function normalizeSaveFps(node) {
   }
 }
 
+function decorateVideoLoad(node) {
+  const nodeClass = node.comfyClass || node.type;
+  if (![VIDEO_LOAD_NODE, VIDEO_STREAM_NODE].includes(nodeClass) || widget(node, "upload_video")) return;
+  // Migrate old workflows that stored a project/final directory.  The node
+  // now requires one concrete video file and the user can upload it directly.
+  const pathWidget = widget(node, "video_path");
+  if (pathWidget && String(pathWidget.value || "").trim()
+      && !/\.(mp4|mkv|webm|mov|avi)$/i.test(String(pathWidget.value).trim())) {
+    pathWidget.value = "";
+    pathWidget.callback?.(pathWidget.value);
+  }
+  const button = node.addWidget("button", "upload_video", "上传视频", async () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "video/mp4,video/matroska,video/webm,video/quicktime,video/x-msvideo,.mp4,.mkv,.webm,.mov,.avi";
+    input.multiple = false;
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      button.label = "上传中…";
+      try {
+        const uploadedPath = await uploadVideoWithComfyUI(file, node);
+        const path = widget(node, "video_path");
+        if (!path) throw new Error("找不到视频文件输入框");
+        path.value = uploadedPath;
+        path.callback?.(path.value);
+        node.setDirtyCanvas?.(true, true);
+        button.label = "重新上传视频";
+      } catch (error) {
+        button.label = "上传视频";
+        window.alert(error?.message || String(error));
+      }
+    };
+    input.click();
+  });
+  button.serialize = false;
+  button.label = "上传视频";
+  button.tooltip = "直接上传一个视频文件；此节点不接受目录。";
+}
+
 function applyChineseLabels(node) {
   const nodeClass = node.comfyClass || node.type;
   if (!H3_NODE_CLASSES.has(nodeClass)) return;
   const labels = {
-    project: "项目计划", project_id: "总文件夹名称", segments_json: "片段配置", duration: "默认片段时长",
+    project: "项目计划", plan: "项目计划", project_id: "总文件夹名称", segments_json: "片段配置", duration: "默认片段时长",
     global_reference_set: "统一参考集", auto_run: "自动连续生成", continuation_mode: "接续模式", auto_context_crop_frames: "自动裁剪上下文帧数",
+    decode_after_all_segments: "所有片段完成后统一解码（逐段处理）",
     cache_prompt_embeddings: "一次性缓存提示词向量", cache_prompt_embeddings_to_disk: "缓存提示词向量到硬盘", global_assets_json: "统一参考素材",
     segment_index: nodeClass === SEGMENT_NODE || nodeClass === CONTEXT_NODE || nodeClass === RESUME_NODE ? "上下文片段序号" : "片段序号",
     context_length: "上下文长度", prompt: "提示词", references_json: "参考素材 JSON",
     clip: "文本编码器", vae: "视频 VAE", audio_vae: "音频 VAE", width: "宽度", height: "高度", length: "帧数",
-    ref_image_size: "预设选项（match/max）", use_auto_ref_image_size: "使用预设", use_manual_ref_short_edge: "使用手动设置", ref_short_edge: "参考图最短边", enable_resume: "启用断点续接", latent_path: "缓存潜变量路径", video_path: "缓存视频路径",
+    ref_image_size: "预设选项（match/max）", use_auto_ref_image_size: "使用预设", use_manual_ref_short_edge: "使用手动设置", ref_short_edge: "参考图最短边", enable_resume: "启用断点续接", latent_path: nodeClass === LOAD_SAVED_AV_LATENT_NODE ? "保存的 AV 潜空间文件路径" : "缓存潜变量路径", video_path: [VIDEO_LOAD_NODE, VIDEO_STREAM_NODE].includes(nodeClass) ? "视频文件（可上传，不能填目录）" : "缓存视频路径",
     conditioning: "条件", latent: "潜变量", context_frames: "上下文画面", context_latent: "上下文潜变量",
     use_video_context: "使用视频上下文", use_audio_context: "使用音频上下文", use_video_latent: "使用视频潜空间",
     fps: "帧率", images: "视频画面", use_stage1_audio_only: "最终仅使用一采音频",
+    context_sampled_start_tokens: "首部可采样 latent token 数", context_sampled_start_strength: "首部 token 重绘强度", context_sampled_tokens: "末端可采样 latent token 数", context_sampled_strength: "末端 token 重绘强度",
     audio: "音频", saved_video: nodeClass === "H3AutoDirectorTTSController" ? "已保存音频" : "已保存视频", segment_node_id: "片段节点 ID", trim_frames: "上下文裁剪帧数", auto_context_crop: "自动裁剪上下文", match_tail: "匹配音频尾部",
-    clip_index: "片段序号", latent_path: "潜变量路径",
+    clip_index: "片段序号", latent_path: nodeClass === LOAD_SAVED_AV_LATENT_NODE ? "保存的 AV 潜空间文件路径" : "潜变量路径",
     aspect_ratio: "宽高比", megapixels: "目标像素数（MP）", multiple: "尺寸倍数",
     use_preset_ratio: "使用预设比例", use_custom_ratio: "使用自定义比例", aspect_preset: "宽高比预设", custom_ratio: "自定义比例（宽,高）",
     stage1_megapixels: "第一阶段像素数（MP）", stage2_megapixels: "第二阶段像素数（MP）",
     resolution_preview: "当前输出分辨率",
+    input_fps: "原视频帧率", interpolation_multiplier: "补帧倍率", vfi_model: "补帧模型", sr_frame_count: "超分处理帧数", sr_scale: "超分倍率（相对原视频）", sr_quality: "RTX VSR 质量", filename: "输出文件名", filename_prefix: "输出文件名前缀", preserve_audio: "保留原视频音频",
     output_root: nodeClass === SAVE_NODE ? "输出文件名（中间片段，留空使用 H3）" : nodeClass === CONTROLLER_NODE ? "输出文件名（最终视频，留空使用 H3）" : nodeClass === "H3AutoDirectorTTSController" ? "最终长 WAV 文件名（留空使用 H3）" : "项目文件夹名称（保存于 output/h3_project 下）",
-    video_format: "视频格式", video_codec: "编码格式", encoder_device: "编码设备", quality: "编码质量", color_correction: "上下文色彩校正",
+    video_format: "视频格式", video_codec: "编码格式", encoder_device: "编码设备", quality: "编码质量", latent_directory: "潜空间目录（项目目录或 cache）", output_intermediate: "输出中间片段", intermediate_filename: "中间片段文件名前缀", final_filename: "最终视频文件名", auto_crop_frames: "自动裁剪帧数（从第2段开始）", color_correction: "上下文色彩校正",
     scene_cut_protection: "场景切换保护", scene_cut_threshold: "场景切换阈值",
     correction_strength: "校色强度", residual_strength: "残余漂移强度",
     cleanup_after_final: "最终完成后清理显存", sampling_mode: "音频采样切换", audio_sampling: "音频采样方法", scheduler: "调度器", steps: "采样步数", denoise: "降噪",
@@ -360,6 +448,11 @@ function applyChineseLabels(node) {
     previous_video_reference_segments: "使用上段视频参考片段", skip_h3_audio_decode: "仅不解码 H3 音频（仍联合采样）",
     final_audio_source: "最终视频音频来源", edit_transfer: "编辑动作迁移计划",
     concat_final_audio: "拼接最终长音频", edit_tts: "编辑 TTS 片段",
+    control_mode: "控制模式", control_type: "控制类型", input_style: "输入风格", enabled: nodeClass === CONTROL_EXPORT_NODE ? "导出控制视频" : "启用预处理",
+    save_preprocessed: "保存预处理视频", preprocess_all_segments: "一次性预处理全部片段", pose_weight: "姿态控制权重", depth_weight: "深度控制权重",
+    video_frames: "视频帧", source_video_path: "视频路径（可选）", control_video: "控制视频",
+    control_context_scale: "控制强度", backend: "Union 后端", controlnet_path: "Union 权重路径",
+    config: "控制配置", control_config: "姿态/深度控制配置", output_name: "输出文件名",
   };
   const apply = (item) => {
     const stageLabel = nodeClass === DUAL_SAMPLING_NODE
@@ -382,6 +475,7 @@ function decorateNode(node) {
   if (!H3_NODE_CLASSES.has(nodeClass)) return;
   if (nodeClass === DUAL_STAGE_LOADER_NODE) cleanDualStageLoaderPorts(node);
   if (nodeClass === SAMPLING_SWITCH_NODE) cleanSamplingSwitchPorts(node);
+  if (nodeClass === CONTROLLER_NODE) removeRetiredPorts(node, ["crop_context_on_assemble", "拼接前裁剪上下文"]);
   if (nodeClass === NODE && !widget(node, "edit_segments")) {
     const button = node.addWidget("button", "edit_segments", "编辑片段", () => openEditor(node));
     button.label = "编辑片段";
@@ -399,14 +493,17 @@ function decorateNode(node) {
   }
   if (nodeClass === H3_RESOLUTION_NODE) decorateH3Resolution(node);
   if (nodeClass === CACHED_REFERENCE_NODE) decorateCachedReference(node);
+  if ([VIDEO_LOAD_NODE, VIDEO_STREAM_NODE].includes(nodeClass)) decorateVideoLoad(node);
   const labels = {
     project_id: "总文件夹名称",
+    plan: "项目计划",
     segments_json: "片段配置",
     duration: "默认片段时长",
     global_reference_set: "统一参考集",
     auto_run: "自动连续生成",
     continuation_mode: "接续模式",
     auto_context_crop_frames: "自动裁剪上下文帧数",
+    decode_after_all_segments: "所有片段完成后统一解码（逐段处理）",
     cache_prompt_embeddings: "一次性缓存提示词向量",
     cache_prompt_embeddings_to_disk: "缓存提示词向量到硬盘",
     global_assets_json: "统一参考素材",
@@ -415,8 +512,11 @@ function decorateNode(node) {
     video_codec: "编码格式",
     encoder_device: "编码设备",
     quality: "编码质量",
+    video_path: [VIDEO_LOAD_NODE, VIDEO_STREAM_NODE].includes(nodeClass) ? "视频文件（可上传，不能填目录）" : "输入视频文件路径", input_fps: "原视频帧率", interpolation_multiplier: "补帧倍率", vfi_model: "补帧模型", sr_frame_count: "超分处理帧数", sr_scale: "超分倍率（相对原视频）", sr_quality: "RTX VSR 质量", filename: "输出文件名", filename_prefix: "输出文件名前缀", preserve_audio: "保留原视频音频",
+    latent_directory: "潜空间目录（项目目录或 cache）", output_intermediate: "输出中间片段", intermediate_filename: "中间片段文件名前缀", final_filename: "最终视频文件名", auto_crop_frames: "自动裁剪帧数（从第2段开始）",
     color_correction: "上下文色彩校正",
     use_video_latent: "使用视频潜空间",
+    context_sampled_start_tokens: "首部可采样 latent token 数", context_sampled_start_strength: "首部 token 重绘强度", context_sampled_tokens: "末端可采样 latent token 数", context_sampled_strength: "末端 token 重绘强度",
     scene_cut_protection: "场景切换保护",
     scene_cut_threshold: "场景切换阈值",
     correction_strength: "校色强度",
@@ -574,7 +674,10 @@ function h3BooleanValue(value, fallback = false) {
 
 function calculateH3Resolution(ratioWidth, ratioHeight, megapixels, multiple) {
   const ratio = Math.max(1, Number(ratioWidth) || 1) / Math.max(1, Number(ratioHeight) || 1);
-  const alignment = Math.max(1, Math.trunc(Number(multiple) || 32));
+  // MiniMax H3 requires a 32px canvas grid.  Keep preview calculations in
+  // lockstep with the Python node even when an old workflow stores 16/24.
+  const requestedMultiple = Math.max(32, Math.trunc(Number(multiple) || 32));
+  const alignment = Math.max(32, Math.floor(requestedMultiple / 32) * 32);
   const targetPixels = Math.max(0.2, Math.min(5, Number(megapixels) || 0.2)) * 1024 * 1024;
   let width = Math.max(alignment, Math.round(Math.sqrt(targetPixels * ratio) / alignment) * alignment);
   let height = Math.max(alignment, Math.round((Math.sqrt(targetPixels * ratio) / ratio) / alignment) * alignment);
@@ -606,6 +709,11 @@ function decorateH3Resolution(node) {
       ? custom : (presets[preset] || [16, 9]);
     const first = calculateH3Resolution(ratio[0], ratio[1], h3ResolutionValue(node, "stage1_megapixels", 0.4), h3ResolutionValue(node, "multiple", 32));
     const second = calculateH3Resolution(ratio[0], ratio[1], h3ResolutionValue(node, "stage2_megapixels", 0.98), h3ResolutionValue(node, "multiple", 32));
+    const multipleWidget = widget(node, "multiple");
+    if (multipleWidget && Number(multipleWidget.value) < 32) {
+      multipleWidget.value = 32;
+      multipleWidget.callback?.(32);
+    }
     const selectedText = customEnabled ? `${ratio[0]}:${ratio[1]}` : (presetEnabled ? preset : "16:9");
     preview.value = `第一阶段：${first.width} x ${first.height}（${first.megapixels} MP）\n第二阶段：${second.width} x ${second.height}（${second.megapixels} MP）\n比例：${selectedText}`;
     const presetWidget = widget(node, "aspect_preset");
@@ -925,6 +1033,13 @@ function openEditor(node) {
   cropPanel.append(cropFrames, "帧（0=自动计算；大于 0 时自动启用裁剪）");
   panel.appendChild(cropPanel);
 
+  const deferredPanel = document.createElement("label"); deferredPanel.style.cssText = "display:flex;align-items:center;gap:8px;padding:8px 10px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px;font-size:12px";
+  const deferredWidget = widget(node, "decode_after_all_segments");
+  const deferredDecode = document.createElement("input"); deferredDecode.type = "checkbox"; deferredDecode.checked = !!deferredWidget?.value;
+  deferredDecode.title = "全部采样后从硬盘逐段读取 latent、逐段解码并拼接；开启时视频上下文固定使用缓存潜空间直取。";
+  deferredPanel.append(deferredDecode, "所有片段采样完成后统一解码（逐段处理，不同时占用多段显存）");
+  panel.appendChild(deferredPanel);
+
   const list = document.createElement("div");
   list.style.cssText = "flex:1;overflow:auto;padding-right:4px";
   panel.appendChild(list);
@@ -1169,6 +1284,10 @@ function openEditor(node) {
       cropWidget.value = Math.max(0, Math.min(4096, Math.floor(Number(cropFrames.value) || 0)));
       cropWidget.callback?.(cropWidget.value);
     }
+    if (deferredWidget) {
+      deferredWidget.value = deferredDecode.checked;
+      deferredWidget.callback?.(deferredDecode.checked);
+    }
     shade.remove();
   }));
   panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade);
@@ -1187,6 +1306,51 @@ app.registerExtension({
           && info.inputs.some((input) => input?.name === "use_previous_video_reference");
         if (legacy && Array.isArray(info.widgets_values) && info.widgets_values.length >= 10) {
           info = { ...info, widgets_values: info.widgets_values.slice(0, 6).concat(info.widgets_values.slice(7)) };
+        }
+        return originalConfigure?.call(this, info);
+      };
+    }
+    if (nodeData.name === MOTION_CONTEXT_NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        let inputs = Array.isArray(info?.inputs) ? info.inputs : [];
+        const noiseNames = new Set(["context_noise_schedule", "context_noise_seed", "context_noise_mode", "context_noise_sample_strength", "context_noise_strength"]);
+        let values = Array.isArray(info?.widgets_values) ? [...info.widgets_values] : info?.widgets_values;
+        if (inputs.some((input) => noiseNames.has(input?.name))) {
+          inputs = inputs.filter((input) => !noiseNames.has(input?.name));
+          values = values ? values.slice(0, 5) : values;
+        }
+        // Add the head/tail redraw controls to old serialized workflows that
+        // predate this feature. Existing context_method remains in place.
+        const hasMethod = inputs.some((input) => input?.name === "context_method");
+        const redrawInputs = [
+          ["context_sampled_start_tokens", "首部可采样 latent token 数", "INT"],
+          ["context_sampled_start_strength", "首部 token 重绘强度", "FLOAT"],
+          ["context_sampled_tokens", "末端可采样 latent token 数", "INT"],
+          ["context_sampled_strength", "末端 token 重绘强度", "FLOAT"],
+        ];
+        if (hasMethod) {
+          const missing = redrawInputs.filter(([name]) => !inputs.some((input) => input?.name === name));
+          if (missing.length) {
+            inputs = inputs.concat(missing.map(([name, label, type]) => ({ label, localized_name: label, name, type, widget: { name } })));
+            if (values) values = values.concat([0, 0.25, 2, 0.25].slice(0, missing.length));
+          }
+        }
+        if (inputs !== info?.inputs || values !== info?.widgets_values) {
+          info = { ...info, inputs, widgets_values: values };
+        }
+        return originalConfigure?.call(this, info);
+      };
+    }
+    if (nodeData.name === CONTROLLER_NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        const inputs = Array.isArray(info?.inputs) ? info.inputs : [];
+        const cropIndex = inputs.findIndex((input) => input?.name === "crop_context_on_assemble");
+        if (cropIndex >= 0) {
+          const values = Array.isArray(info?.widgets_values) ? [...info.widgets_values] : info?.widgets_values;
+          if (values && cropIndex >= 0 && values.length > 0) values.pop();
+          info = { ...info, inputs: inputs.filter((input) => input?.name !== "crop_context_on_assemble"), widgets_values: values };
         }
         return originalConfigure?.call(this, info);
       };
@@ -1217,6 +1381,21 @@ app.registerExtension({
         const retired = ["freeze_video_sampling", "freeze_audio_sampling"];
         if (retired.some((name) => names.includes(name)) && Array.isArray(info.widgets_values)) {
           info = { ...info, widgets_values: info.widgets_values.filter((_, index) => !retired.includes(names[index])) };
+        }
+        return originalConfigure?.call(this, info);
+      };
+    }
+    if (nodeData.name === CONTROL_PREPROCESS_NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        // Migrate the former single-control schema (control_type + style) to
+        // the unified pose/depth node without retaining the retired style UI.
+        const names = Array.isArray(info?.inputs) ? info.inputs.map((input) => input?.name) : [];
+        const values = Array.isArray(info?.widgets_values) ? info.widgets_values : null;
+        if (values && names.includes("control_type") && !names.includes("control_mode")) {
+          const oldType = String(values[names.indexOf("control_type")] || "");
+          const mode = oldType.startsWith("姿态") ? "姿态" : oldType.startsWith("深度") ? "深度" : "关闭";
+          info = { ...info, widgets_values: [mode, values[names.indexOf("resolution")] ?? 768, values[names.indexOf("enabled")] ?? true, true, false, 1.0, 1.0] };
         }
         return originalConfigure?.call(this, info);
       };

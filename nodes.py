@@ -8,6 +8,7 @@ silently consumes the newest rejected cache.
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import importlib
 import inspect
@@ -35,6 +36,12 @@ import comfy.samplers
 import comfy.sample
 import comfy.sd
 import comfy.utils
+try:
+    # NestedTensor is native to current H3 AV sampling.  It is unavailable in
+    # older ComfyUI builds, which use the legacy list-of-streams contract.
+    import comfy.nested_tensor as _h3_nested_tensor
+except (ImportError, AttributeError):
+    _h3_nested_tensor = None
 from .sampling_switch import LEGACY_MODE, NATIVE_MODE, apply_h3_sampling, ensure_h3_layout_refresh
 
 try:
@@ -103,7 +110,7 @@ MAX_REFERENCE_TOTAL = 12
 PROJECT_ROOT_NAME = "h3_project"
 
 VIDEO_FORMATS = {"mp4": "mp4", "mkv": "matroska", "webm": "webm", "mov": "mov"}
-VIDEO_EXTENSIONS = (".mp4", ".mkv", ".webm", ".mov")
+VIDEO_EXTENSIONS = (".mp4", ".mkv", ".webm", ".mov", ".avi")
 VIDEO_CODECS = {
     "h264": {"cpu": "libx264", "gpu": ("h264_nvenc", "h264_qsv", "h264_amf")},
     "hevc": {"cpu": "libx265", "gpu": ("hevc_nvenc", "hevc_qsv", "hevc_amf")},
@@ -111,6 +118,35 @@ VIDEO_CODECS = {
     "av1": {"cpu": "libaom-av1", "gpu": ("av1_nvenc", "av1_qsv", "av1_amf")},
 }
 QUALITY_CHOICES = ("最高质量", "高质量", "平衡", "快速")
+
+
+def _direct_video_file(value):
+    """Resolve a directly selected/uploaded video file.
+
+    The standalone video tool intentionally accepts a file, never a
+    directory.  Browser uploads return an ``input/``-relative path while
+    native ComfyUI workflows may provide an absolute Windows path, so both
+    forms are normalized here.  Keeping this check in one helper prevents
+    metadata probing and decoding from disagreeing about the input.
+    """
+    raw = str(value or "").strip().strip('"')
+    if not raw:
+        raise ValueError("请直接上传或填写视频文件（支持 MP4、MKV、WebM、MOV、AVI），不能填写目录")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        normalized = raw.replace("\\", "/")
+        if normalized.startswith("input/"):
+            normalized = normalized[6:]
+        input_candidate = Path(folder_paths.get_input_directory()) / normalized
+        candidate = input_candidate if input_candidate.exists() else candidate
+    candidate = candidate.resolve()
+    if candidate.is_dir():
+        raise ValueError("视频加载节点仅支持直接加载视频文件，不能加载目录：%s" % candidate)
+    if not candidate.is_file():
+        raise ValueError("视频文件不存在：%s" % candidate)
+    if candidate.suffix.lower() not in VIDEO_EXTENSIONS:
+        raise ValueError("不支持的视频格式：%s（支持：%s）" % (candidate.suffix or "无扩展名", ", ".join(VIDEO_EXTENSIONS)))
+    return candidate
 ENCODER_DEVICES = ("CPU", "GPU")
 COLOR_CORRECTION_CHOICES = ("关闭", "匹配首段", "匹配上段")
 CONTEXT_DIR_NAME = "context"
@@ -120,6 +156,24 @@ _MOTION_CONTEXT_MARKER = "_h3_auto_director_motion_context"
 _NATIVE_CONTEXT_KEY = "_h3_auto_director_native_context"
 _LAST_STAGE1_CONTEXT = None
 _LAST_MOTION_CONTEXT_TRIM = None
+
+
+def _h3_canvas_dimensions(width, height):
+    """Return the exact spatial grid consumed by MiniMax H3.
+
+    H3 packs video latents at a 16x VAE stride but requires the pixel canvas
+    itself to be a multiple of ``CANVAS_MULTIPLE`` (32 in the official node).
+    Normalize at every public boundary so manually entered or legacy workflow
+    values cannot be silently truncated by ``_empty_av_latent``.
+    """
+    multiple = int(getattr(_minimax_h3, "CANVAS_MULTIPLE", 32) or 32)
+    multiple = max(32, multiple)
+    try:
+        w = int(round(float(width) / multiple) * multiple)
+        h = int(round(float(height) / multiple) * multiple)
+    except (TypeError, ValueError):
+        raise ValueError("H3 分辨率必须是有效的宽度和高度")
+    return max(multiple, w), max(multiple, h)
 
 
 def _output_root():
@@ -151,6 +205,21 @@ def _find_ffmpeg():
         if path.is_file():
             return str(path)
     return None
+
+
+def _release_video_memory():
+    """Release temporary Python/CUDA allocations between video chunks."""
+    gc.collect()
+    try:
+        model_management.soft_empty_cache()
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
 
 
 def _safe_project_dir(project_id: str, root: str = "h3_projects") -> Path:
@@ -273,6 +342,14 @@ def _prompt_disk_fingerprint(plan, generation_index, width, height, ref_image_si
     refs = _cache_segment_references(plan, generation_index)
     seg = _segment(plan, generation_index)
     prompt = _previous_video_prompt(seg.get("prompt", ""), refs)
+    # Reference conditioning does not depend on the generation canvas when
+    # using a fixed short-edge policy (manual) or H3's max policy.  The match
+    # policy scales images to the generation pixel area, so width/height must
+    # remain part of its cache identity.
+    ref_mode = str(ref_image_size or "match").lower()
+    width, height = _h3_canvas_dimensions(width, height)
+    resolution = ({"width": int(width), "height": int(height)}
+                  if ref_mode not in {"manual", "max"} else None)
     value = {
         "schema": PROMPT_DISK_CACHE_SCHEMA,
         "mode": plan.get("mode", "director"),
@@ -285,7 +362,7 @@ def _prompt_disk_fingerprint(plan, generation_index, width, height, ref_image_si
         "segment": seg,
         "prompt": prompt,
         "references": [_reference_file_marker(plan, ref) for ref in refs],
-        "width": int(width), "height": int(height),
+        "resolution": resolution,
         "ref_image_size": str(ref_image_size),
         "context_length": int(context_length),
         "ref_short_edge": _nearest_multiple(ref_short_edge),
@@ -394,14 +471,18 @@ def _disk_cache_enabled(plan):
 def _prompt_disk_global_details(plan, width, height, ref_image_size, context_length,
                                 ref_short_edge, model_identity, use_manual_ref_short_edge=False):
     """Build the manifest-wide signature used by both eager and delayed cache writes."""
+    effective_mode = str("manual" if use_manual_ref_short_edge else ref_image_size or "match").lower()
+    width, height = _h3_canvas_dimensions(width, height)
+    resolution = ({"width": int(width), "height": int(height)}
+                  if effective_mode not in {"manual", "max"} else None)
     return {
         "schema": PROMPT_DISK_CACHE_SCHEMA,
         "mode": plan.get("mode", "director"),
         "project_id": plan.get("project_id"),
         "global_reference_set": bool(plan.get("global_reference_set", True)),
         "global_assets": plan.get("global_assets", []),
-        "width": int(width), "height": int(height),
-        "ref_image_size": str("manual" if use_manual_ref_short_edge else ref_image_size),
+        "resolution": resolution,
+        "ref_image_size": effective_mode,
         "context_length": int(context_length),
         "ref_short_edge": _nearest_multiple(ref_short_edge),
         "models": model_identity,
@@ -479,7 +560,18 @@ def _use_previous_video_reference(plan, generation_index: int) -> bool:
 def _segment_reference_specs(plan, generation_index: int):
     """Return user references plus a runtime-only previous-video reference when enabled."""
     seg = _segment(plan, int(generation_index))
-    refs = list(plan.get("global_assets", [])) if plan.get("global_reference_set", True) else list(seg.get("references", []))
+    global_set = bool(plan.get("global_reference_set", True))
+    refs = list(plan.get("global_assets", [])) if global_set else list(seg.get("references", []))
+    if global_set and int(generation_index) != 1:
+        # Global mode reuses the first segment's files as ordinary references,
+        # but timed insertion belongs only to the segment where it was set.
+        # Strip insertion metadata on later segments so a guide at (say) 2s
+        # is not injected into every segment sharing the global set.
+        refs = [
+            dict(ref, insert_seconds=0.0, insert_frames=0)
+            if isinstance(ref, dict) else ref
+            for ref in refs
+        ]
     if _use_previous_video_reference(plan, generation_index):
         video_count = sum(1 for ref in refs if isinstance(ref, dict) and str(ref.get("type", "image")).lower() in {"video", "transfer_video_segment"})
         if video_count > 1:
@@ -645,7 +737,10 @@ def _runtime_plan(plan, output_root=None):
 def _load_context_video(path: Path, max_frames=39):
     if av is None:
         raise RuntimeError("PyAV is required to load H3 context videos")
-    tail = deque(maxlen=max_frames)
+    # ``max_frames=None`` is used only by disk assembly diagnostics/fallbacks;
+    # normal context loading keeps a bounded tail to avoid retaining a whole
+    # long project in memory.
+    tail = deque(maxlen=(None if max_frames is None else max(1, int(max_frames))))
     with av.open(str(path), "r") as container:
         streams = tuple(container.streams.video)
         if not streams:
@@ -765,6 +860,19 @@ def _av_latent_parts(value):
     if torch.is_tensor(samples) and torch.is_tensor(audio):
         return samples, audio
     return None
+
+
+def _h3_av_container(video, audio):
+    """Create an AV latent in the representation supported by this core.
+
+    ComfyUI 0.31+ packs H3 video/audio streams as ``NestedTensor``.  The
+    integrated 0.30 compatibility path expects the older two-item list.
+    Centralising this conversion prevents a new context feature from making
+    the entire plugin unloadable on the older supported core.
+    """
+    if _h3_nested_tensor is not None:
+        return _h3_nested_tensor.NestedTensor((video, audio))
+    return [video, audio]
 
 
 def _h3_sigmas(model, scheduler, steps, denoise):
@@ -957,6 +1065,17 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
         return dict(latent)
     latent_image = latent["samples"]
     noise = comfy.sample.prepare_noise(latent_image, int(seed), latent.get("batch_index"))
+    denoise_mask = latent.get("noise_mask")
+    if denoise_mask is not None:
+        mask_parts = _av_latent_parts({"samples": denoise_mask})
+        if mask_parts is not None and torch.is_tensor(mask_parts[0]):
+            LOG.info(
+                "H3 Auto Director: 采样器接收上下文 denoise_mask，视频 shape=%s，范围=[%.3f, %.3f]",
+                tuple(int(value) for value in mask_parts[0].shape),
+                float(mask_parts[0].amin().item()), float(mask_parts[0].amax().item()),
+            )
+        else:
+            LOG.info("H3 Auto Director: 采样器接收上下文 denoise_mask（类型=%s）", type(denoise_mask).__name__)
     callback = None
     if bool(enable_preview):
         try:
@@ -966,7 +1085,7 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
             LOG.warning("H3 Auto Director: 新版采样预览初始化失败，继续采样：%s", exc)
     try:
         samples = guider.sample(noise, latent_image, sampler, sigmas,
-                                denoise_mask=latent.get("noise_mask"), callback=callback, seed=int(seed))
+                                denoise_mask=denoise_mask, callback=callback, seed=int(seed))
     except RuntimeError as exc:
         # Retry once with the private Auto Director audio guide removed. This
         # preserves video continuation and all user audio references when a
@@ -985,7 +1104,7 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
         retry_guider.set_conds(repaired)
         retry_noise = comfy.sample.prepare_noise(latent_image, int(seed), latent.get("batch_index"))
         samples = retry_guider.sample(retry_noise, latent_image, sampler, sigmas,
-                                      denoise_mask=latent.get("noise_mask"), callback=callback,
+                                      denoise_mask=denoise_mask, callback=callback,
                                       seed=int(seed))
     result = dict(latent)
     result["samples"] = samples
@@ -1284,12 +1403,12 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
                     item_steps = step_counts[index]
                     if source_tail is not None and context_flags[index] and item_steps > 0:
                         # The normal context keyframe occupies frame 0 and
-                        # must receive the complete predecessor tail. The
-                        # extra boundary keyframe at ``context_run`` reuses
-                        # the final token so it anchors the first delivered
-                        # frame after SaveSegment's crop. Legacy mode stores
-                        # the normal window as one-token keyframes, so retain
-                        # their chronological order with a cursor.
+                        # receives only the exact predecessor context window.
+                        # No extra keyframe is placed at the cut: temporal
+                        # tokens span multiple pixel frames and such an anchor
+                        # would overlap the first generated frames. Legacy
+                        # mode stores the window as one-token keyframes, so
+                        # retain their chronological order with a cursor.
                         frame_index = item.get("resolved_frame_index")
                         if frame_index is None:
                             frame_index = item.get("h3_auto_director_legacy_frame_index", 0)
@@ -1514,6 +1633,35 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
                 int(steps),
             )
     return adapt_keyframe_grids(prepared)
+
+
+def _attach_union_control_conditioning(conditioning, control_config):
+    """Attach persisted Union control metadata without copying control tensors.
+
+    The native H3 transformer ignores unknown conditioning values, while a
+    VideoX-Fun Union adapter can consume these paths and scales. Keeping only
+    paths here avoids duplicating every pose/depth frame through the sampler.
+    """
+    if not isinstance(control_config, dict):
+        return conditioning
+    if not bool(control_config.get("enabled")):
+        return conditioning
+    payload = {
+        "type": "h3_union_control",
+        "control_mode": str(control_config.get("control_mode", "姿态+深度")),
+        "pose_weight": float(control_config.get("pose_weight", 0.0) or 0.0),
+        "depth_weight": float(control_config.get("depth_weight", 0.0) or 0.0),
+        "segment_index": int(control_config.get("segment_index", 1) or 1),
+        "fps": float(control_config.get("fps", FPS) or FPS),
+        "frame_grid": str(control_config.get("frame_grid", "17*n+5")),
+        "segments": copy.deepcopy(control_config.get("segments", {})),
+        "requires_videox_fun": bool(control_config.get("requires_videox_fun", True)),
+    }
+    LOG.info(
+        "H3 Auto Director: 已将 Union 控制接入采样条件：模式=%s，姿态权重=%.3f，深度权重=%.3f，片段=%d",
+        payload["control_mode"], payload["pose_weight"], payload["depth_weight"], payload["segment_index"],
+    )
+    return node_helpers.conditioning_set_values(conditioning, {"h3_union_control": payload})
 
 
 def _flatten_video_frames(images):
@@ -1742,9 +1890,13 @@ def _upscale_rtx(images, width, height, quality="HIGH"):
     frames, restore = _flatten_video_frames(images)
     output_width = max(32, round(int(width) / 32) * 32)
     output_height = max(32, round(int(height) / 32) * 32)
-    with nvvfx.VideoSuperRes(quality_map.get(str(quality), nvvfx.effects.QualityLevel.HIGH)) as sr:
+    gpu_index = int(torch.cuda.current_device())
+    with nvvfx.VideoSuperRes(quality_map.get(str(quality), nvvfx.effects.QualityLevel.HIGH), device=gpu_index) as sr:
         sr.output_width, sr.output_height = output_width, output_height
         sr.load()
+        LOG.info("H3 Auto Director: RTX VSR GPU=%s，输入=%s，输出=%sx%s，质量=%s",
+                 torch.cuda.get_device_name(gpu_index),
+                 tuple(frames.shape), output_width, output_height, quality)
         out = torch.empty((frames.shape[0], output_height, output_width, frames.shape[-1]),
                           device=frames.device, dtype=frames.dtype)
         for index in range(frames.shape[0]):
@@ -1757,7 +1909,516 @@ def _upscale_rtx(images, width, height, quality="HIGH"):
             elif result.shape[-1] != frames.shape[-1]:
                 raise RuntimeError(f"RTX Video Super Resolution 返回了异常通道数: {tuple(result.shape)}")
             out[index] = result.to(device=out.device, dtype=out.dtype)
+            del frame, result
+        # nvvfx runs asynchronously on the selected CUDA device.  Synchronize
+        # before leaving the effect scope so the next chunk cannot overlap the
+        # previous one and make VRAM appear to grow monotonically.
+        torch.cuda.synchronize()
     return restore(out)
+
+
+class H3AutoDirectorVideoSRVFI:
+    """Streaming video super-resolution + frame interpolation.
+
+    VFI is delegated to the installed ComfyUI-Frame-Interpolation nodes. Source
+    frames are super-resolved first, then sent to VFI in small overlapping
+    windows. Only one VFI window and one RTX-VSR frame are resident on the GPU
+    at a time; output frames are moved back to CPU before the next window.
+    """
+
+    MODEL_CHOICES = (
+        "AMT-G（通用高质量）",
+        "GMFSS Fortuna（动漫优先）",
+        "RIFE 4.9（速度优先）",
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "input_fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 0.01}),
+            "interpolation_multiplier": ("INT", {"default": 2, "min": 2, "max": 8}),
+            "vfi_model": (list(cls.MODEL_CHOICES), {"default": cls.MODEL_CHOICES[0]}),
+            "sr_frame_count": ("INT", {"default": 8, "min": 2, "max": 64,
+                                      "tooltip": "每批一次送入超分模型处理的帧数；越小越省显存。"}),
+            "sr_scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.05,
+                            "tooltip": "相对原视频分辨率的倍率；目标宽高会按源视频尺寸计算并对齐到 32 的倍数。"}),
+            "sr_quality": (["低", "中", "高", "最高"], {"default": "最高"}),
+        }, "optional": {
+            "frames": ("IMAGE",),
+            "video_source": ("H3_VIDEO_SOURCE",),
+            "enable_rtx_vsr": ("BOOLEAN", {"default": True, "tooltip": "开启后使用 NVIDIA RTX Video Super Resolution；失败时明确报错，不会静默产生低质量结果。"}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "FLOAT", "STRING", "INT")
+    RETURN_NAMES = ("超分补帧视频", "输出帧率", "处理信息", "超分处理帧数")
+    FUNCTION = "process"
+    CATEGORY = "H3 自动导演/视频工具"
+
+    @staticmethod
+    def _run_vfi(model_name, frames, multiplier):
+        mapping = getattr(nodes, "NODE_CLASS_MAPPINGS", {})
+        if model_name.startswith("AMT"):
+            cls = mapping.get("AMT VFI")
+            kwargs = {"ckpt_name": "amt-g.pth"}
+        elif model_name.startswith("GMFSS"):
+            cls = mapping.get("GMFSS Fortuna VFI")
+            kwargs = {"ckpt_name": "GMFSS_fortuna_union"}
+        else:
+            cls = mapping.get("RIFE VFI")
+            kwargs = {"ckpt_name": "rife49.pth", "fast_mode": True, "ensemble": False, "scale_factor": 1.0}
+        if cls is None:
+            raise RuntimeError("未找到视频补帧节点，请安装并启用 ComfyUI-Frame-Interpolation（AMT/GMFSS/RIFE）")
+        kwargs.update({"frames": frames, "clear_cache_after_n_frames": 1, "multiplier": int(multiplier)})
+        # VFI is an inference-only stage.  Explicitly disable autograd so a
+        # third-party interpolation node cannot retain computation graphs for
+        # every processed window.
+        with torch.inference_mode():
+            result = cls().vfi(**kwargs)
+        if not isinstance(result, (tuple, list)) or not result or not torch.is_tensor(result[0]):
+            raise RuntimeError("视频补帧节点返回了无效的 IMAGE")
+        return result[0].detach().cpu().contiguous()
+
+    def process(self, input_fps, interpolation_multiplier, vfi_model,
+                sr_frame_count, sr_scale, sr_quality, frames=None,
+                video_source=None, enable_rtx_vsr=True):
+        if video_source is not None:
+            if not isinstance(video_source, dict) or not video_source.get("path"):
+                raise ValueError("视频源句柄无效")
+            frames = H3AutoDirectorVideoLoad.decode_all(video_source.get("path"), int(sr_frame_count))
+        if not torch.is_tensor(frames) or frames.ndim not in (4, 5):
+            raise ValueError("视频超分补帧输入必须是 4/5 维 IMAGE")
+        flat, _restore = _flatten_video_frames(frames)
+        # Keep only the flattened view; retaining both names needlessly keeps
+        # an additional Python reference alive throughout the long operation.
+        del frames
+        if flat.shape[0] < 2:
+            raise ValueError("视频补帧至少需要 2 帧")
+        try:
+            multiplier_value = float(interpolation_multiplier)
+            multiplier = max(2, int(multiplier_value)) if math.isfinite(multiplier_value) else 2
+        except (TypeError, ValueError, OverflowError):
+            multiplier = 2
+        try:
+            source_fps_value = float(input_fps)
+            source_fps = max(1.0, source_fps_value) if math.isfinite(source_fps_value) else 24.0
+        except (TypeError, ValueError, OverflowError):
+            source_fps = 24.0
+        # VFI requires a pair of adjacent source frames.  A one-frame chunk
+        # cannot produce output until the next chunk arrives, so normalize the
+        # lower bound to two and avoid dropping the first frame at the stream
+        # boundary.
+        sr_frame_count = min(64, max(2, int(sr_frame_count)))
+        try:
+            scale = float(sr_scale)
+        except (TypeError, ValueError):
+            scale = 2.0
+        scale = min(4.0, max(1.0, scale)) if math.isfinite(scale) else 2.0
+        source_height, source_width = int(flat.shape[1]), int(flat.shape[2])
+        target_width = max(32, round(source_width * scale / 32) * 32)
+        target_height = max(32, round(source_height * scale / 32) * 32)
+        # Super-resolve source frames before VFI.  Keep this operation in small
+        # batches as a memory guard.  The VFI window below remains fixed and
+        # is intentionally not exposed as a user setting.
+        vfi_window_size = 8
+        # Process one super-resolution chunk directly into VFI windows.  The
+        # previous implementation accumulated every upscaled chunk in
+        # ``sr_frames``, then duplicated it with ``torch.cat`` and accumulated
+        # a second full copy in ``outputs``.  Long videos therefore consumed
+        # nearly all system RAM even though GPU tensors were released.  Keep
+        # only the source tensor (owned by the upstream graph), one chunk and
+        # one preallocated final output buffer.
+        source_total = int(flat.shape[0])
+        expected_output = max(1, (source_total - 1) * multiplier + 1)
+        result = None
+        written = 0
+        previous_tail = None
+        for chunk_start in range(0, source_total, sr_frame_count):
+            source_window = flat[chunk_start:min(source_total, chunk_start + sr_frame_count)].detach().cpu().contiguous()
+            if bool(enable_rtx_vsr):
+                upscaled = _upscale_rtx(source_window, target_width, target_height, str(sr_quality))
+            else:
+                upscaled = _upscale_interpolate(source_window, target_width, target_height)
+            del source_window
+            upscaled = upscaled.detach().cpu().contiguous()
+            # Share one source frame across super-resolution chunks.  The
+            # first generated frame of every chunk after the first is the
+            # shared boundary and is discarded below.
+            boundary_chunk = previous_tail is not None
+            if previous_tail is not None:
+                vfi_input = torch.cat((previous_tail, upscaled), dim=0)
+            else:
+                vfi_input = upscaled
+            previous_tail = upscaled[-1:].clone()
+            window_start = 0
+            input_total = int(vfi_input.shape[0])
+            while window_start < input_total - 1:
+                window_end = min(input_total, window_start + vfi_window_size)
+                window = vfi_input[window_start:window_end].detach().cpu().contiguous()
+                interpolated = self._run_vfi(vfi_model, window, multiplier).detach().cpu().contiguous()
+                drop_first = boundary_chunk or window_start > 0
+                if drop_first and interpolated.shape[0] > 0:
+                    interpolated = interpolated[1:]
+                if interpolated.shape[0] > 0:
+                    if result is None:
+                        result = torch.empty((expected_output, *interpolated.shape[1:]),
+                                             dtype=interpolated.dtype, device="cpu")
+                    count = min(int(interpolated.shape[0]), int(result.shape[0]) - written)
+                    if count > 0:
+                        result[written:written + count].copy_(interpolated[:count])
+                        written += count
+                del window, interpolated
+                window_start = window_end - 1
+                if window_end >= input_total:
+                    break
+            del vfi_input, upscaled
+            _release_video_memory()
+        if result is None or written < 1:
+            raise RuntimeError("超分补帧未产生有效输出帧")
+        # This is a view into the preallocated buffer; making it contiguous
+        # here would duplicate the entire output one more time.
+        result = result[:written]
+        total = source_total
+        out_fps = source_fps * multiplier
+        info = (f"模型={vfi_model}，输入={total}帧，输出={int(result.shape[0])}帧，"
+                f"源帧率={source_fps:.3f}，超分批大小={sr_frame_count}帧，输出帧率={out_fps:.3f}，"
+                f"原视频={source_width}x{source_height}，超分倍率={scale:.2f}x，"
+                f"输出={target_width}x{target_height}，VFI窗口=8，RTX VSR={'开启' if enable_rtx_vsr else '关闭'}")
+        LOG.info("H3 Auto Director: %s", info)
+        return (result, out_fps, info, int(sr_frame_count))
+
+
+class H3AutoDirectorVideoLoad:
+    """Load a video incrementally from disk into an IMAGE sequence.
+
+    Frames are decoded in small CPU batches and immediately released after
+    conversion.  This keeps decoder peak memory bounded and provides source
+    FPS/size metadata to the following nodes.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        # The path is an internal serialized value populated by the upload
+        # button.  It is hidden so the node exposes only a direct file upload
+        # control instead of a misleading directory/path text box.
+        return {"required": {
+            "video_path": ("STRING", {"default": "", "multiline": False, "hidden": True}),
+        }}
+
+    RETURN_TYPES = ("H3_VIDEO_SOURCE", "FLOAT", "INT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("视频源", "原视频帧率", "宽度", "高度", "总帧数", "视频信息")
+    FUNCTION = "load"
+    CATEGORY = "H3 自动导演/视频工具"
+
+    @staticmethod
+    def decode_all(video_path, decode_batch=8):
+        source = _direct_video_file(video_path)
+        container = av.open(str(source), "r")
+        chunks, window = [], []
+        try:
+            streams = tuple(container.streams.video)
+            if not streams:
+                raise ValueError("输入文件不包含视频流")
+            stream = streams[0]
+            width = int(getattr(stream, "width", 0) or getattr(stream.codec_context, "width", 0) or 0)
+            height = int(getattr(stream, "height", 0) or getattr(stream.codec_context, "height", 0) or 0)
+            expected = int(getattr(stream, "frames", 0) or 0)
+            # PyAV usually exposes an exact frame count for regular video
+            # files.  Preallocate once in that case instead of retaining a
+            # list of chunks and duplicating the whole source in torch.cat.
+            preallocated = torch.empty((expected, height, width, 3), dtype=torch.float32) if expected > 0 and width > 0 and height > 0 else None
+            decoded = 0
+            for frame in container.decode(stream):
+                image = torch.from_numpy(frame.to_ndarray(format="rgb24")).float().div_(255.0)
+                if preallocated is not None and decoded < preallocated.shape[0]:
+                    preallocated[decoded].copy_(image)
+                else:
+                    window.append(image)
+                    if len(window) >= max(1, int(decode_batch)):
+                        chunks.append(torch.stack(window, dim=0)); window.clear()
+                decoded += 1
+            if preallocated is not None and decoded > 0:
+                if decoded <= preallocated.shape[0]:
+                    return preallocated[:decoded].contiguous()
+                # A malformed stream reported too few frames; retain the
+                # overflow frames through the normal chunk fallback.
+                chunks.insert(0, preallocated)
+            if window: chunks.append(torch.stack(window, dim=0))
+            if not chunks: raise ValueError("输入视频没有可解码帧")
+            return torch.cat(chunks, dim=0).contiguous()
+        finally:
+            container.close(); gc.collect()
+
+    def load(self, video_path):
+        if av is None:
+            raise RuntimeError("加载视频需要 PyAV；请安装 av 后重启 ComfyUI")
+        source = _direct_video_file(video_path)
+        try:
+            container = av.open(str(source), "r")
+        except Exception as exc:
+            raise RuntimeError("无法读取输入视频：%s" % source) from exc
+        try:
+            streams = tuple(container.streams.video)
+            if not streams:
+                raise ValueError("输入文件不包含视频流")
+            stream = streams[0]
+            rate = stream.average_rate or stream.base_rate
+            fps = float(rate) if rate is not None and float(rate) > 0 else 24.0
+            width = int(getattr(stream, "width", 0) or getattr(stream.codec_context, "width", 0) or 0)
+            height = int(getattr(stream, "height", 0) or getattr(stream.codec_context, "height", 0) or 0)
+            total = int(getattr(stream, "frames", 0) or 0)
+            info = f"{source} | {width}x{height} | {fps:.3f} FPS | {total or '未知'} 帧"
+            LOG.info("H3 Auto Director: 加载视频 %s", info)
+            return ({"path": str(source), "fps": fps, "width": width, "height": height, "frames": total}, fps, width, height, total, info)
+        finally:
+            container.close()
+            gc.collect()
+
+
+class H3AutoDirectorVideoSave:
+    """Stream an IMAGE sequence to ffmpeg without making an extra copy."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "frames": ("IMAGE",),
+            "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 0.01}),
+            "filename": ("STRING", {"default": "H3_video.mp4", "multiline": False}),
+        }, "optional": {
+            "sr_frame_count": ("INT", {"default": 8, "min": 1, "max": 64,
+                                             "tooltip": "由超分补帧节点输出的超分处理帧数；未连接时使用 8。"}),
+        }}
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("已保存视频", "保存信息")
+    FUNCTION = "save"
+    CATEGORY = "H3 自动导演/视频工具"
+    OUTPUT_NODE = True
+
+    def save(self, frames, fps=24.0, filename="H3_video.mp4", sr_frame_count=8):
+        if not torch.is_tensor(frames) or frames.ndim not in (4, 5):
+            raise ValueError("保存视频输入必须是 4/5 维 IMAGE")
+        flat, _ = _flatten_video_frames(frames)
+        if flat.shape[0] < 1:
+            raise ValueError("没有可保存的视频帧")
+        ffmpeg = _find_ffmpeg()
+        if not ffmpeg:
+            raise RuntimeError("未找到 ffmpeg，无法保存视频")
+        clean = re.sub(r"[^A-Za-z0-9._-]+", "_", str(filename or "H3_video.mp4").strip()).strip("._") or "H3_video.mp4"
+        if not Path(clean).suffix:
+            clean += ".mp4"
+        output = _output_root() / "h3_video_tools" / clean
+        output.parent.mkdir(parents=True, exist_ok=True)
+        height, width = int(flat.shape[1]), int(flat.shape[2])
+        command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
+                   "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", f"{float(fps):.8f}",
+                   "-i", "pipe:0", "-c:v", "libx264", "-crf", "16", "-preset", "slow",
+                   "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)]
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        chunk = max(1, int(sr_frame_count))
+        try:
+            for start in range(0, int(flat.shape[0]), chunk):
+                data = flat[start:start + chunk].detach().cpu().clamp(0, 1).mul(255).round().byte().numpy()[..., :3]
+                process.stdin.write(data.tobytes())
+                del data
+            process.stdin.close()
+            stderr = process.stderr.read().decode(errors="replace")
+            if process.wait(timeout=600) != 0:
+                raise RuntimeError(stderr[-2000:] or "ffmpeg 编码失败")
+        except Exception:
+            if process.poll() is None:
+                process.terminate()
+            output.unlink(missing_ok=True)
+            raise
+        info = f"{output} | {int(flat.shape[0])} 帧 | {float(fps):.3f} FPS | 编码块={chunk}"
+        LOG.info("H3 Auto Director: 保存视频 %s", info)
+        return (str(output), info)
+
+
+class H3AutoDirectorStreamingVideoSRVFI:
+    """Disk-to-disk RTX VSR and VFI processing for long videos.
+
+    Unlike an IMAGE based graph, this node never creates a tensor containing
+    the full source or output video.  PyAV decodes a small overlapping source
+    window, the VFI model returns that window, RTX VSR processes it one frame
+    at a time, and ffmpeg immediately encodes the result to disk.
+    """
+
+    MODEL_CHOICES = H3AutoDirectorVideoSRVFI.MODEL_CHOICES
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "video_path": ("STRING", {"default": "", "multiline": False, "hidden": True}),
+            "interpolation_multiplier": ("INT", {"default": 2, "min": 2, "max": 8}),
+            "vfi_model": (list(cls.MODEL_CHOICES), {"default": cls.MODEL_CHOICES[0]}),
+            "chunk_size": ("INT", {"default": 8, "min": 2, "max": 64,
+                            "tooltip": "单次解码/补帧的源帧数；4 更省显存，8 是推荐默认值。"}),
+            "sr_scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.05,
+                            "tooltip": "相对原视频分辨率的倍率；目标宽高按源视频尺寸计算并对齐到 32 的倍数。"}),
+            "sr_quality": (["低", "中", "高", "最高"], {"default": "最高"}),
+            "filename_prefix": ("STRING", {"default": "H3_Video_SR_VFI"}),
+            "preserve_audio": ("BOOLEAN", {"default": True,
+                                "tooltip": "从源视频读取并重新封装音轨；不会把音频载入 PyTorch。"}),
+        }, "optional": {
+            "enable_rtx_vsr": ("BOOLEAN", {"default": True,
+                               "tooltip": "开启后必须使用 NVIDIA RTX Video Super Resolution；未安装 nvvfx 时会明确报错。"}),
+        }}
+
+    RETURN_TYPES = ("STRING", "FLOAT", "STRING")
+    RETURN_NAMES = ("已保存视频", "输出帧率", "处理信息")
+    FUNCTION = "process"
+    CATEGORY = "H3 自动导演/视频工具"
+    OUTPUT_NODE = True
+
+    @staticmethod
+    def _output_path(prefix):
+        clean = re.sub(r"[^A-Za-z0-9._-]+", "_", str(prefix or "H3_Video_SR_VFI").strip()).strip("._")
+        clean = clean or "H3_Video_SR_VFI"
+        directory = _output_root() / "h3_video_tools"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"{clean}_{uuid.uuid4().hex[:8]}.mp4"
+
+    @staticmethod
+    def _encoder_command(ffmpeg, output, source, width, height, fps, preserve_audio):
+        # The output duration is unchanged by interpolation: only its frame
+        # rate rises.  Re-encode optional source audio so uncommon input audio
+        # codecs cannot make an otherwise successful video encode fail.
+        command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
+                   "-r", f"{fps:.8f}", "-i", "pipe:0"]
+        if preserve_audio:
+            command.extend(["-i", str(source), "-map", "0:v:0", "-map", "1:a?"])
+        else:
+            command.extend(["-map", "0:v:0", "-an"])
+        command.extend(["-c:v", "libx264", "-crf", "16", "-preset", "slow", "-pix_fmt", "yuv420p"])
+        if preserve_audio:
+            command.extend(["-c:a", "aac", "-b:a", "192k", "-shortest"])
+        command.extend(["-movflags", "+faststart", "-f", "mp4", str(output)])
+        return command
+
+    @staticmethod
+    def _write_chunk(process, images):
+        if images.numel() == 0:
+            return 0
+        rgb = images.detach().cpu().clamp(0, 1).mul(255).round().byte().numpy()[..., :3]
+        try:
+            process.stdin.write(rgb.tobytes())
+        except (BrokenPipeError, OSError) as exc:
+            raise RuntimeError("ffmpeg 视频编码进程提前结束") from exc
+        return int(rgb.shape[0])
+
+    def process(self, video_path, interpolation_multiplier, vfi_model, chunk_size,
+                sr_scale, sr_quality, filename_prefix, preserve_audio,
+                enable_rtx_vsr=True):
+        if av is None:
+            raise RuntimeError("流式视频超分补帧需要 PyAV；请安装 av 后重启 ComfyUI")
+        source = _direct_video_file(video_path)
+        ffmpeg = _find_ffmpeg()
+        if not ffmpeg:
+            raise RuntimeError("未找到 ffmpeg，无法流式写入超分补帧视频。请设置 FFMPEG_PATH 或安装 imageio-ffmpeg。")
+        chunk_size = max(2, int(chunk_size))
+        multiplier = max(2, int(interpolation_multiplier))
+        output = self._output_path(filename_prefix)
+
+        try:
+            container = av.open(str(source), "r")
+        except Exception as exc:
+            raise RuntimeError("无法读取输入视频：%s" % exc) from exc
+        encode_process = None
+        source_frames = 0
+        output_frames = 0
+        try:
+            streams = tuple(container.streams.video)
+            if not streams:
+                raise RuntimeError("输入文件不包含视频流")
+            stream = streams[0]
+            source_width = int(getattr(stream, "width", 0) or getattr(stream.codec_context, "width", 0) or 0)
+            source_height = int(getattr(stream, "height", 0) or getattr(stream.codec_context, "height", 0) or 0)
+            if source_width < 1 or source_height < 1:
+                raise RuntimeError("无法读取输入视频分辨率")
+            try:
+                scale = float(sr_scale)
+            except (TypeError, ValueError):
+                scale = 2.0
+            scale = min(4.0, max(1.0, scale))
+            target_width = max(32, round(source_width * scale / 32) * 32)
+            target_height = max(32, round(source_height * scale / 32) * 32)
+            rate = stream.average_rate or stream.base_rate
+            if rate is None or float(rate) <= 0:
+                raise RuntimeError("无法读取输入视频帧率")
+            input_fps = float(rate)
+            output_fps = input_fps * multiplier
+            encode_process = subprocess.Popen(
+                self._encoder_command(ffmpeg, output, source, target_width, target_height,
+                                      output_fps, bool(preserve_audio)),
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+            window = []
+            has_previous_window = False
+            for frame in container.decode(stream):
+                # The decoded RGB frame lives only until its small overlapping
+                # VFI window has been written to ffmpeg.
+                window.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).float().div_(255.0))
+                source_frames += 1
+                if len(window) < chunk_size:
+                    continue
+                interpolated = H3AutoDirectorVideoSRVFI._run_vfi(
+                    vfi_model, torch.stack(window, dim=0), multiplier)
+                if bool(enable_rtx_vsr):
+                    interpolated = _upscale_rtx(interpolated, target_width, target_height, str(sr_quality))
+                else:
+                    interpolated = _upscale_interpolate(interpolated, target_width, target_height)
+                if has_previous_window:
+                    interpolated = interpolated[1:]
+                output_frames += self._write_chunk(encode_process, interpolated)
+                # Adjacent windows share exactly one source frame, preserving
+                # all VFI intervals while avoiding a duplicate output frame.
+                window = [window[-1]]
+                has_previous_window = True
+                del interpolated
+                _release_video_memory()
+            if len(window) >= 2:
+                interpolated = H3AutoDirectorVideoSRVFI._run_vfi(
+                    vfi_model, torch.stack(window, dim=0), multiplier)
+                if bool(enable_rtx_vsr):
+                    interpolated = _upscale_rtx(interpolated, target_width, target_height, str(sr_quality))
+                else:
+                    interpolated = _upscale_interpolate(interpolated, target_width, target_height)
+                if has_previous_window:
+                    interpolated = interpolated[1:]
+                output_frames += self._write_chunk(encode_process, interpolated)
+                del interpolated
+                _release_video_memory()
+            if source_frames < 2:
+                raise ValueError("视频补帧至少需要 2 帧")
+            encode_process.stdin.close()
+            stderr = encode_process.stderr.read().decode(errors="replace")
+            if encode_process.wait(timeout=600) != 0:
+                raise RuntimeError(stderr[-2000:] or "ffmpeg 编码失败")
+            if not output.is_file() or output.stat().st_size == 0:
+                raise RuntimeError("ffmpeg 没有写出有效视频文件")
+            info = (f"模型={vfi_model}，输入={source_frames}帧，输出={output_frames}帧，"
+                    f"帧率={output_fps:.3f}，原视频={source_width}x{source_height}，超分倍率={scale:.2f}x，"
+                    f"输出={target_width}x{target_height}，分块={chunk_size}，RTX VSR={'开启' if enable_rtx_vsr else '关闭'}，"
+                    f"文件={output}")
+            LOG.info("H3 Auto Director: %s", info)
+            return (str(output), output_fps, info)
+        except Exception:
+            if encode_process is not None and encode_process.poll() is None:
+                try:
+                    encode_process.stdin.close()
+                except Exception:
+                    pass
+                encode_process.terminate()
+                try:
+                    encode_process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    encode_process.kill()
+            output.unlink(missing_ok=True)
+            raise
+        finally:
+            container.close()
+            _release_video_memory()
 
 
 class H3AutoDirectorResolution:
@@ -1777,7 +2438,8 @@ class H3AutoDirectorResolution:
             "custom_ratio": ("STRING", {"default": "16,9", "tooltip": "输入宽,高；支持英文逗号或中文逗号，例如 16,9 或 9，16"}),
             "stage1_megapixels": ("FLOAT", {"default": 0.4, "min": 0.2, "max": 5.0, "step": 0.01}),
             "stage2_megapixels": ("FLOAT", {"default": 0.98, "min": 0.2, "max": 5.0, "step": 0.01}),
-            "multiple": ("INT", {"default": 32, "min": 16, "max": 128, "step": 16}),
+            "multiple": ("INT", {"default": 32, "min": 32, "max": 128, "step": 32,
+                                  "tooltip": "H3 画布必须是 32 的倍数；旧工作流中的更小值会自动规范化。"}),
         }}
 
     RETURN_TYPES = ("INT", "INT", "INT", "INT", "STRING")
@@ -1793,9 +2455,18 @@ class H3AutoDirectorResolution:
         target_pixels = float(megapixels) * 1024 * 1024
         width = math.sqrt(target_pixels * ratio)
         height = width / ratio
-        multiple = max(1, int(multiple))
+        # MiniMax H3's canvas and packed latent grid are defined on a 32px
+        # spatial multiple.  Older versions of this node exposed 16/24px
+        # choices; those values produced dimensions that were silently
+        # truncated by _empty_av_latent(), making the user's resolution look
+        # ineffective.  Keep the widget backwards compatible but canonicalize
+        # every result to the core H3 multiple here.
+        h3_multiple = int(getattr(_minimax_h3, "CANVAS_MULTIPLE", 32) or 32)
+        multiple = max(h3_multiple, int(multiple))
+        multiple = max(h3_multiple, (multiple // h3_multiple) * h3_multiple)
         width = max(multiple, int(round(width / multiple)) * multiple)
         height = max(multiple, int(round(height / multiple)) * multiple)
+        width, height = _h3_canvas_dimensions(width, height)
         max_dimension = max(multiple, int(getattr(nodes, "MAX_RESOLUTION", 16384)) // multiple * multiple)
         if max(width, height) > max_dimension:
             scale = max_dimension / max(width, height)
@@ -1834,6 +2505,11 @@ class H3AutoDirectorResolution:
         preview = (
             f"第一阶段：{first_width} x {first_height}（{first_width * first_height / 1_000_000:.2f} MP） | "
             f"第二阶段：{second_width} x {second_height}（{second_width * second_height / 1_000_000:.2f} MP） | {ratio_label}"
+        )
+        LOG.info(
+            "H3 Auto Director: 分辨率计算 ratio=%s stage1=%dx%d stage2=%dx%d (输入 MP=%.3f/%.3f, multiple=%d)",
+            ratio_label, first_width, first_height, second_width, second_height,
+            float(stage1_megapixels), float(stage2_megapixels), int(multiple),
         )
         return (first_width, first_height, second_width, second_height, preview)
 
@@ -1885,11 +2561,15 @@ class H3AutoDirectorDualSampling:
             "stage2_end_at_sigma": ("FLOAT", {"default": 12.0, "min": 0.0, "max": 20000.0, "step": 0.01, "round": False}),
             "stage2_spacing": (["linear", "cosine", "sine"], {"default": "linear"}),
         }, "optional": {
+            "plan": ("H3_AUTO_PLAN", {"tooltip": "可选。连接项目计划后，开启统一解码时会在所有片段采样完成前禁止任何视频/音频解码。"}),
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
             "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’的采样调度信息；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
             "stage1_sigmas": ("SIGMAS", {"tooltip": "可选。一采使用的完整 Sigmas 调度；连接后优先于一采步数、降噪和调度器。"}),
             "stage2_sigmas": ("SIGMAS", {"tooltip": "可选。二采使用的完整 Sigmas 调度；连接后优先于二采步数、降噪和调度器。"}),
+            "stage2_conditioning": ("CONDITIONING", {"tooltip": "可选。二采专用正向条件；未连接时复用一采条件。"}),
+            "stage2_context_latent": ("LATENT", {"tooltip": "可选。二采上下文潜变量；仅在开启二采上下文时使用。"}),
+            "control_config": ("H3_CONTROL_CONFIG", {"tooltip": "可选。连接统一姿态/深度控制节点；控制视频路径与独立权重会传入采样条件。"}),
         }}
 
     RETURN_TYPES = ("LATENT", "LATENT", "IMAGE", "IMAGE")
@@ -1907,12 +2587,19 @@ class H3AutoDirectorDualSampling:
                stage1_extend_sigmas=False, stage1_extend_steps=2, stage1_start_at_sigma=-1.0,
                stage1_end_at_sigma=12.0, stage1_spacing="linear", stage2_extend_sigmas=False,
                stage2_extend_steps=2, stage2_start_at_sigma=-1.0, stage2_end_at_sigma=12.0,
-               stage2_spacing="linear", **_legacy_unused):
+               stage2_spacing="linear", control_config=None, plan=None, **_legacy_unused):
         global _LAST_STAGE1_CONTEXT
+        deferred_decode = bool(isinstance(plan, dict) and plan.get("decode_after_all_segments", False))
         if stage1_model is None:
             stage1_model = _legacy_unused.get("model")
         if stage1_model is None:
             raise ValueError("一采模型未连接：请将模型加载器或外部模型补丁链连接到双采样的一采模型输入")
+        input_parts = _av_latent_parts(latent)
+        if input_parts is not None and torch.is_tensor(input_parts[0]) and input_parts[0].ndim >= 5:
+            input_h = int(input_parts[0].shape[-2]) * 16
+            input_w = int(input_parts[0].shape[-1]) * 16
+            LOG.info("H3 Auto Director: 一采输入 latent 网格=%dx%d（%.3f MP）",
+                     input_w, input_h, input_w * input_h / 1_000_000)
         # A direct connection from the audio switch's SIGMAS socket is an
         # alternative to its metadata socket.  It still applies the embedded
         # video/audio shifts, but must not replace the stage's full schedule
@@ -1922,6 +2609,7 @@ class H3AutoDirectorDualSampling:
                 _audio_sampling_from_base_sigmas(stage1_sigmas)
                 or _audio_sampling_from_base_sigmas(stage2_sigmas)
             )
+        conditioning = _attach_union_control_conditioning(conditioning, control_config)
         stage1_conditioning = _prepare_dual_sampling_conditioning(conditioning)
         first_model = _apply_audio_sampling_config(stage1_model, audio_sampling, "一采模型")
         second_source_model = stage2_model or stage1_model
@@ -1948,29 +2636,32 @@ class H3AutoDirectorDualSampling:
             if stage1_parts is None:
                 raise ValueError("一采音频选项需要 H3 联合 AV latent")
             stage1_audio_latent = _normalize_h3_audio_latent(stage1_parts[1], "一采音频 latent")
-            stage1_waveform, stage1_sample_rate = _decode_h3_audio(audio_vae, stage1_audio_latent)
-            stage1_audio_override = {
-                "waveform": stage1_waveform.detach().cpu().contiguous(),
-                "sample_rate": int(stage1_sample_rate),
-            }
-            # Also expose it on the first-stage return for graphs that save
-            # that branch explicitly instead of using the final branch.
-            first["_h3_stage1_audio"] = stage1_audio_override
-            first_output["_h3_stage1_audio"] = stage1_audio_override
+            if not deferred_decode:
+                stage1_waveform, stage1_sample_rate = _decode_h3_audio(audio_vae, stage1_audio_latent)
+                stage1_audio_override = {
+                    "waveform": stage1_waveform.detach().cpu().contiguous(),
+                    "sample_rate": int(stage1_sample_rate),
+                }
+                # Also expose it on the first-stage return for graphs that save
+                # that branch explicitly instead of using the final branch.
+                first["_h3_stage1_audio"] = stage1_audio_override
+                first_output["_h3_stage1_audio"] = stage1_audio_override
         if not bool(enable_stage2):
             # Preserve the output contract without paying for decode/upscale.
             # The empty IMAGE is deliberately inert; the final AV latent is
             # the first-stage result and remains compatible with AV Decode.
             empty_preview = torch.empty((0, 1, 1, 3), dtype=torch.float32)
-            first_images = _decode_h3_video(video_vae, _av_latent_parts(first)[0])
+            first_images = (torch.empty((0, 1, 1, 3), dtype=torch.float32)
+                            if deferred_decode else _decode_h3_video(video_vae, _av_latent_parts(first)[0]))
             return (first_output, first, empty_preview, first_images)
         parts = _av_latent_parts(first)
         if parts is None:
             raise ValueError("双采样仅支持 MiniMax H3 联合 AV latent")
         first_video, first_audio = parts
-        decoded = _decode_h3_video(video_vae, first_video)
-        width = max(32, int(target_width) // 32 * 32)
-        height = max(32, int(target_height) // 32 * 32)
+        decoded = None if deferred_decode else _decode_h3_video(video_vae, first_video)
+        width, height = _h3_canvas_dimensions(target_width, target_height)
+        LOG.info("H3 Auto Director: 二采目标画布=%dx%d（%.3f MP）",
+                 width, height, width * height / 1_000_000)
         target_latent_size = (max(1, height // 16), max(1, width // 16))
         first_latent_size = (int(first_video.shape[-2]), int(first_video.shape[-1]))
         if first_latent_size == target_latent_size:
@@ -1978,7 +2669,8 @@ class H3AutoDirectorDualSampling:
             # only add reconstruction loss.  Keep the first-pass video latent
             # byte-for-byte and decode it only for the preview output.
             encoded_video = first_video
-            preview = decoded
+            preview = (torch.empty((0, 1, 1, 3), dtype=torch.float32)
+                       if deferred_decode else decoded)
             LOG.info(
                 "H3 Auto Director: 一采/二采分辨率相同（latent=%s），跳过放大与视频 VAE 重编码",
                 first_latent_size,
@@ -1993,19 +2685,28 @@ class H3AutoDirectorDualSampling:
                     first_video, latent_upscale_model,
                     target_latent_size[0], target_latent_size[1],
                     latent_upscale_device, latent_upscale_precision)
-                preview = _decode_h3_video(video_vae, encoded_video)
+                preview = (torch.empty((0, 1, 1, 3), dtype=torch.float32)
+                           if deferred_decode else _decode_h3_video(video_vae, encoded_video))
             elif mode == "RTX Video Super Resolution":
+                if deferred_decode:
+                    raise RuntimeError("统一解码模式下不能使用 RTX 视频放大：请改用 H3 Latent 学习型放大或在一采/二采使用相同分辨率")
                 preview = _upscale_rtx(decoded, width, height, "高")
             elif mode == "普通放大模型":
+                if deferred_decode:
+                    raise RuntimeError("统一解码模式下不能使用普通视频放大模型：请改用 H3 Latent 学习型放大或关闭统一解码")
                 preview = _upscale_with_model(upscale_model, decoded)
                 preview = _upscale_interpolate(preview, width, height)
             elif mode == "自动（RTX→普通模型→插值）":
+                if deferred_decode:
+                    raise RuntimeError("统一解码模式下不能使用视频放大链：请改用 H3 Latent 学习型放大或关闭统一解码")
                 try:
                     preview = _upscale_rtx(decoded, width, height, "高")
                 except Exception:
                     preview = _upscale_with_model(upscale_model, decoded) if upscale_model else decoded
                     preview = _upscale_interpolate(preview, width, height)
             else:
+                if deferred_decode:
+                    raise RuntimeError("统一解码模式下不能使用像素插值放大：请改用 H3 Latent 学习型放大或关闭统一解码")
                 preview = _upscale_interpolate(decoded, width, height)
             # Some VAE/upscaler combinations round the temporal dimension while
             # processing a video.  Restore H3's exact 17k+5 frame count before
@@ -2015,7 +2716,6 @@ class H3AutoDirectorDualSampling:
             if mode != "H3 Latent 学习型放大":
                 encoded_video = _encode_h3_video(video_vae, preview)
                 encoded_video = _match_latent_time(encoded_video, first_video.shape[2])
-        import comfy.nested_tensor
         # The two branches can be returned on different devices/dtypes by
         # custom VAEs.  Normalize audio before rebuilding H3's AV container.
         # Keep the H3 audio stream in its native latent layout.  Casting an
@@ -2024,7 +2724,12 @@ class H3AutoDirectorDualSampling:
         first_audio = _normalize_h3_audio_latent(first_audio, "第一阶段音频 latent")
         first_audio = first_audio.to(device=encoded_video.device)
         refined = dict(first)
-        refined["samples"] = comfy.nested_tensor.NestedTensor((encoded_video, first_audio))
+        refined["samples"] = _h3_av_container(encoded_video, first_audio)
+        # Context sampled-noise masking belongs only to the first pass. The
+        # second pass starts from the completed first-pass latent and must not
+        # reapply its prefix mask at a different spatial resolution.
+        refined.pop("noise_mask", None)
+        refined.pop("h3_auto_director_sampled_context", None)
         # Retain text and user references, but remove the project continuation
         # injected for stage one unless the user explicitly asks to apply it
         # again during refinement. This also applies to a separately connected
@@ -2043,6 +2748,7 @@ class H3AutoDirectorDualSampling:
             stage2_conditioning if _has_positive_conditioning(stage2_conditioning)
             else conditioning
         )
+        stage2_input_conditioning = _attach_union_control_conditioning(stage2_input_conditioning, control_config)
         final_conditioning = _prepare_stage2_conditioning(
             stage2_input_conditioning, refined, stage2_use_context, stage2_source
         )
@@ -2068,8 +2774,7 @@ class H3AutoDirectorDualSampling:
             final_audio = _normalize_h3_audio_latent(first_audio, "一采音频 latent")
             final_audio = final_audio.to(device=final_parts[0].device)
             final = dict(final)
-            import comfy.nested_tensor
-            final["samples"] = comfy.nested_tensor.NestedTensor((final_parts[0], final_audio))
+            final["samples"] = _h3_av_container(final_parts[0], final_audio)
             if stage1_audio_override is None:
                 raise RuntimeError("一采音频已启用，但未生成音频覆盖数据")
             final["_h3_stage1_audio"] = stage1_audio_override
@@ -2126,6 +2831,9 @@ class H3AutoDirectorDualSamplingModel:
             "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’的采样调度信息；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
             "stage1_sigmas": ("SIGMAS", {"tooltip": "可选。一采使用的完整 Sigmas 调度；连接后优先于一采步数、降噪和调度器。"}),
             "stage2_sigmas": ("SIGMAS", {"tooltip": "可选。二采使用的完整 Sigmas 调度；连接后优先于二采步数、降噪和调度器。"}),
+            "stage2_conditioning": ("CONDITIONING", {"tooltip": "可选。二采专用正向条件；未连接时复用一采条件。"}),
+            "stage2_context_latent": ("LATENT", {"tooltip": "可选。二采上下文潜变量；仅在开启二采上下文时使用。"}),
+            "control_config": ("H3_CONTROL_CONFIG", {"tooltip": "可选。连接统一姿态/深度控制节点；控制视频路径与独立权重会传入采样条件。"}),
         }}
         return base
 
@@ -2144,7 +2852,7 @@ class H3AutoDirectorDualSamplingModel:
                stage1_extend_sigmas=False, stage1_extend_steps=2, stage1_start_at_sigma=-1.0,
                stage1_end_at_sigma=12.0, stage1_spacing="linear", stage2_extend_sigmas=False,
                stage2_extend_steps=2, stage2_start_at_sigma=-1.0, stage2_end_at_sigma=12.0,
-               stage2_spacing="linear", **_legacy_unused):
+               stage2_spacing="linear", control_config=None, **_legacy_unused):
         return H3AutoDirectorDualSampling().sample(
         stage1_model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
             stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
@@ -2154,7 +2862,7 @@ class H3AutoDirectorDualSamplingModel:
             latent_upscale_precision, stage2_model, audio_sampling, stage1_sigmas, stage2_sigmas,
             stage1_extend_sigmas, stage1_extend_steps, stage1_start_at_sigma, stage1_end_at_sigma,
             stage1_spacing, stage2_extend_sigmas, stage2_extend_steps, stage2_start_at_sigma,
-            stage2_end_at_sigma, stage2_spacing)
+            stage2_end_at_sigma, stage2_spacing, control_config=control_config)
 
 
 def _validate_reference_limits(refs, label="参考素材"):
@@ -2193,6 +2901,8 @@ class H3AutoDirectorPlan:
             "auto_run": ("BOOLEAN", {"default": True}),
             "continuation_mode": ("BOOLEAN", {"default": True, "tooltip": "默认允许后续片段使用视频上下文；每段可单独关闭"}),
             "cache_prompt_embeddings": ("BOOLEAN", {"default": False, "tooltip": "首次执行时一次性编码并缓存全部片段的多模态提示词向量"}),
+            "decode_after_all_segments": ("BOOLEAN", {"default": False,
+                "tooltip": "开启后先缓存每段最终 AV latent，全部采样完成后统一解码、裁剪并拼接；视频上下文会自动改为缓存潜空间直取。"}),
             "output_root": ("STRING", {"default": "h3_projects", "tooltip": "项目文件夹名称；新路径为 output/h3_project/<此名称>"}),
             "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": False, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
         }, "optional": {
@@ -2206,7 +2916,7 @@ class H3AutoDirectorPlan:
     FUNCTION = "create"
     CATEGORY = "H3 自动导演"
 
-    def create(self, project_id, segments_json, duration, global_reference_set, auto_run, continuation_mode=True, cache_prompt_embeddings=False, output_root="h3_projects", cache_prompt_embeddings_to_disk=False, global_assets_json="[]", auto_context_crop_frames=0, project_dir="", **_legacy_inputs):
+    def create(self, project_id, segments_json, duration, global_reference_set, auto_run, continuation_mode=True, cache_prompt_embeddings=False, decode_after_all_segments=False, output_root="h3_projects", cache_prompt_embeddings_to_disk=False, global_assets_json="[]", auto_context_crop_frames=0, project_dir="", **_legacy_inputs):
         try:
             segments = json.loads(segments_json)
             assets = json.loads(global_assets_json or "[]")
@@ -2284,6 +2994,7 @@ class H3AutoDirectorPlan:
                 "duration": float(duration), "global_reference_set": bool(global_reference_set),
                 "auto_run": bool(auto_run), "continuation_mode": bool(continuation_mode),
                 "cache_prompt_embeddings": bool(cache_prompt_embeddings),
+                "decode_after_all_segments": bool(decode_after_all_segments),
                 "cache_prompt_embeddings_to_disk": bool(cache_prompt_embeddings_to_disk),
                 "auto_context_crop_frames": int(auto_context_crop_frames),
                 "global_assets": assets, "segments": normalized,
@@ -2579,6 +3290,472 @@ class H3AutoDirectorVideoTransferPlan:
         state.setdefault("segments", {})
         _atomic_json(directory / "json" / "state.json", state)
         return (plan,)
+
+
+CONTROL_MODES = ("关闭", "姿态", "深度", "姿态+深度")
+
+
+def _control_image_result(result):
+    """Normalize ControlNet-Aux node return values to an IMAGE tensor."""
+    if isinstance(result, dict):
+        result = result.get("result", ())
+    if isinstance(result, (list, tuple)):
+        result = result[0] if result else None
+    if not torch.is_tensor(result) or result.ndim != 4:
+        raise ValueError("控制预处理器没有输出 [帧,高,宽,RGB] 图像序列")
+    if result.shape[-1] == 1:
+        result = result.repeat(1, 1, 1, 3)
+    if result.shape[-1] < 3:
+        raise ValueError("控制预处理器输出通道数不足")
+    return result[..., :3].float().clamp(0, 1).contiguous()
+
+
+def _align_control_frames(images):
+    """Align a control batch to the H3 17*n+5 temporal grid by tail repeat."""
+    count = int(images.shape[0])
+    if count < 5:
+        raise ValueError("H3 控制视频至少需要 5 帧")
+    aligned = _align_frames(count)
+    if count < aligned:
+        images = torch.cat((images, images[-1:].repeat((aligned - count, 1, 1, 1))), dim=0)
+    return images[:aligned], aligned
+
+
+def _control_cache_dir(plan, segment_index):
+    """Return the per-project directory for persisted control frames."""
+    if not isinstance(plan, dict) or not plan.get("project_dir"):
+        return None
+    directory = Path(plan["project_dir"]) / "control" / ("segment_%04d" % int(segment_index))
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _control_cache_paths(plan, segment_index, kind):
+    directory = _control_cache_dir(plan, segment_index)
+    if directory is None:
+        return None, None
+    return directory / ("%s.pt" % kind), directory / ("%s.mp4" % kind)
+
+
+def _load_control_tensor(path):
+    if not path or not Path(path).is_file():
+        return None
+    try:
+        value = torch.load(str(path), map_location="cpu", weights_only=True)
+    except TypeError:
+        value = torch.load(str(path), map_location="cpu")
+    except Exception as exc:
+        LOG.warning("H3 Auto Director: 控制帧缓存读取失败，将重新预处理：%s", exc)
+        return None
+    if not torch.is_tensor(value) or value.ndim != 4:
+        return None
+    return value.float().clamp(0, 1).contiguous()
+
+
+def _save_control_tensor(path, images):
+    if path is None:
+        return
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(images.detach().float().cpu().contiguous(), str(temporary))
+    temporary.replace(path)
+
+
+def _control_mode_has_pose(mode):
+    return str(mode or "").strip() in {"姿态", "姿态+深度", "pose", "pose+depth"}
+
+
+def _control_mode_has_depth(mode):
+    return str(mode or "").strip() in {"深度", "姿态+深度", "depth", "pose+depth"}
+
+
+def _control_frames_for_segment(plan, segment_index, video_frames):
+    """Slice a full reference-video IMAGE batch to one transfer segment.
+
+    When a caller already supplies a segment-sized batch, it is returned as-is.
+    This lets the node work with either a normal video loader or the plan-only
+    automatic loader without duplicating a source video in the graph.
+    """
+    frames = video_frames
+    if not isinstance(plan, dict) or str(plan.get("mode", "")) != "video_transfer":
+        return frames
+    try:
+        segment = _segment(plan, max(1, int(segment_index)))
+        transfer = next(item for item in segment.get("references", [])
+                        if isinstance(item, dict) and item.get("type") == "transfer_video_segment")
+    except Exception:
+        return frames
+    start = max(0, int(transfer.get("start_frame", 0)))
+    source = max(1, int(transfer.get("source_frames", transfer.get("reference_frames", 1))))
+    aligned = max(source, int(transfer.get("reference_frames", source)))
+    count = int(frames.shape[0])
+    if start > 0 and count >= start + source:
+        return frames[start:start + source]
+    if start == 0 and count > aligned:
+        return frames[:source]
+    return frames
+
+
+def _load_transfer_source_frames(plan, segment_index):
+    segment = _segment(plan, max(1, int(segment_index)))
+    transfer = next((item for item in segment.get("references", [])
+                     if isinstance(item, dict) and item.get("type") == "transfer_video_segment"), None)
+    if transfer is None:
+        raise ValueError("动作迁移计划缺少参考视频片段")
+    return _load_transfer_video_segment(transfer)
+
+
+def _control_preprocessor_mappings():
+    mappings = getattr(nodes, "NODE_CLASS_MAPPINGS", {})
+    for package_name in ("comfyui_controlnet_aux", "custom_nodes.comfyui_controlnet_aux"):
+        try:
+            aux_module = importlib.import_module(package_name)
+            aux_mappings = getattr(aux_module, "AUX_NODE_MAPPINGS", None)
+            if aux_mappings:
+                mappings = {**aux_mappings, **mappings}
+                break
+        except Exception:
+            continue
+    return mappings
+
+
+def _run_pose_preprocessor(video_frames, resolution, mappings):
+    # DWPose is the most reliable common denominator for real and anime
+    # footage.  An AnimePose node is used only when DWPose is unavailable.
+    cls = next((mappings.get(name) for name in ("DWPreprocessor", "OpenposePreprocessor",
+                                                "AnimePosePreprocessor", "AnimePose")
+                if mappings.get(name) is not None), None)
+    if cls is None:
+        raise RuntimeError("未找到姿态预处理器，请安装 comfyui_controlnet_aux（可选安装 ComfyUI-AnimePose）")
+    try:
+        result = cls().estimate_pose(
+            video_frames, detect_hand="enable", detect_body="enable", detect_face="enable",
+            resolution=int(resolution), bbox_detector="yolox_l.onnx",
+            pose_estimator="dw-ll_ucoco_384.onnx", scale_stick_for_xinsr_cn="disable")
+    except TypeError:
+        result = cls().estimate_pose(video_frames, resolution=int(resolution))
+    return _control_image_result(result), type(cls()).__name__
+
+
+def _run_depth_preprocessor(video_frames, resolution, mappings):
+    # Prefer a temporal depth implementation when installed; otherwise use
+    # the widely available Depth Anything V2 node.
+    cls = next((mappings.get(name) for name in ("VideoDepthAnythingPreprocessor", "VideoDepthAnything")
+                if mappings.get(name) is not None), None)
+    if cls is not None:
+        try:
+            result = cls().execute(video_frames, resolution=int(resolution))
+            return _control_image_result(result), type(cls()).__name__
+        except (TypeError, RuntimeError, ValueError) as exc:
+            LOG.warning("H3 Auto Director: Video Depth Anything 处理失败，回退 Depth Anything V2：%s", exc)
+    cls = mappings.get("DepthAnythingV2Preprocessor")
+    if cls is None:
+        raise RuntimeError("未找到深度预处理器，请安装 comfyui_controlnet_aux 或 Video-Depth-Anything")
+    result = cls().execute(video_frames, ckpt_name="depth_anything_v2_vitl.pth", resolution=int(resolution))
+    return _control_image_result(result), type(cls()).__name__
+
+
+def _persist_control_video(path, images):
+    try:
+        _write_segment_video(path, images.detach().float().cpu().contiguous(), None,
+                             FPS, "mp4", "h264", "CPU", "最高质量")
+        return bool(path.is_file() and path.stat().st_size > 0)
+    except Exception as exc:
+        # A .pt cache is still sufficient for an in-process/external runner;
+        # missing ffmpeg should not abort H3 sampling.
+        LOG.warning("H3 Auto Director: 控制视频 MP4 保存失败（已保留 PT 缓存）：%s", exc)
+        return False
+
+
+class H3AutoDirectorControlPreprocess:
+    """Preprocess both pose and depth controls for one or all transfer segments.
+
+    The output config is consumed by the dual sampler as conditioning metadata.
+    Native H3 builds that do not expose the VideoX-Fun Union transformer safely
+    ignore that metadata, while a compatible external backend can consume the
+    persisted control-video paths and independent weights.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "control_mode": (list(CONTROL_MODES), {"default": "姿态+深度"}),
+            "resolution": ("INT", {"default": 768, "min": 256, "max": 2048, "step": 32}),
+            "enabled": ("BOOLEAN", {"default": True, "label_on": "启用预处理", "label_off": "关闭预处理",
+                                       "tooltip": "默认启用姿态/深度预处理。关闭时只对齐并转发原视频帧。"}),
+            "save_preprocessed": ("BOOLEAN", {"default": True, "label_on": "保存预处理视频", "label_off": "不保存预处理视频",
+                                                "tooltip": "默认保存到项目 control/segment_XXXX；同时保留 PT 缓存供后端读取。"}),
+            "preprocess_all_segments": ("BOOLEAN", {"default": False, "label_on": "一次性预处理全部片段", "label_off": "仅当前片段",
+                                                       "tooltip": "开启后按动作迁移计划完整预处理所有视频片段；适合开始采样前一次性生成控制缓存。"}),
+            "pose_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+            "depth_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+        }, "optional": {
+            "video_frames": ("IMAGE", {"tooltip": "可选。连接完整参考视频 IMAGE；节点会按片段编号自动切分。未连接时从计划读取对应片段。"}),
+            "plan": ("H3_AUTO_PLAN", {"tooltip": "连接动作迁移项目计划，自动读取并缓存对应参考视频片段。"}),
+            "segment_index": ("INT", {"default": 1, "min": 1, "max": 9999,
+                                         "tooltip": "动作迁移计划中的生成片段编号；应连接 H3 片段节点输出。"}),
+            "source_video_path": ("STRING", {"default": "", "multiline": False,
+                                               "tooltip": "可选。input 目录内的视频相对路径；优先级低于 video_frames 和 plan。"}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "H3_CONTROL_CONFIG", "IMAGE", "STRING")
+    RETURN_NAMES = ("姿态控制视频", "深度控制视频", "控制配置", "控制预览", "预处理信息")
+    FUNCTION = "preprocess"
+    CATEGORY = "H3 自动导演/动作迁移/ControlNet"
+
+    def preprocess(self, control_mode="姿态+深度", resolution=768, enabled=True,
+                   save_preprocessed=True, preprocess_all_segments=False,
+                   pose_weight=1.0, depth_weight=1.0, video_frames=None, plan=None,
+                   segment_index=1, source_video_path="", **_legacy):
+        mode = str(control_mode or "姿态+深度")
+        # Retain old graph compatibility without exposing the retired style
+        # widget.  The former control_type determines the new mode when used.
+        if mode not in CONTROL_MODES:
+            old_type = str(_legacy.get("control_type", mode))
+            mode = "姿态" if old_type.startswith("姿态") else "深度" if old_type.startswith("深度") else "关闭"
+        need_pose, need_depth = _control_mode_has_pose(mode), _control_mode_has_depth(mode)
+        connected_frames = video_frames is not None
+        if (video_frames is None and not bool(enabled) and not preprocess_all_segments
+                and plan is None and not str(source_video_path or "").strip()):
+            video_frames = torch.zeros((5, 16, 16, 3), dtype=torch.float32)
+        if video_frames is None and isinstance(plan, dict):
+            video_frames = _load_transfer_source_frames(plan, segment_index)
+        if video_frames is None:
+            source = str(source_video_path or "").strip().strip('"')
+            if not source:
+                raise ValueError("请连接视频帧、动作迁移项目计划，或填写 input 目录内的视频路径")
+            try:
+                video_frames, _ = _load_reference_video(source)
+            except Exception as exc:
+                if av is None:
+                    raise RuntimeError("无法读取控制视频；请安装 VideoHelperSuite 或 PyAV") from exc
+                video_frames = _load_video_frames_av((_input_root() / _reference_name(source)).resolve())
+        if not torch.is_tensor(video_frames) or video_frames.ndim != 4:
+            raise ValueError("控制视频输入必须是 [帧,高,宽,RGB] IMAGE")
+        if int(video_frames.shape[0]) < 5:
+            raise ValueError("控制视频至少需要 5 帧（约 0.2 秒）")
+        full_frames = video_frames.float().clamp(0, 1).contiguous()
+        indices = [max(1, int(segment_index))]
+        if bool(preprocess_all_segments) and isinstance(plan, dict) and str(plan.get("mode", "")) == "video_transfer":
+            indices = list(range(1, len(plan.get("segments", [])) + 1))
+        mappings = _control_preprocessor_mappings()
+        current_pose = current_depth = None
+        records = {}
+        for index in indices:
+            if connected_frames:
+                segment_frames = _control_frames_for_segment(plan, index, full_frames)
+                if (segment_frames is full_frames and plan is not None
+                        and str(plan.get("mode", "")) == "video_transfer"
+                        and index != int(segment_index)):
+                    # A connected batch that is already a segment cannot be
+                    # reused for another window; load that plan window on demand.
+                    segment_frames = _load_transfer_source_frames(plan, index)
+            else:
+                segment_frames = full_frames if index == int(segment_index) and not preprocess_all_segments \
+                    else _load_transfer_source_frames(plan, index)
+            if not torch.is_tensor(segment_frames) or segment_frames.ndim != 4:
+                raise ValueError("控制视频片段必须是 [帧,高,宽,RGB] IMAGE")
+            cache_pose, video_pose = _control_cache_paths(plan, index, "pose")
+            cache_depth, video_depth = _control_cache_paths(plan, index, "depth")
+            pose = _load_control_tensor(cache_pose) if need_pose else None
+            depth = _load_control_tensor(cache_depth) if need_depth else None
+            preprocessors = {}
+            if bool(enabled):
+                if need_pose and pose is None:
+                    pose, preprocessors["pose"] = _run_pose_preprocessor(segment_frames, resolution, mappings)
+                    pose, _ = _align_control_frames(pose)
+                if need_depth and depth is None:
+                    depth, preprocessors["depth"] = _run_depth_preprocessor(segment_frames, resolution, mappings)
+                    depth, _ = _align_control_frames(depth)
+            if not bool(enabled):
+                passthrough, _ = _align_control_frames(segment_frames)
+                pose = passthrough if need_pose else None
+                depth = passthrough if need_depth else None
+            if pose is not None:
+                _save_control_tensor(cache_pose, pose)
+                if bool(save_preprocessed) and video_pose is not None and not video_pose.is_file():
+                    _persist_control_video(video_pose, pose)
+            if depth is not None:
+                _save_control_tensor(cache_depth, depth)
+                if bool(save_preprocessed) and video_depth is not None and not video_depth.is_file():
+                    _persist_control_video(video_depth, depth)
+            records[str(index)] = {
+                "pose_path": str(video_pose) if pose is not None and video_pose is not None else "",
+                "depth_path": str(video_depth) if depth is not None and video_depth is not None else "",
+                "pose_cache": str(cache_pose) if pose is not None and cache_pose is not None else "",
+                "depth_cache": str(cache_depth) if depth is not None and cache_depth is not None else "",
+                "frames": int(max(pose.shape[0] if pose is not None else 0, depth.shape[0] if depth is not None else 0)),
+                "preprocessors": preprocessors,
+            }
+            if index == int(segment_index):
+                current_pose, current_depth = pose, depth
+        if current_pose is None and current_depth is None:
+            fallback = _align_control_frames(full_frames)[0]
+            current_pose = current_depth = fallback
+        template = current_pose if current_pose is not None else current_depth
+        blank = torch.zeros_like(template)
+        payload = {
+            "type": "h3_union_control",
+            "enabled": bool(enabled) and mode != "关闭" and bool(need_pose or need_depth),
+            "control_mode": mode,
+            "pose_weight": max(0.0, min(2.0, float(pose_weight))) if need_pose else 0.0,
+            "depth_weight": max(0.0, min(2.0, float(depth_weight))) if need_depth else 0.0,
+            "segment_index": int(segment_index), "fps": FPS, "frame_grid": "17*n+5",
+            "segments": records,
+            "requires_videox_fun": True,
+        }
+        preview = current_pose if current_pose is not None else current_depth
+        info = {"type": "h3_union_control", "mode": mode, "enabled": payload["enabled"],
+                "pose_weight": payload["pose_weight"], "depth_weight": payload["depth_weight"],
+                "current_segment": int(segment_index), "processed_segments": [int(x) for x in indices],
+                "saved": bool(save_preprocessed), "records": records}
+        LOG.info("H3 Auto Director: 控制预处理完成：模式=%s，姿态权重=%.3f，深度权重=%.3f，片段=%s",
+                 mode, payload["pose_weight"], payload["depth_weight"], ",".join(map(str, indices)))
+        return (current_pose if current_pose is not None else blank,
+                current_depth if current_depth is not None else blank,
+                payload, preview if preview is not None else blank,
+                json.dumps(info, ensure_ascii=False))
+
+
+def _load_video_frames_av(path):
+    """Decode a video into ComfyUI IMAGE frames without VHS lazy audio state."""
+    if av is None:
+        raise RuntimeError("PyAV 未安装，无法直接读取控制视频")
+    frames = []
+    container = av.open(str(path))
+    try:
+        stream = next(iter(container.streams.video), None)
+        if stream is None:
+            raise ValueError("控制视频没有视频流")
+        try:
+            source_fps = float(stream.average_rate or stream.base_rate or FPS)
+        except (TypeError, ValueError):
+            source_fps = FPS
+        for frame in container.decode(stream):
+            array = frame.to_rgb().to_ndarray()
+            frames.append(torch.from_numpy(array).float().div(255.0))
+    finally:
+        container.close()
+    if not frames:
+        raise ValueError("控制视频没有可解码画面")
+    if abs(source_fps - FPS) > 0.01 and len(frames) > 1:
+        # Keep the source timeline's duration while selecting the nearest
+        # frame for each 24-fps output timestamp.  This mirrors VHS's
+        # ``force_rate=24`` behavior without creating a lazy audio mapping.
+        target_count = max(1, int(round(len(frames) * FPS / source_fps)))
+        indices = [min(len(frames) - 1, int(round(index * source_fps / FPS)))
+                   for index in range(target_count)]
+        frames = [frames[index] for index in indices]
+    return torch.stack(frames, dim=0).contiguous()
+
+
+class H3AutoDirectorControlConfig:
+    """Describe how an external VideoX-Fun Union ControlNet run is configured."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "control_video": ("IMAGE",),
+            "control_type": (["Pose", "Depth"], {"default": "Pose"}),
+            "control_context_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+            "backend": (["VideoX-Fun Union（外部后端）", "仅记录配置（不启用控制）"], {"default": "VideoX-Fun Union（外部后端）"}),
+            "controlnet_path": ("STRING", {"default": "", "multiline": False,
+                                              "tooltip": "MiniMax-H3-Fun-Controlnet-Union.safetensors 的完整路径；仅外部 VideoX-Fun 后端使用"}),
+        }}
+
+    RETURN_TYPES = ("H3_CONTROL_CONFIG",)
+    RETURN_NAMES = ("H3 Union 控制配置",)
+    FUNCTION = "configure"
+    CATEGORY = "H3 自动导演/动作迁移/ControlNet"
+
+    def configure(self, control_video, control_type="Pose", control_context_scale=1.0,
+                  backend="VideoX-Fun Union（外部后端）", controlnet_path=""):
+        if not torch.is_tensor(control_video) or control_video.ndim != 4:
+            raise ValueError("控制视频必须是 [帧,高,宽,RGB] IMAGE")
+        frames, count = _align_control_frames(control_video.float().clamp(0, 1))
+        path = str(controlnet_path or "").strip().strip('"')
+        available = bool(path and Path(path).is_file())
+        return ({
+            "backend": str(backend), "control_type": str(control_type),
+            "control_context_scale": max(0.0, min(2.0, float(control_context_scale))),
+            "controlnet_path": path, "controlnet_available": available,
+            "frames": int(count), "fps": FPS, "frame_grid": "17*n+5",
+            "control_video": frames.contiguous(),
+            "requires_videox_fun": str(backend).startswith("VideoX-Fun"),
+        },)
+
+
+class H3AutoDirectorControlExport:
+    """Export pose/depth IMAGE frames for the external VideoX-Fun runner."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "config": ("H3_CONTROL_CONFIG",),
+            "plan": ("H3_AUTO_PLAN",),
+            "enabled": ("BOOLEAN", {"default": False, "label_on": "导出控制视频", "label_off": "不导出控制视频",
+                                      "tooltip": "默认关闭；开启后才会调用 ffmpeg 将控制帧导出到项目 control 目录。"}),
+            "output_name": ("STRING", {"default": "", "multiline": False,
+                                         "tooltip": "控制视频文件名；留空按 pose/depth 自动命名。"}),
+        }, "optional": {
+            "video_codec": (["h264", "hevc"], {"default": "h264"}),
+        }}
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("控制视频路径", "导出状态")
+    FUNCTION = "export"
+    CATEGORY = "H3 自动导演/动作迁移/ControlNet"
+
+    def export(self, config, plan, enabled=False, output_name="", video_codec="h264"):
+        if not bool(enabled):
+            return ("", "已关闭控制视频导出；原生 H3 动作迁移不使用 Union 控制")
+        if not isinstance(config, dict) or not torch.is_tensor(config.get("control_video")):
+            raise ValueError("控制配置中没有有效控制视频")
+        if not isinstance(plan, dict) or not plan.get("project_dir"):
+            raise ValueError("控制视频导出需要连接动作迁移项目计划")
+        project_dir = Path(plan["project_dir"])
+        control_dir = project_dir / "control"
+        control_dir.mkdir(parents=True, exist_ok=True)
+        control_type = "pose" if str(config.get("control_type", "Pose")).lower().startswith("pose") else "depth"
+        name = _output_filename(output_name) if str(output_name or "").strip() else control_type
+        path = control_dir / (name + ".mp4")
+        images = config["control_video"].detach().float().clamp(0, 1).cpu().contiguous()
+        _write_segment_video(path, images, None, FPS, "mp4", video_codec, "CPU", "最高质量")
+        if not path.is_file() or path.stat().st_size == 0:
+            raise RuntimeError("控制视频导出失败：%s" % path)
+        status = "已导出 %s 控制视频（%d 帧）；请交给 VideoX-Fun Union 专用管线执行" % (control_type, images.shape[0])
+        LOG.info("H3 Auto Director: %s -> %s", status, path)
+        return (str(path), status)
+
+
+class H3AutoDirectorControlBackendCheck:
+    """Fail early with an actionable message instead of silently ignoring Union control."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"config": ("H3_CONTROL_CONFIG",)}}
+
+    RETURN_TYPES = ("BOOLEAN", "STRING")
+    RETURN_NAMES = ("后端可用", "检查信息")
+    FUNCTION = "check"
+    CATEGORY = "H3 自动导演/动作迁移/ControlNet"
+
+    def check(self, config):
+        try:
+            import videox_fun  # noqa: F401
+            package = True
+        except Exception:
+            package = False
+        path_ok = bool(config.get("controlnet_available"))
+        required = bool(config.get("requires_videox_fun"))
+        ok = bool((not required) or (package and path_ok))
+        if required and not ok:
+            message = ("VideoX-Fun 后端不可用：请安装 VideoX-Fun，并将 "
+                       "MiniMax-H3-Fun-Controlnet-Union.safetensors 路径填入控制配置节点。")
+        elif required:
+            message = "VideoX-Fun Union 控制后端与权重路径检查通过；该配置需交给专用 VideoX-Fun 采样节点执行。"
+        else:
+            message = "当前为仅记录配置模式，不会向原生 H3 采样注入 Union 控制。"
+        return (ok, message)
 
 
 def _h3_model_options(weight_dtype):
@@ -3199,9 +4376,42 @@ def _prompt_cache_key(plan, clip, vae, audio_vae, width, height, ref_image_size,
     # The seed belongs to RandomNoise/sampling downstream.  It is deliberately
     # absent here so changing the seed reuses the deterministic H3 conditioning.
     plan_data = {k: plan.get(k) for k in ("project_id", "global_reference_set", "global_assets", "segments", "continuation_mode")}
-    return (id(clip), id(vae), id(audio_vae), int(width), int(height), str(ref_image_size),
+    mode = str(ref_image_size or "match").lower()
+    width, height = _h3_canvas_dimensions(width, height)
+    resolution = (int(width), int(height)) if mode not in {"manual", "max"} else None
+    return (id(clip), id(vae), id(audio_vae), resolution, mode,
             int(context_length), _nearest_multiple(ref_short_edge),
             json.dumps(plan_data, ensure_ascii=False, sort_keys=True, default=str))
+
+
+def _refresh_cached_conditioning_latent(value, width, height, length):
+    """Replace the generation latent carried by a cached conditioning.
+
+    Reference/text conditioning in ``manual`` and ``max`` sizing modes is
+    intentionally reusable across canvas changes.  The tuple returned by the
+    encoder also carries an empty AV latent, however, and that latent *does*
+    depend on width/height/length.  It is therefore rebuilt on every run,
+    rather than conditionally refreshing only after a shape mismatch.
+    """
+    if _minimax_h3 is None or not isinstance(value, (tuple, list)) or len(value) < 2:
+        return value
+    conditioning = value[0]
+    expected_width, expected_height = _h3_canvas_dimensions(width, height)
+    # Do this unconditionally.  The latent embedded in a prompt-cache entry
+    # is only a serialization convenience; it must never become a persistent
+    # sampling state.  Rebuilding it on every execution guarantees that a
+    # changed resolution/length gets a fresh AV container and that the
+    # downstream RandomNoise seed is applied to a clean latent every run.
+    expected_latent = _minimax_h3._empty_av_latent(
+        expected_width, expected_height, int(length)
+    )[0]
+    LOG.info(
+        "H3 Auto Director: 缓存文本向量复用，但按当前设置重建 AV latent：%dx%d，长度=%d",
+        expected_width, expected_height, int(length),
+    )
+    if isinstance(value, tuple):
+        return (conditioning, expected_latent, *value[2:])
+    return [conditioning, expected_latent, *value[2:]]
 
 
 class H3AutoDirectorCachedReferenceToVideo:
@@ -3251,6 +4461,10 @@ class H3AutoDirectorCachedReferenceToVideo:
                     plan=None, use_manual_ref_short_edge=False, ref_short_edge=2048):
         if _H3ReferenceToVideo is None:
             raise RuntimeError("当前 ComfyUI 未提供 MiniMaxH3ReferenceToVideo 核心节点")
+        width, height = _h3_canvas_dimensions(width, height)
+        LOG.info("H3 Auto Director: 参考编码画布=%dx%d（%.3f MP），参考尺寸模式=%s",
+                 width, height, width * height / 1_000_000,
+                 "manual" if use_manual_ref_short_edge else ref_image_size)
         if bool(use_manual_ref_short_edge):
             prepared = H3AutoDirectorCachedReferenceToVideo._prepare_references(
                 vae, audio_vae, width, height, length, "manual", refs, plan=plan,
@@ -3273,6 +4487,7 @@ class H3AutoDirectorCachedReferenceToVideo:
         """Encode all Ref2VA assets before the batch text-encoder session."""
         if _H3ReferenceToVideo is None or _minimax_h3 is None:
             raise RuntimeError("当前 ComfyUI 未提供 MiniMaxH3ReferenceToVideo 核心节点")
+        width, height = _h3_canvas_dimensions(width, height)
         latent, frame_count = _minimax_h3._empty_av_latent(int(width), int(height), int(length))
         ref_groups = _resolve_reference_groups(refs, plan=plan)
         ref_items = []
@@ -3481,7 +4696,8 @@ class H3AutoDirectorCachedReferenceToVideo:
         if entry.get("fingerprint") == fingerprint and cache_file.is_file():
             try:
                 LOG.info("H3 Auto Director: 当前片段命中提示词磁盘缓存（第 %d 段）", generation_index)
-                return _load_torch_cache(cache_file)
+                cached = _load_torch_cache(cache_file)
+                return _refresh_cached_conditioning_latent(cached, width, height, length)
             except Exception as exc:
                 LOG.warning("H3 Auto Director: 第 %d 段磁盘向量无法读取，将重新编码：%s",
                             generation_index, exc)
@@ -3502,6 +4718,9 @@ class H3AutoDirectorCachedReferenceToVideo:
                ref_image_size="match", context_length=FRAME_CONTEXT_DEFAULT, segment_index=0,
                use_auto_ref_image_size=True, use_manual_ref_short_edge=False, ref_short_edge=2048,
                references_json=None):
+        width, height = _h3_canvas_dimensions(width, height)
+        LOG.info("H3 Auto Director: 编码请求画布=%dx%d（%.3f MP），帧数=%d",
+                 width, height, width * height / 1_000_000, int(length))
         # The original Auto Director workflow wires output 8 (the 0-based
         # context index) into this node.  TTS and Video Transfer workflows
         # wire output 5 (the 1-based target segment number).  Keep both public
@@ -3519,6 +4738,12 @@ class H3AutoDirectorCachedReferenceToVideo:
             except json.JSONDecodeError as exc:
                 raise ValueError("参考素材 JSON 无效: %s" % exc) from exc
             _validate_reference_limits(refs, "当前片段参考素材")
+            if bool(plan.get("global_reference_set", True)) and generation_index != 1:
+                refs = [
+                    dict(ref, insert_seconds=0.0, insert_frames=0)
+                    if isinstance(ref, dict) else ref
+                    for ref in refs
+                ]
         # The UI keeps the two switches mutually exclusive. If an old or
         # hand-edited workflow contains both values, preset mode wins; if both
         # are off, preset mode is the deterministic fallback.
@@ -3589,6 +4814,9 @@ class H3AutoDirectorCachedReferenceToVideo:
             if len(cache) >= len(plan.get("segments", [])):
                 model_management.unload_model_and_clones(clip.patcher, unload_additional_models=False, all_devices=True)
                 LOG.info("H3 Auto Director: 延迟参考素材就绪，全部文本向量缓存完成，已卸载文本编码器")
+        cache[generation_index] = _refresh_cached_conditioning_latent(
+            cache[generation_index], width, height, length
+        )
         return cache[generation_index]
 
 
@@ -3618,6 +4846,9 @@ class H3AutoDirectorTransferDecode:
         parts = _av_latent_parts(samples)
         if parts is None:
             raise ValueError("视频迁移解码仅支持 MiniMax H3 的联合 AV latent")
+        if isinstance(plan, dict) and bool(plan.get("decode_after_all_segments", False)):
+            LOG.info("H3 Auto Director: 统一解码模式跳过动作迁移片段级视频/音频解码")
+            return (torch.empty((0, 1, 1, 3), dtype=torch.float32), None)
         video, audio = parts
         images = _decode_h3_video(video_vae, video)
         source_audio = str(plan.get("final_audio_source", "H3 生成音频")) == "参考视频音频"
@@ -3637,17 +4868,22 @@ class H3AutoDirectorAVDecode:
     def INPUT_TYPES(cls):
         return {"required": {
             "samples": ("LATENT",), "video_vae": ("VAE",), "audio_vae": ("VAE",),
-        }}
+        }, "optional": {"plan": ("H3_AUTO_PLAN",)}}
 
     RETURN_TYPES = ("IMAGE", "AUDIO")
     RETURN_NAMES = ("画面", "音频")
     FUNCTION = "decode"
     CATEGORY = "H3 自动导演/解码"
 
-    def decode(self, samples, video_vae, audio_vae):
+    def decode(self, samples, video_vae, audio_vae, plan=None):
         parts = _av_latent_parts(samples)
         if parts is None:
             raise ValueError("H3 AV 解码需要联合视频/音频 latent")
+        if isinstance(plan, dict) and bool(plan.get("decode_after_all_segments", False)):
+            # SaveSegment persists the latent; Controller decodes one segment
+            # at a time during final assembly. Keep the output contract so old
+            # links remain valid without allocating a decoded clip here.
+            return (torch.empty((0, 1, 1, 3), dtype=torch.float32), None)
         images = _decode_h3_video(video_vae, parts[0])
         waveform, sample_rate = _decode_h3_audio(audio_vae, parts[1])
         # Native H3 Guide has no prepended context frames. Its audio latent
@@ -3657,6 +4893,189 @@ class H3AutoDirectorAVDecode:
         if waveform.shape[-1] > expected_samples:
             waveform = waveform[..., :expected_samples]
         return (images, {"waveform": waveform, "sample_rate": sample_rate})
+
+
+class H3AutoDirectorLoadSavedAVLatent:
+    """Load an AV latent cache written by H3 Auto Director without a plan.
+
+    This deliberately accepts only the paired ``video`` / ``audio`` tensors
+    written by Save Segment.  Loading it through a normal generic latent node
+    loses the two-stream H3 contract and makes audio decode silently fail.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "latent_path": ("STRING", {"default": "", "multiline": False,
+                             "placeholder": "D:/.../output/h3_project/项目/cache/segment_0001.safetensors"}),
+        }}
+
+    RETURN_TYPES = ("LATENT", "STRING")
+    RETURN_NAMES = ("H3 AV 潜空间", "已加载文件")
+    FUNCTION = "load"
+    CATEGORY = "H3 自动导演/解码"
+
+    @staticmethod
+    def _path(value):
+        return Path(str(value or "").strip().strip('"')).expanduser()
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, latent_path):
+        path = cls._path(latent_path)
+        if not path.is_file() or path.suffix.lower() != ".safetensors":
+            return "潜空间文件必须是存在的 .safetensors：%s" % path
+        return True
+
+    @classmethod
+    def IS_CHANGED(cls, latent_path):
+        path = cls._path(latent_path)
+        try:
+            stat = path.stat()
+            return "%s:%d:%d" % (path.resolve(), stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            return str(path)
+
+    def load(self, latent_path):
+        path = self._path(latent_path)
+        if not path.is_file() or path.suffix.lower() != ".safetensors":
+            raise FileNotFoundError("潜空间文件必须是存在的 .safetensors：%s" % path)
+        latent = _load_av_latent(path)
+        video, audio = _av_latent_parts(latent) or (None, None)
+        if video is None or audio is None:
+            raise ValueError("不是 H3 自动导演保存的联合 AV 潜空间：%s" % path)
+        LOG.info("H3 Auto Director: 已加载保存的 AV 潜空间：%s（视频=%s，音频=%s）",
+                 path, tuple(video.shape), tuple(audio.shape))
+        return (latent, str(path))
+
+
+class H3AutoDirectorDecodeSaveVideo:
+    """Decode every saved AV latent in a project directory and assemble video.
+
+    The node deliberately keeps only one decoded segment in memory.  It accepts
+    either a project directory (``.../h3_project/<name>``), its ``cache``
+    directory, or ``cache_stage1``.  Stage-one caches are useful for diagnosis;
+    normal output should point at ``cache`` so the final second-pass latents are
+    decoded.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "latent_directory": ("STRING", {"default": "", "multiline": False,
+                "placeholder": ".../output/h3_project/项目 或其 cache/ 目录"}),
+            "video_vae": ("VAE",),
+            "audio_vae": ("VAE",),
+            "output_intermediate": ("BOOLEAN", {"default": True,
+                "label_on": "输出中间片段", "label_off": "不输出中间片段"}),
+            "intermediate_filename": ("STRING", {"default": "H3",
+                "tooltip": "中间片段文件名前缀；留空使用 H3"}),
+            "final_filename": ("STRING", {"default": "H3",
+                "tooltip": "最终视频文件名；留空使用 H3"}),
+            "auto_crop_frames": ("INT", {"default": 22, "min": 0, "max": 4096,
+                "tooltip": "从第 2 段开始裁剪的上下文帧数；0 表示不裁剪"}),
+        }}
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("最终视频", "保存信息")
+    FUNCTION = "decode_save"
+    CATEGORY = "H3 自动导演/解码"
+    OUTPUT_NODE = True
+
+    @staticmethod
+    def _project_and_cache(value):
+        raw = str(value or "").strip().strip('"')
+        if not raw:
+            raise ValueError("请输入项目目录或 cache/ 目录")
+        path = Path(raw).expanduser()
+        if path.is_file():
+            path = path.parent
+        path = path.resolve()
+        if path.name.lower() in {"cache", "cache_stage1", "latents"}:
+            return path.parent, path
+        if (path / "cache").is_dir():
+            return path, path / "cache"
+        if (path / "cache_stage1").is_dir():
+            return path, path / "cache_stage1"
+        # A direct directory containing safetensors is also accepted.  This
+        # keeps old projects and manually copied caches resumable.
+        if path.is_dir() and any(path.glob("*.safetensors")):
+            return path.parent, path
+        raise FileNotFoundError("无法识别潜空间目录（应为项目目录或 cache/）：%s" % path)
+
+    @staticmethod
+    def _entries(cache_dir):
+        files = [p for p in cache_dir.glob("*.safetensors") if p.is_file()]
+        def key(path):
+            match = re.search(r"(?:_|-)(\d+)(?:\.safetensors)?$", path.name)
+            return (int(match.group(1)) if match else 10**9, path.name.lower())
+        return sorted(files, key=key)
+
+    @staticmethod
+    def _safe_name(value, default):
+        name = str(value or "").strip().strip('"')
+        name = Path(name).stem if name else default
+        if not name or name in {".", ".."} or any(c in name for c in "\\/:*?<>|\n\r"):
+            raise ValueError("文件名只能包含文件名，不能包含路径或特殊字符")
+        return name
+
+    def decode_save(self, latent_directory, video_vae, audio_vae,
+                    output_intermediate=True, intermediate_filename="H3",
+                    final_filename="H3", auto_crop_frames=22):
+        project_dir, cache_dir = self._project_and_cache(latent_directory)
+        entries = self._entries(cache_dir)
+        if not entries:
+            raise FileNotFoundError("目录中没有 .safetensors 潜空间：%s" % cache_dir)
+        intermediate_stem = self._safe_name(intermediate_filename, "H3")
+        final_stem = self._safe_name(final_filename, "H3")
+        crop = max(0, int(auto_crop_frames or 0))
+        clips_dir = project_dir / "clips"
+        final_dir = project_dir / "final"
+        temp_dir = project_dir / "json" / ".decode_segments"
+        target_dir = clips_dir if bool(output_intermediate) else temp_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        final_dir.mkdir(parents=True, exist_ok=True)
+        list_path = project_dir / "json" / "decode_concat.txt"
+        list_path.parent.mkdir(parents=True, exist_ok=True)
+        sources = []
+        decoded_count = 0
+        try:
+            for ordinal, latent_path in enumerate(entries, 1):
+                latent = _load_av_latent(latent_path)
+                parts = _av_latent_parts(latent)
+                if parts is None:
+                    raise ValueError("不是联合 AV latent：%s" % latent_path)
+                images = _decode_h3_video(video_vae, parts[0])
+                waveform, sample_rate = _decode_h3_audio(audio_vae, parts[1])
+                audio = {"waveform": waveform, "sample_rate": sample_rate}
+                if ordinal >= 2 and crop > 0:
+                    if crop >= int(images.shape[0]):
+                        raise ValueError("第 %d 段裁剪 %d 帧后没有剩余画面" % (ordinal, crop))
+                    images, audio = _trim_context_prefix(images, audio, crop, FPS)
+                clip_path = target_dir / ("%s_%05d.mp4" % (intermediate_stem, ordinal))
+                _write_segment_video(clip_path, images, audio, FPS, "mp4", "h264", "CPU", "最高质量")
+                sources.append(clip_path)
+                decoded_count += 1
+                LOG.info("H3 Auto Director: 目录解码第 %d/%d 段（裁剪=%d）: %s", ordinal, len(entries), crop if ordinal >= 2 else 0, latent_path)
+                del latent, parts, images, waveform, audio
+                _release_video_memory()
+            list_path.write_text("\n".join("file '%s'" % str(p).replace("'", "'\\''") for p in sources) + "\n", encoding="utf-8")
+            ffmpeg = _find_ffmpeg()
+            if not ffmpeg:
+                raise RuntimeError("未找到 ffmpeg，无法拼接解码视频")
+            final_path = final_dir / (final_stem + ".mp4")
+            temp_final = final_path.with_name(final_path.stem + ".tmp.mp4")
+            _encode_concat_with_fallback(ffmpeg, list_path, temp_final, "mp4", "h264", "CPU", "最高质量")
+            if not temp_final.is_file() or temp_final.stat().st_size == 0:
+                raise RuntimeError("ffmpeg 未生成有效最终视频")
+            os.replace(temp_final, final_path)
+            info = "目录=%s，读取=%d 段，裁剪=%d 帧（从第2段起），中间片段=%s，最终=%s" % (cache_dir, decoded_count, crop, "开启" if output_intermediate else "关闭", final_path)
+            LOG.info("H3 Auto Director: %s", info)
+            return (str(final_path), info)
+        finally:
+            list_path.unlink(missing_ok=True)
+            if not bool(output_intermediate):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            _release_video_memory()
 
 
 class H3AutoDirectorAudioDecode:
@@ -3769,19 +5188,39 @@ class H3AutoDirectorContext:
                         "H3 Auto Director: 一采缓存缺失，兼容回退到上一段最终二采上下文：%s",
                         latent_path,
                     )
+            # The workflow-compatible frame Guide reads the saved final video
+            # even when a dedicated stage-one preview was not connected. Keep
+            # the stage-one latent above for latent consumers, but source its
+            # decoded frames from the final context directory in that case.
+            if video_enabled and not video_path.is_file():
+                final_video_path, _ = _paths(
+                    plan, int(segment_index), for_context=True, context_stage=2
+                )
+                if final_video_path.is_file():
+                    video_path = final_video_path
+                    LOG.info(
+                        "H3 Auto Director: 一采帧 Guide 未找到独立一采视频，改用上一段最终视频：%s",
+                        video_path,
+                    )
         # Stage-one context intentionally stores the latent first.  Its video
         # preview is optional because latent-direct Motion Context does not
         # need a decoded frame stream; stage two keeps the normal video cache.
-        if not latent_path.exists() or (video_enabled and context_stage != 1 and not video_path.exists()):
+        deferred_decode = bool(plan.get("decode_after_all_segments", False))
+        if not latent_path.exists() or (video_enabled and context_stage != 1 and not video_path.exists() and not deferred_decode):
             raise FileNotFoundError("Missing context cache for segment %d: %s / %s" % (int(segment_index), video_path, latent_path))
         LOG.info(
             "H3 Auto Director: 加载上下文序号 %d（阶段%d）：视频=%s，音频=%s，视频缓存=%s，latent缓存=%s",
             int(segment_index), context_stage, "开启" if video_enabled else "关闭",
             "开启" if audio_enabled else "关闭", video_path, latent_path,
         )
-        frames = (_load_context_video(video_path) if video_enabled and video_path.exists()
+        frames = (_load_context_video(video_path) if video_enabled and video_path.exists() and not deferred_decode
                   else torch.zeros((1, 1, 1, 3), dtype=torch.float32))
         context_latent = _load_av_latent(latent_path)
+        if bool(plan.get("decode_after_all_segments", False)):
+            # Deferred decoding deliberately leaves no per-segment context
+            # video on disk. Motion Context must use this durable AV latent.
+            context_latent = dict(context_latent)
+            context_latent["h3_deferred_decode"] = True
         # Keep the final stage-two source explicit for the second pass.  When
         # stage one already selected that source this is a duplicate by
         # design; the marker makes the routing unambiguous and keeps old
@@ -3837,10 +5276,21 @@ class H3AutoDirectorMotionContext:
         }, "optional": {
             "context_latent": ("LATENT",),
             "use_video_latent": ("BOOLEAN", {"default": True, "tooltip": "优先直接使用缓存 AV latent 的视频尾部；尺寸不匹配时自动回退至画面编码。"}),
+            "context_method": (["工作流视频帧 Guide", "缓存视频 latent 直取", "自动（latent 优先）"],
+                                {"default": "工作流视频帧 Guide",
+                                 "tooltip": "工作流视频帧 Guide：从磁盘视频解码尾帧后编码并通过 H3 AddGuide 注入；缓存视频 latent 直取：复用缓存 latent；自动：有缓存时优先 latent。"}),
+            "context_sampled_start_tokens": ("INT", {"default": 0, "min": 0, "max": 11, "step": 1,
+                "tooltip": "仅用于缓存 latent 直取。让上下文首部的若干 latent token 参与本段采样；0=首部全部固定 Guide。"}),
+            "context_sampled_start_strength": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01,
+                "tooltip": "首部可采样 token 的重绘强度。0=固定不重绘，1=完全重绘；建议 0.20-0.35。"}),
+            "context_sampled_tokens": ("INT", {"default": 2, "min": 0, "max": 11, "step": 1,
+                "tooltip": "仅用于缓存 latent 直取。让上下文末端的若干 latent token 参与本段采样；0=末端全部固定 Guide。22 帧上下文对应 7 token，默认 2 个（约 5 帧）。"}),
+            "context_sampled_strength": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01,
+                "tooltip": "末端可采样 token 的重绘强度。0=固定不重绘，1=完全重绘；建议 0.20-0.35，过高会造成模糊或跳变。"}),
         }}
 
-    RETURN_TYPES = ("CONDITIONING", "INT")
-    RETURN_NAMES = ("条件", "裁剪帧数")
+    RETURN_TYPES = ("CONDITIONING", "INT", "LATENT")
+    RETURN_NAMES = ("条件", "裁剪帧数", "采样潜变量")
     FUNCTION = "apply"
     CATEGORY = "H3 自动导演"
 
@@ -3857,7 +5307,9 @@ class H3AutoDirectorMotionContext:
 
     @staticmethod
     def _direct_latent_context(conditioning, latent, context_latent, context_length, use_audio_context,
-                               use_video_context=True):
+                               use_video_context=True, sampled_context_start_tokens=0,
+                               sampled_context_start_strength=0.25, sampled_context_tokens=0,
+                               sampled_context_strength=0.25):
         """Build native or legacy-compatible context from cached AV latents."""
         target_parts = _av_latent_parts(latent)
         context_parts = _av_latent_parts(context_latent)
@@ -3889,7 +5341,7 @@ class H3AutoDirectorMotionContext:
             legacy = legacy_h3_motion
         if not use_video_context:
             if not use_audio_context:
-                return conditioning, 0
+                return conditioning, 0, latent
             audio_tail, audio_steps, _overhang = _h3_audio_tail_from_latent(context_latent, run)
             audio_tail = audio_tail.to(device=target_video.device, dtype=target_video.dtype)
             if native_guides:
@@ -3900,28 +5352,108 @@ class H3AutoDirectorMotionContext:
             else:
                 values = {"minimax_refs": [{"kind": "audio", "ref_audio_t": audio_steps,
                                               "audio_latent": audio_tail, legacy.MC_AUDIO_KEY: 0.0}]}
-            return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), 0
+            return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), 0, latent
         if context_video.shape[2] < steps:
             raise ValueError("上下文视频 latent 长度不足，无法读取 %d 帧上下文" % run)
         if run >= _h3_pixel_frames(int(target_video.shape[2])):
             raise ValueError("上下文长度不能占满当前生成片段")
         tail = context_video[:, :, -steps:].to(device=target_video.device, dtype=target_video.dtype)
+        # Keep the leading context tokens as immutable Guide rows, while
+        # optionally allowing only the tail tokens to be denoised on the
+        # current target timeline.  H3's 22-frame context is 7 temporal
+        # tokens; the tail is deliberately token-aligned because splitting a
+        # token into pixel frames would make PackedLayout disagree with the
+        # VAE temporal grid.
+        end_tokens = max(0, min(int(sampled_context_tokens or 0), steps))
+        start_tokens = max(0, min(int(sampled_context_start_tokens or 0), steps))
+        start_strength = max(0.0, min(1.0, float(sampled_context_start_strength)))
+        end_strength = max(0.0, min(1.0, float(sampled_context_strength)))
+        if start_tokens + end_tokens > steps:
+            # Prefer the explicitly requested首部范围 and trim the末端 range
+            # when both settings overlap, keeping the mask deterministic.
+            end_tokens = max(0, steps - start_tokens)
+        sampled_latent = latent
+        sampled_token_ranges = []
+        if start_tokens:
+            sampled_token_ranges.append((0, start_tokens, start_strength))
+        if end_tokens:
+            sampled_token_ranges.append((steps - end_tokens, steps, end_strength))
+        if sampled_token_ranges:
+            sampled_video = target_video.clone()
+            for range_start, range_end, _strength in sampled_token_ranges:
+                sampled_video[:, :, range_start:range_end] = tail[:, :, range_start:range_end].to(
+                    device=target_video.device, dtype=target_video.dtype)
+            # ComfyUI's denoise_mask uses 0 for an immutable latent and 1 for
+            # a fully sampled latent.  The copied context occupies the first
+            # ``steps`` temporal tokens of the target, so initialise that
+            # window as fixed and leave the rest of the current segment at 1.
+            # Previously the whole mask was initialised to 1, which made the
+            # copied context outside the selected head/tail ranges fully
+            # resample whenever either control was enabled (the controls
+            # appeared to work in metadata but had the opposite effect in
+            # the sampler).
+            video_mask = torch.ones(
+                (sampled_video.shape[0], 1, sampled_video.shape[2],
+                 sampled_video.shape[3], sampled_video.shape[4]),
+                dtype=sampled_video.dtype, device=sampled_video.device,
+            )
+            video_mask[:, :, :steps] = 0.0
+            for range_start, range_end, strength in sampled_token_ranges:
+                video_mask[:, :, range_start:range_end] = strength
+            source_audio = target_parts[1]
+            audio_mask = torch.ones(
+                (source_audio.shape[0], 1, source_audio.shape[2], source_audio.shape[3]),
+                dtype=source_audio.dtype, device=source_audio.device,
+            )
+            sampled_latent = dict(latent)
+            sampled_latent["samples"] = _h3_av_container(sampled_video, source_audio)
+            sampled_latent["noise_mask"] = _h3_av_container(video_mask, audio_mask)
+            fixed_tokens = max(0, steps - int(sum(
+                end - start for start, end, _ in sampled_token_ranges
+            )))
+            sampled_latent["h3_auto_director_sampled_context"] = {
+                "frames": int(run), "latent_steps": int(sum(end - start for start, end, _ in sampled_token_ranges)),
+                "start_tokens": int(start_tokens), "start_strength": start_strength,
+                "end_tokens": int(end_tokens), "end_strength": end_strength,
+                "fixed_tokens": int(fixed_tokens),
+                "video_mask_shape": [int(value) for value in video_mask.shape],
+                "video_mask_min": float(video_mask.amin().item()),
+                "video_mask_max": float(video_mask.amax().item()),
+                "mode": "latent_head_tail",
+            }
+            LOG.info(
+                "H3 Auto Director: latent 上下文首部 %d token(强度=%.3f)、末端 %d token(强度=%.3f)参与采样；"
+                "重叠时优先首部范围；固定上下文=%d token，视频 mask 范围=[%.3f, %.3f]",
+                int(start_tokens), start_strength, int(end_tokens), end_strength,
+                int(fixed_tokens), float(video_mask.amin().item()), float(video_mask.amax().item()),
+            )
         if native_guides:
             # Native MiniMaxH3AddGuide represents a guide clip as one
             # keyframe containing its full temporal latent.  Splitting this
             # into arbitrary single-step keyframes can make the prebuilt
             # PackedLayout disagree with cond_video_latents when conditioning
             # is cached or references are also present.
-            keyframes = [{"resolved_frame_index": 0, "latent": tail,
-                          _NATIVE_CONTEXT_KEY: True}]
-            # SaveSegment removes the context prefix before concatenation.
-            # Add a one-token anchor exactly at that cut so the first visible
-            # frame is still tied to the predecessor's final latent instead
-            # of being allowed to jump after the hidden 22-frame transition.
-            if _h3_pixel_frames(int(target_video.shape[2])) > int(run):
-                keyframes.append({"resolved_frame_index": int(run),
-                                  "latent": tail[:, :, -1:],
-                                  _NATIVE_CONTEXT_KEY: True})
+            # AddGuide receives only the fixed middle portion when head/tail
+            # tokens are marked sampleable.  Token boundaries are converted
+            # back to pixel-frame offsets using H3's temporal packing table.
+            try:
+                frame_per_token = importlib.import_module("comfy.ldm.minimax.model").FRAME_PER_TOKEN
+            except (ImportError, AttributeError):
+                frame_per_token = (1, 4, 4, 4, 4)
+            token_offsets, cursor = [], 0
+            for token_index in range(steps):
+                token_offsets.append(cursor)
+                cursor += int(frame_per_token[token_index % len(frame_per_token)])
+            fixed_start, fixed_end = start_tokens, steps - end_tokens
+            keyframes = ([{"resolved_frame_index": int(token_offsets[fixed_start]),
+                           "latent": tail[:, :, fixed_start:fixed_end],
+                           _NATIVE_CONTEXT_KEY: True}]
+                         if fixed_end > fixed_start else [])
+            # Do not add a one-token anchor at ``run``.  A temporal token
+            # spans multiple pixel frames (the final token covers four), so
+            # such an anchor extends the Guide beyond the exact context
+            # window and overlaps the first generated frames.  That overlap
+            # was the source of a small colour/contrast jump at the join.
             values = {"minimax_keyframes": keyframes, _NATIVE_CONTEXT_KEY: True,
                       "h3_auto_director_context_run": int(run)}
         else:
@@ -3933,11 +5465,11 @@ class H3AutoDirectorMotionContext:
             for index in range(steps):
                 offsets.append(offset)
                 offset += frame_per_token[index % len(frame_per_token)]
-            keyframes = [{"resolved_frame_index": 0, legacy.MC_KEY: frame, "latent": tail[:, :, index:index + 1]}
-                         for index, frame in enumerate(offsets)]
-            if _h3_pixel_frames(int(target_video.shape[2])) > int(run):
-                keyframes.append({"resolved_frame_index": int(run), legacy.MC_KEY: int(run),
-                                  "latent": tail[:, :, -1:]})
+            fixed_start, fixed_end = start_tokens, steps - end_tokens
+            keyframes = [{"resolved_frame_index": int(frame), legacy.MC_KEY: frame,
+                          "latent": tail[:, :, index:index + 1]}
+                         for index, frame in enumerate(offsets)
+                         if fixed_start <= index < fixed_end]
             values = {"minimax_keyframes": keyframes,
                       "minimax_frame_count": _h3_pixel_frames(int(target_video.shape[2])),
                       "h3_auto_director_context_run": int(run)}
@@ -3953,6 +5485,8 @@ class H3AutoDirectorMotionContext:
                 # index. Context audio is the *start* of the carried window,
                 # therefore it must start at frame 0 alongside the first
                 # video block, not at the final compressed-video block.
+                if not keyframes:
+                    keyframes.append({"resolved_frame_index": 0, _NATIVE_CONTEXT_KEY: True})
                 keyframes[0]["audio_latent"] = audio_tail
             else:
                 values["minimax_refs"] = [{"kind": "audio", "ref_audio_t": audio_steps,
@@ -3961,15 +5495,16 @@ class H3AutoDirectorMotionContext:
         # The guide context is hidden from the delivered clip; SaveSegment
         # removes the same number of decoded frames and audio samples before
         # writing it.
-        return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), run
+        return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), run, sampled_latent
 
     @staticmethod
-    def _vae_context(conditioning, vae, latent, context_frames, context_length, use_audio_context):
-        """Fallback when no compatible cached AV latent is available.
+    def _vae_context(conditioning, vae, latent, context_frames, context_length, use_audio_context,
+                     context_latent=None):
+        """Encode the disk-video tail with the workflow-compatible Guide path.
 
-        This keeps old workflows usable without an external Motion Context
-        installation.  The native core receives arbitrary guide frames
-        directly; a legacy core receives the internally patched equivalent.
+        This also serves as the compatibility fallback when no cached AV latent
+        is available. The native core receives guide frames directly; a legacy
+        core receives the internally patched equivalent.
         """
         target_parts = _av_latent_parts(latent)
         if target_parts is None or not torch.is_tensor(target_parts[0]) or target_parts[0].ndim != 5:
@@ -3989,18 +5524,21 @@ class H3AutoDirectorMotionContext:
         if not torch.is_tensor(encoded) or encoded.ndim != 5:
             raise ValueError("H3 视频 VAE 未返回 [B,C,T,H,W] latent")
         steps = min(int(encoded.shape[2]), int(target_video.shape[2]))
+        sampled_latent = latent
         if _native_h3_add_guide_supported():
             keyframes = [{"resolved_frame_index": 0, "latent": encoded[:, :, :steps].to(
                 device=target_video.device, dtype=target_video.dtype), _NATIVE_CONTEXT_KEY: True}]
-            if _h3_pixel_frames(int(target_video.shape[2])) > int(run) and steps > 0:
-                keyframes.append({"resolved_frame_index": int(run),
-                                  "latent": encoded[:, :, steps - 1:steps].to(
-                                      device=target_video.device, dtype=target_video.dtype),
-                                  _NATIVE_CONTEXT_KEY: True})
             values = {"minimax_keyframes": keyframes, _NATIVE_CONTEXT_KEY: True,
                       "h3_auto_director_context_run": int(run)}
+            if bool(use_audio_context) and context_latent is not None:
+                try:
+                    audio_tail, _audio_steps, _overhang = _h3_audio_tail_from_latent(context_latent, run)
+                    keyframes[0]["audio_latent"] = audio_tail.to(
+                        device=target_video.device, dtype=target_video.dtype)
+                except (ValueError, RuntimeError) as exc:
+                    LOG.warning("H3 Auto Director: 帧 Guide 音频上下文不可用，保留画面上下文：%s", exc)
             LOG.info("H3 Auto Director: 使用新版原生 Guide VAE 回退上下文：视频 keyframe=%d，音频上下文不可用", len(keyframes))
-            return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), run
+            return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), run, sampled_latent
         from . import legacy_h3_motion
         if not legacy_h3_motion.ensure_legacy_h3_motion_context():
             raise RuntimeError("当前旧版 ComfyUI 无法启用内置 H3 Motion Context 兼容层")
@@ -4012,34 +5550,49 @@ class H3AutoDirectorMotionContext:
         keyframes = [{"resolved_frame_index": 0, legacy_h3_motion.MC_KEY: frame,
                       "latent": encoded[:, :, index:index + 1].to(device=target_video.device, dtype=target_video.dtype)}
                      for index, frame in enumerate(offsets)]
-        if _h3_pixel_frames(int(target_video.shape[2])) > int(run) and steps > 0:
-            keyframes.append({"resolved_frame_index": int(run), legacy_h3_motion.MC_KEY: int(run),
-                              "latent": encoded[:, :, steps - 1:steps].to(
-                                  device=target_video.device, dtype=target_video.dtype)})
         values = {"minimax_keyframes": keyframes,
                   "minimax_frame_count": _h3_pixel_frames(int(target_video.shape[2])),
                   "h3_auto_director_context_run": int(run)}
+        if bool(use_audio_context) and context_latent is not None:
+            try:
+                audio_tail, audio_steps, overhang = _h3_audio_tail_from_latent(context_latent, run)
+                values["minimax_refs"] = [{"kind": "audio", "ref_audio_t": audio_steps,
+                                             "audio_latent": audio_tail,
+                                             legacy_h3_motion.MC_AUDIO_KEY: float(run) + float(overhang) / (5.0 / 3.0)}]
+            except (ValueError, RuntimeError) as exc:
+                LOG.warning("H3 Auto Director: 旧版帧 Guide 音频上下文不可用，保留画面上下文：%s", exc)
         LOG.info("H3 Auto Director: 使用内置旧版 Motion Context VAE 回退：视频 keyframe=%d，音频上下文不可用", len(keyframes))
-        return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), run
+        return _mark_motion_context(node_helpers.conditioning_set_values(conditioning, values)), run, sampled_latent
 
-    def apply(self, conditioning, vae, latent, context_frames, use_video_context, use_audio_context, context_length, context_latent=None, use_video_latent=True):
+    def apply(self, conditioning, vae, latent, context_frames, use_video_context, use_audio_context,
+              context_length, context_latent=None, use_video_latent=True,
+              context_method="工作流视频帧 Guide", context_sampled_start_tokens=0,
+              context_sampled_start_strength=0.25, context_sampled_tokens=2,
+              context_sampled_strength=0.25, **_legacy_noise):
         global _LAST_MOTION_CONTEXT_TRIM
         stage2_context = context_latent.get("h3_stage2_context_latent") if isinstance(context_latent, dict) else None
+        method = str(context_method or "工作流视频帧 Guide")
         def with_stage2(value):
             global _LAST_MOTION_CONTEXT_TRIM
             context_trim = int(value[1]) if isinstance(value, (list, tuple)) and len(value) > 1 else 0
+            sampling_latent = value[2] if isinstance(value, (list, tuple)) and len(value) > 2 else latent
             _LAST_MOTION_CONTEXT_TRIM = max(0, context_trim)
             if context_trim > 0:
                 LOG.info("H3 Auto Director: 上下文裁剪=%d 帧",
                          _LAST_MOTION_CONTEXT_TRIM)
-            if stage2_context is None:
-                return (value[0], _LAST_MOTION_CONTEXT_TRIM) if isinstance(value, (list, tuple)) and len(value) > 1 else value
-            return (self._attach_stage2_context(value[0], stage2_context), _LAST_MOTION_CONTEXT_TRIM)
+            conditioned = value[0] if isinstance(value, (list, tuple)) and value else value
+            if stage2_context is not None:
+                conditioned = self._attach_stage2_context(conditioned, stage2_context)
+            return (conditioned, _LAST_MOTION_CONTEXT_TRIM, sampling_latent)
         if not use_video_context:
             if bool(use_audio_context) and context_latent is not None:
                 try:
                     result = self._direct_latent_context(conditioning, latent, context_latent, context_length,
-                                                         True, use_video_context=False)
+                                                         True, use_video_context=False,
+                                                         sampled_context_start_tokens=0,
+                                                         sampled_context_start_strength=context_sampled_start_strength,
+                                                         sampled_context_tokens=0,
+                                                         sampled_context_strength=context_sampled_strength)
                     LOG.info("H3 Auto Director: 应用音频上下文（无视频 keyframe），音频 ref=%d，ref_audio_t=%d",
                              sum(1 for entry in result[0] if isinstance(entry, (list, tuple))
                                  for value in [entry[1]] if isinstance(value, dict)
@@ -4050,9 +5603,39 @@ class H3AutoDirectorMotionContext:
                 except (ValueError, RuntimeError) as exc:
                     LOG.info("H3 Auto Director: 音频上下文直取不可用，跳过音频上下文：%s", exc)
             return with_stage2((self._attach_stage2_context(conditioning, stage2_context), 0))
-        if bool(use_video_latent) and context_latent is not None:
+        deferred_decode = bool(isinstance(context_latent, dict) and context_latent.get("h3_deferred_decode"))
+        use_direct_latent = ((bool(use_video_latent) or deferred_decode) and context_latent is not None
+                             and (method == "缓存视频 latent 直取"
+                                  or method == "自动（latent 优先）"
+                                  or deferred_decode))
+        if deferred_decode and method != "缓存视频 latent 直取":
+            LOG.info("H3 Auto Director: 已开启所有片段采样完成后统一解码，视频上下文强制使用缓存潜空间直取")
+        # A stage-one cache may predate the separate context-video directory.
+        # If the workflow-compatible frame input is only the inert placeholder,
+        # transparently fall back to its cached latent instead of encoding a
+        # 1x1 black frame as a false continuation source.
+        if (not use_direct_latent and context_latent is not None
+                and torch.is_tensor(context_frames) and context_frames.ndim == 4
+                and (int(context_frames.shape[0]) <= 1 or int(context_frames.shape[1]) <= 1
+                     or int(context_frames.shape[2]) <= 1)):
+            use_direct_latent = bool(use_video_latent)
+            if use_direct_latent:
+                LOG.warning("H3 Auto Director: 上下文视频缓存不可用，回退到 AV latent 直取")
+        if (int(context_sampled_start_tokens or 0) > 0 or int(context_sampled_tokens or 0) > 0) and not use_direct_latent:
+            LOG.info(
+                "H3 Auto Director: 已设置首部/末端可采样 token=%d/%d，但当前为视频帧 Guide 路径；"
+                "该参数仅在‘缓存视频 latent 直取’或‘自动（latent 优先）’路径生效",
+                int(context_sampled_start_tokens), int(context_sampled_tokens),
+            )
+        if use_direct_latent:
             try:
-                result = self._direct_latent_context(conditioning, latent, context_latent, context_length, use_audio_context)
+                result = self._direct_latent_context(
+                    conditioning, latent, context_latent, context_length, use_audio_context,
+                    sampled_context_start_tokens=context_sampled_start_tokens,
+                    sampled_context_start_strength=context_sampled_start_strength,
+                    sampled_context_tokens=context_sampled_tokens,
+                    sampled_context_strength=context_sampled_strength,
+                )
                 keyframe_count = sum(1 for entry in result[0] if isinstance(entry, (list, tuple))
                                      for value in [entry[1]] if isinstance(value, dict)
                                      for kf in (value.get("minimax_keyframes") or []) if isinstance(kf, dict))
@@ -4065,7 +5648,8 @@ class H3AutoDirectorMotionContext:
                 return with_stage2(result)
             except ValueError as exc:
                 LOG.info("H3 Auto Director: 视频 latent 直取不可用，回退 VAE 上下文编码：%s", exc)
-        result = self._vae_context(conditioning, vae, latent, context_frames, context_length, use_audio_context)
+        result = self._vae_context(conditioning, vae, latent, context_frames, context_length,
+                                    use_audio_context, context_latent=context_latent)
         return with_stage2(result)
 
 
@@ -4301,6 +5885,44 @@ def _encode_concat_with_fallback(ffmpeg, list_path, output, video_format, video_
     raise RuntimeError("最终视频编码失败（GPU失败后已回退CPU，未继续重试）：\n" + "\n".join(errors)[-3500:])
 
 
+def _trim_disk_video(path: Path, output: Path, trim_frames: int, fps=FPS,
+                     video_format="mp4", video_codec="h264", quality="最高质量"):
+    """Decode a saved segment, remove its context prefix, and re-encode it.
+
+    This is intentionally used only during final assembly (when all segment
+    files are already durable).  The normal per-segment save path remains
+    lossless with respect to its selected encoder and keeps the untrimmed
+    context source separately.
+    """
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("未找到 ffmpeg，无法在最终拼接前裁剪磁盘片段")
+    trim_frames = max(0, int(trim_frames or 0))
+    if trim_frames <= 0:
+        shutil.copy2(path, output)
+        return
+    fmt = str(video_format or "mp4").lower().lstrip(".")
+    codec = str(video_codec or "h264").lower()
+    encoder = VIDEO_CODECS.get(codec, VIDEO_CODECS["h264"])["cpu"]
+    start_seconds = float(trim_frames) / float(fps or FPS)
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
+               "-map", "0:v:0", "-map", "0:a:0?",
+               "-vf", f"trim=start_frame={trim_frames},setpts=PTS-STARTPTS",
+               "-af", f"atrim=start={start_seconds:.9f},asetpts=PTS-STARTPTS",
+               "-c:v", encoder]
+    command.extend(_quality_args(codec, "cpu", quality))
+    command.extend(["-pix_fmt", "yuv420p", "-c:a", ("libopus" if fmt == "webm" else "aac"),
+                    "-shortest"])
+    if fmt in {"mp4", "mov"}:
+        command.extend(["-movflags", "+faststart"])
+    command.extend(["-f", VIDEO_FORMATS.get(fmt, "mp4"), str(output)])
+    result = subprocess.run(command, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
+        output.unlink(missing_ok=True)
+        raise RuntimeError("最终拼接前裁剪片段失败：%s" % ((result.stderr or "")[-1600:]))
+    _verify_video_stream(output)
+
+
 def _write_segment_video(path: Path, images, audio, fps, video_format, video_codec, encoder_device, quality):
     """Encode an image sequence and mux its optional audio atomically."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -4434,6 +6056,7 @@ class H3AutoDirectorSaveSegment:
             audio = stage1_audio_override
             LOG.info("H3 Auto Director: 保存第 %d 段时使用一采音频覆盖外部 AUDIO 输入", int(segment_index))
         global _LAST_MOTION_CONTEXT_TRIM
+        deferred_decode = bool(plan.get("decode_after_all_segments", False))
         requested_trim = int(trim_frames or 0)
         motion_trim = _LAST_MOTION_CONTEXT_TRIM
         configured_trim = max(0, int(plan.get("auto_context_crop_frames", 0) or 0))
@@ -4460,7 +6083,8 @@ class H3AutoDirectorSaveSegment:
                     int(segment_index), int(requested_trim),
                 )
             requested_trim = 0
-        images, audio = _trim_context_prefix(images, audio, requested_trim, FPS)
+        if not deferred_decode:
+            images, audio = _trim_context_prefix(images, audio, requested_trim, FPS)
         if requested_trim > 0:
             LOG.info("H3 Auto Director: 保存第 %d 段前裁剪上下文头部 %d 帧，避免拼接重复", int(segment_index), requested_trim)
         if stage1_latent is None:
@@ -4496,7 +6120,9 @@ class H3AutoDirectorSaveSegment:
         images_to_save = images
         segment_number = int(segment_index)
         correction_mode = str(color_correction)
-        if correction_mode in {"匹配首段", "匹配上段"} and segment_number <= 1:
+        if deferred_decode:
+            LOG.info("H3 Auto Director: 统一解码模式跳过保存节点校色，最终逐段解码时使用原始 latent")
+        elif correction_mode in {"匹配首段", "匹配上段"} and segment_number <= 1:
             LOG.info("H3 Auto Director: color correction skipped for first segment")
         elif correction_mode in {"匹配首段", "匹配上段"}:
             anchor_path = _color_reference_path(plan, segment_number, correction_mode, output_root, video_format)
@@ -4516,20 +6142,30 @@ class H3AutoDirectorSaveSegment:
                         LOG.info("H3 Auto Director: matched segment %d colors to %s", segment_number, anchor_path)
                 except Exception as exc:
                     LOG.warning("H3 Auto Director: color correction skipped for segment %d: %s", segment_number, exc)
-        # Context is intentionally written from the raw decoded frames. The
-        # next segment must never inherit display-only color correction.
-        _write_segment_video(context_path, images, audio, fps, video_format, video_codec, encoder_device, quality)
-        if images_to_save is images:
-            shutil.copy2(context_path, video_path)
+        if deferred_decode:
+            # In unified-decode mode, latent is the only per-segment durable
+            # source. This prevents repeated VAE encode/decode and keeps GPU
+            # memory bounded to one segment at final assembly.
+            context_path = Path("")
+            video_path = Path("")
+            LOG.info("H3 Auto Director: 第 %d 段仅保存最终 AV latent，等待全部片段完成后逐段解码", int(segment_index))
         else:
-            _write_segment_video(video_path, images_to_save, audio, fps, video_format, video_codec, encoder_device, quality)
+            # Context is intentionally written from raw decoded frames. The
+            # next segment must never inherit display-only color correction.
+            _write_segment_video(context_path, images, audio, fps, video_format, video_codec, encoder_device, quality)
+            if images_to_save is images:
+                shutil.copy2(context_path, video_path)
+            else:
+                _write_segment_video(video_path, images_to_save, audio, fps, video_format, video_codec, encoder_device, quality)
         st_save({"video": parts[0].detach().cpu().contiguous(), "audio": parts[1].detach().cpu().contiguous()}, str(latent_path), metadata={"format": "h3_auto_director_av_v1", "segment_index": str(int(segment_index))})
+        stage1_cache_path = None
         if stage1_latent is not None:
             stage1_parts = _av_latent_parts(stage1_latent)
             if stage1_parts is not None:
                 stage1_audio = _normalize_h3_audio_latent(stage1_parts[1], "保存前一采音频 latent")
                 _, stage1_cache = _paths(plan, int(segment_index), output_root, video_format,
                                          for_write=True, for_context=True, context_stage=1)
+                stage1_cache_path = stage1_cache
                 stage1_cache.parent.mkdir(parents=True, exist_ok=True)
                 st_save({"video": stage1_parts[0].detach().cpu().contiguous(),
                          "audio": stage1_audio.detach().cpu().contiguous()},
@@ -4542,9 +6178,24 @@ class H3AutoDirectorSaveSegment:
                     _write_segment_video(stage1_video, stage1_images, audio, fps,
                                          video_format, video_codec, encoder_device, quality)
                 LOG.info("H3 Auto Director: 已保存第 %d 段一采上下文 latent 与二采上下文 latent", int(segment_index))
+        state_path = _state_path(plan)
+        state = _load_json(state_path, {"version": 3, "segments": {}})
+        segment_state = state.setdefault("segments", {}).setdefault(str(int(segment_index)), {})
+        segment_state.update({
+            "status": "completed",
+            "video": str(video_path) if not deferred_decode else "",
+            "context_video": str(context_path) if not deferred_decode else "",
+            "latent": str(latent_path),
+            "stage1_latent": str(stage1_cache_path) if stage1_cache_path is not None else "",
+            "context_trim_frames": int(requested_trim),
+            "fps": float(fps),
+        })
+        state["last_completed"] = int(segment_index)
+        _atomic_json(state_path, state)
         _LAST_STAGE1_CONTEXT = None
         _LAST_MOTION_CONTEXT_TRIM = None
-        return (str(video_path), str(latent_path))
+        saved_video = "已缓存最终潜空间（等待统一解码）" if deferred_decode else str(video_path)
+        return (saved_video, str(latent_path))
 
 
 class H3AutoDirectorController:
@@ -4559,6 +6210,7 @@ class H3AutoDirectorController:
             "encoder_device": (list(ENCODER_DEVICES), {"default": "CPU"}),
             "quality": (list(QUALITY_CHOICES), {"default": "最高质量"}),
         }, "optional": {
+            "video_vae": ("VAE",), "audio_vae": ("VAE",),
             "cleanup_after_final": ("BOOLEAN", {"default": True, "tooltip": "仅在最终视频拼接成功且文件确认非空后清理显存。"}),
         }, "hidden": {"prompt": "PROMPT", "client_id": "CLIENT_ID"}}
 
@@ -4591,7 +6243,7 @@ class H3AutoDirectorController:
                 pass
 
     @staticmethod
-    def _assemble(plan, output_name="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量"):
+    def _assemble(plan, output_name="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量", video_vae=None, audio_vae=None):
         ffmpeg = _find_ffmpeg()
         if not ffmpeg:
             raise RuntimeError("未找到 ffmpeg，无法拼接 H3 片段。请重启 ComfyUI，或设置环境变量 FFMPEG_PATH 指向 ffmpeg.exe。")
@@ -4608,14 +6260,57 @@ class H3AutoDirectorController:
         list_path = project_dir / "json" / "concat.txt"
         list_path.parent.mkdir(parents=True, exist_ok=True)
         lines = []
+        assembly_dir = project_dir / "json" / ".assembly_segments"
+        assembly_dir.mkdir(parents=True, exist_ok=True)
+        state = _load_json(_state_path(plan), {"segments": {}})
         for index in range(1, len(plan.get("segments", [])) + 1):
-            clip, _ = _paths(plan, index, output_name)
-            if not clip.is_file():
+            # The controller may run in a later queued task, after the sampler
+            # has released its tensors.  Always resolve the numbered clip and
+            # final AV latent from the project directory on disk; never rely
+            # on an in-memory output from the last segment.
+            clip, latent_path = _paths(plan, index, output_name)
+            deferred_decode = bool(plan.get("decode_after_all_segments", False))
+            if not deferred_decode and not clip.is_file():
                 raise FileNotFoundError("Cannot assemble; missing segment video: %s" % clip)
-            lines.append("file '%s'" % str(clip).replace("'", "'\\''"))
+            if not latent_path.is_file():
+                raise FileNotFoundError("Cannot assemble; missing final AV latent cache for segment %d: %s" % (index, latent_path))
+            entry = (state.get("segments") or {}).get(str(index), {})
+            # SaveSegment owns context cropping. In deferred mode it records
+            # the chosen value here and final assembly applies exactly that
+            # recorded value while decoding each latent; no second policy or
+            # inference is permitted in the controller.
+            trim = max(0, int(entry.get("context_trim_frames", 0) or 0))
+            if deferred_decode:
+                if video_vae is None or audio_vae is None:
+                    raise RuntimeError("开启“所有片段采样完成后统一解码”时，拼接节点必须连接视频 VAE 和音频 VAE")
+                parts = _av_latent_parts(_load_av_latent(latent_path))
+                if parts is None:
+                    raise ValueError("第 %d 段缓存不是 H3 联合 AV latent" % index)
+                decoded_images = _decode_h3_video(video_vae, parts[0])
+                decoded_audio, sample_rate = _decode_h3_audio(audio_vae, parts[1])
+                audio_data = {"waveform": decoded_audio, "sample_rate": sample_rate}
+                if trim > 0:
+                    decoded_images, audio_data = _trim_context_prefix(decoded_images, audio_data, trim, FPS)
+                source = assembly_dir / ("H3_%05d%s" % (index, "." + str(video_format).lower().lstrip(".")))
+                _write_segment_video(source, decoded_images, audio_data, FPS, video_format, video_codec, encoder_device, quality)
+                LOG.info("H3 Auto Director: 统一解码逐段处理第 %d 段（裁剪 %d 帧）", index, trim)
+                del decoded_images, decoded_audio, audio_data, parts
+                if torch.cuda.is_available():
+                    try: model_management.soft_empty_cache()
+                    except Exception: pass
+            else:
+                _verify_video_stream(clip)
+                LOG.info("H3 Auto Director: 从磁盘读取第 %d 段视频与最终 latent：%s / %s", index, clip, latent_path)
+                source = clip
+            lines.append("file '%s'" % str(source).replace("'", "'\\''"))
         list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         tmp = final_path.with_name(final_path.stem + ".final_tmp" + final_path.suffix)
-        _encode_concat_with_fallback(ffmpeg, list_path, tmp, fmt, codec, encoder_device, quality)
+        try:
+            _encode_concat_with_fallback(ffmpeg, list_path, tmp, fmt, codec, encoder_device, quality)
+        finally:
+            # Temporary decoded/cropped segment files are disposable and must
+            # never be mistaken for resumable project cache.
+            shutil.rmtree(assembly_dir, ignore_errors=True)
         # A transfer project can replace all generated segment soundtracks
         # with the original reference video's complete audio stream. Do this
         # after video concatenation so segment padding cannot duplicate or
@@ -4651,7 +6346,7 @@ class H3AutoDirectorController:
         os.replace(tmp, final_path)
         return str(final_path)
 
-    def advance(self, plan, segment_index, saved_video, segment_node_id, output_root="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量", cleanup_after_final=True, prompt=None, client_id=None):
+    def advance(self, plan, segment_index, saved_video, segment_node_id, output_root="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量", video_vae=None, audio_vae=None, cleanup_after_final=True, prompt=None, client_id=None):
         total = len(plan.get("segments", []))
         runtime = dict(plan)
         # ``plan.project_dir`` is authoritative.  In particular, TTS segments
@@ -4662,7 +6357,10 @@ class H3AutoDirectorController:
         state = _load_json(state_path, {"version": 1, "segments": {}})
         mode = str(runtime.get("mode", ""))
         saved_key = "audio" if mode == "tts" else "video"
-        state.setdefault("segments", {})[str(int(segment_index))] = {"status": "completed", saved_key: saved_video}
+        # Preserve SaveSegment's durable paths (final latent, raw context
+        # video, crop count) while recording the controller output.
+        segment_state = state.setdefault("segments", {}).setdefault(str(int(segment_index)), {})
+        segment_state.update({"status": "completed", saved_key: saved_video})
         state["last_completed"] = int(segment_index)
         _atomic_json(state_path, state)
         if int(segment_index) >= total or not bool(plan.get("auto_run", True)):
@@ -4672,7 +6370,8 @@ class H3AutoDirectorController:
                     final_path = ""
                     state["final_audio"] = ""
                 else:
-                    final_path = self._assemble(runtime, output_root, video_format, video_codec, encoder_device, quality)
+                    final_path = self._assemble(runtime, output_root, video_format, video_codec, encoder_device, quality,
+                                                 video_vae=video_vae, audio_vae=audio_vae)
                     final_file = Path(final_path)
                     if not final_file.is_file() or final_file.stat().st_size <= 0:
                         raise RuntimeError("最终输出拼接返回了空文件，已保留显存与运行状态供排查")
@@ -4742,7 +6441,7 @@ class H3AutoDirectorTTSController(H3AutoDirectorController):
     CATEGORY = "H3 自动导演/TTS"
 
     @staticmethod
-    def _assemble(plan, output_name="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量"):
+    def _assemble(plan, output_name="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量", **_unused):
         ffmpeg = _find_ffmpeg()
         if not ffmpeg:
             raise RuntimeError("未找到 ffmpeg，无法拼接 TTS 音频")
@@ -4841,6 +6540,10 @@ NODE_CLASS_MAPPINGS = {
     "H3AutoDirectorPlan": H3AutoDirectorPlan,
     "H3AutoDirectorTTSPlan": H3AutoDirectorTTSPlan,
     "H3AutoDirectorVideoTransferPlan": H3AutoDirectorVideoTransferPlan,
+    "H3AutoDirectorControlPreprocess": H3AutoDirectorControlPreprocess,
+    "H3AutoDirectorControlConfig": H3AutoDirectorControlConfig,
+    "H3AutoDirectorControlExport": H3AutoDirectorControlExport,
+    "H3AutoDirectorControlBackendCheck": H3AutoDirectorControlBackendCheck,
     "H3AutoDirectorHybridModelLoader": H3AutoDirectorHybridModelLoader,
     "H3AutoDirectorTransferModelLoader": H3AutoDirectorTransferModelLoader,
     "H3AutoDirectorDualStageModelLoader": H3AutoDirectorDualStageModelLoader,
@@ -4848,6 +6551,8 @@ NODE_CLASS_MAPPINGS = {
     "H3AutoDirectorReferenceResolver": H3AutoDirectorReferenceResolver,
     "H3AutoDirectorCachedReferenceToVideo": H3AutoDirectorCachedReferenceToVideo,
     "H3AutoDirectorResolution": H3AutoDirectorResolution,
+    "H3AutoDirectorDecodeSaveVideo": H3AutoDirectorDecodeSaveVideo,
+    "H3AutoDirectorLoadSavedAVLatent": H3AutoDirectorLoadSavedAVLatent,
     "H3AutoDirectorDualSampling": H3AutoDirectorDualSamplingModel,
     "H3AutoDirectorAVDecode": H3AutoDirectorAVDecode,
     "H3AutoDirectorTransferDecode": H3AutoDirectorTransferDecode,
@@ -4866,13 +6571,19 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3AutoDirectorPlan": "H3 自动导演｜项目计划",
     "H3AutoDirectorTTSPlan": "H3 自动导演｜TTS 项目计划",
     "H3AutoDirectorVideoTransferPlan": "H3 自动导演｜动作迁移项目计划",
+    "H3AutoDirectorControlPreprocess": "H3 动作迁移｜姿态/深度预处理",
+    "H3AutoDirectorControlConfig": "H3 动作迁移｜Union 控制配置",
+    "H3AutoDirectorControlExport": "H3 动作迁移｜导出 Union 控制视频",
+    "H3AutoDirectorControlBackendCheck": "H3 动作迁移｜Union 后端检查",
     "H3AutoDirectorHybridModelLoader": "H3 自动导演｜多模态参考模型加载",
     "H3AutoDirectorTransferModelLoader": "H3 自动导演｜动作迁移模型加载",
     "H3AutoDirectorDualStageModelLoader": "H3 自动导演｜一采/二采模型加载",
     "H3AutoDirectorSegment": "H3 自动导演｜片段设置",
     "H3AutoDirectorReferenceResolver": "H3 自动导演｜多模态素材解析",
-    "H3AutoDirectorCachedReferenceToVideo": "MiniMax H3 多模态参考生成｜提示词缓存",
+    "H3AutoDirectorCachedReferenceToVideo": "H3 自动导演｜提示词与素材缓存",
     "H3AutoDirectorResolution": "H3 自动导演｜双采样分辨率",
+    "H3AutoDirectorDecodeSaveVideo": "H3 解码｜目录批量解码并保存视频",
+    "H3AutoDirectorLoadSavedAVLatent": "H3 解码｜加载保存的 AV 潜空间",
     "H3AutoDirectorDualSampling": "H3 自动导演｜双阶段采样",
     "H3AutoDirectorAVDecode": "H3 自动导演｜AV 解码",
     "H3AutoDirectorTransferDecode": "H3 视频迁移｜按策略解码",
