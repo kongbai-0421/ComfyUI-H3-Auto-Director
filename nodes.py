@@ -8,6 +8,7 @@ silently consumes the newest rejected cache.
 from __future__ import annotations
 
 import copy
+import contextlib
 import gc
 import hashlib
 import importlib
@@ -20,7 +21,7 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
+import sys
 import uuid
 import wave
 from collections import deque
@@ -120,42 +121,19 @@ VIDEO_CODECS = {
 QUALITY_CHOICES = ("最高质量", "高质量", "平衡", "快速")
 
 
-def _direct_video_file(value):
-    """Resolve a directly selected/uploaded video file.
-
-    The standalone video tool intentionally accepts a file, never a
-    directory.  Browser uploads return an ``input/``-relative path while
-    native ComfyUI workflows may provide an absolute Windows path, so both
-    forms are normalized here.  Keeping this check in one helper prevents
-    metadata probing and decoding from disagreeing about the input.
-    """
-    raw = str(value or "").strip().strip('"')
-    if not raw:
-        raise ValueError("请直接上传或填写视频文件（支持 MP4、MKV、WebM、MOV、AVI），不能填写目录")
-    candidate = Path(raw).expanduser()
-    if not candidate.is_absolute():
-        normalized = raw.replace("\\", "/")
-        if normalized.startswith("input/"):
-            normalized = normalized[6:]
-        input_candidate = Path(folder_paths.get_input_directory()) / normalized
-        candidate = input_candidate if input_candidate.exists() else candidate
-    candidate = candidate.resolve()
-    if candidate.is_dir():
-        raise ValueError("视频加载节点仅支持直接加载视频文件，不能加载目录：%s" % candidate)
-    if not candidate.is_file():
-        raise ValueError("视频文件不存在：%s" % candidate)
-    if candidate.suffix.lower() not in VIDEO_EXTENSIONS:
-        raise ValueError("不支持的视频格式：%s（支持：%s）" % (candidate.suffix or "无扩展名", ", ".join(VIDEO_EXTENSIONS)))
-    return candidate
 ENCODER_DEVICES = ("CPU", "GPU")
 COLOR_CORRECTION_CHOICES = ("关闭", "匹配首段", "匹配上段")
 CONTEXT_DIR_NAME = "context"
 CONTEXT_STAGE1_DIR_NAME = "context_stage1"
+CONTROL_DIR_NAME = "control"
+PREPROCESSED_DIR_NAME = "preprocessed"
 DUAL_UPSCALE_CHOICES = ("普通插值", "H3 Latent 学习型放大", "普通放大模型", "RTX Video Super Resolution", "自动（RTX→普通模型→插值）")
 _MOTION_CONTEXT_MARKER = "_h3_auto_director_motion_context"
 _NATIVE_CONTEXT_KEY = "_h3_auto_director_native_context"
 _LAST_STAGE1_CONTEXT = None
 _LAST_MOTION_CONTEXT_TRIM = None
+_CONTROL_ORT_GPU_PROBES = {}
+_CONTROL_TS_GPU_VERIFIED = set()
 
 
 def _h3_canvas_dimensions(width, height):
@@ -204,6 +182,23 @@ def _find_ffmpeg():
         path = Path(value)
         if path.is_file():
             return str(path)
+    return None
+
+
+def _find_ffprobe():
+    """Find ffprobe beside the configured/system ffmpeg when available."""
+    configured = os.environ.get("FFPROBE_PATH", "").strip().strip('"')
+    candidates = [configured] if configured else []
+    found = shutil.which("ffprobe")
+    if found:
+        candidates.append(found)
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg:
+        ffmpeg_path = Path(ffmpeg)
+        candidates.append(ffmpeg_path.with_name("ffprobe" + ffmpeg_path.suffix))
+    for value in candidates:
+        if value and Path(value).is_file():
+            return str(Path(value))
     return None
 
 
@@ -358,6 +353,7 @@ def _prompt_disk_fingerprint(plan, generation_index, width, height, ref_image_si
         "global_assets": plan.get("global_assets", []),
         "continuation_mode": plan.get("continuation_mode", True),
         "video_continuation": plan.get("video_continuation"),
+        "use_reference_video_material": plan.get("use_reference_video_material", True),
         "segment_index": int(generation_index),
         "segment": seg,
         "prompt": prompt,
@@ -562,6 +558,12 @@ def _segment_reference_specs(plan, generation_index: int):
     seg = _segment(plan, int(generation_index))
     global_set = bool(plan.get("global_reference_set", True))
     refs = list(plan.get("global_assets", [])) if global_set else list(seg.get("references", []))
+    # Transfer plans may use the uploaded source video only as a timeline for
+    # preprocessing. Keep its per-segment record in the plan for control-node
+    # slicing, but do not expose it to H3 multimodal conditioning when the
+    # user disabled "作为参考素材".
+    if str(plan.get("mode", "")) == "video_transfer" and not bool(plan.get("use_reference_video_material", True)):
+        refs = [ref for ref in refs if not (isinstance(ref, dict) and ref.get("type") == "transfer_video_segment")]
     if global_set and int(generation_index) != 1:
         # Global mode reuses the first segment's files as ordinary references,
         # but timed insertion belongs only to the segment where it was set.
@@ -1635,7 +1637,63 @@ def _prepare_stage2_conditioning(conditioning, latent, use_context, context_sour
     return adapt_keyframe_grids(prepared)
 
 
-def _attach_union_control_conditioning(conditioning, control_config):
+def _control_model_capability(model):
+    """Return whether a ComfyUI MODEL exposes a real H3 Union control path.
+
+    ``h3_union_control`` is deliberately not treated as a magic conditioning
+    key: the stock MiniMaxH3 model ignores unknown metadata.  A compatible
+    backend must expose control blocks (or an explicit Union adapter) on the
+    diffusion model.  This probe keeps the distinction visible in logs and in
+    the payload consumed by downstream adapters.
+    """
+    candidates = [model, getattr(model, "model", None)]
+    for parent in tuple(candidates):
+        if parent is None:
+            continue
+        candidates.extend([
+            getattr(parent, "diffusion_model", None),
+            getattr(parent, "model", None),
+            getattr(getattr(parent, "model", None), "diffusion_model", None),
+        ])
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if getattr(candidate, "h3_union_control", None) is not None:
+            return True, "h3_union_control"
+        if getattr(candidate, "control_blocks", None) is not None:
+            return True, "control_blocks"
+        name = candidate.__class__.__name__.lower()
+        if "controltransformer" in name or "controlpipeline" in name:
+            return True, candidate.__class__.__name__
+    return False, "native_minimax_h3_without_control_blocks"
+
+
+def _audit_control_frames(images, label="控制视频"):
+    """Validate the tensor contract expected by VideoX-Fun H3 ControlNet."""
+    if not torch.is_tensor(images) or images.ndim != 4:
+        raise ValueError(f"{label}必须是 [帧,高,宽,RGB] IMAGE，实际形状={getattr(images, 'shape', None)}")
+    if int(images.shape[-1]) < 3:
+        raise ValueError(f"{label}必须至少有 3 个颜色通道")
+    if int(images.shape[0]) < 5 or int(images.shape[0]) % 17 != 5:
+        raise ValueError(
+            f"{label}帧数={int(images.shape[0])} 不符合 H3 的 17*n+5 网格；"
+            "请重新执行预处理节点进行尾帧对齐"
+        )
+    h, w = int(images.shape[1]), int(images.shape[2])
+    multiple = max(32, int(getattr(_minimax_h3, "CANVAS_MULTIPLE", 32) or 32))
+    if h < multiple or w < multiple or h % multiple or w % multiple:
+        raise ValueError(f"{label}尺寸={w}x{h} 无效，必须是 {multiple} 的倍数")
+    if not bool(torch.isfinite(images).all()):
+        raise ValueError(f"{label}包含 NaN/Inf，无法交给 ControlNet")
+    min_value = float(images.amin().item())
+    max_value = float(images.amax().item())
+    if min_value < -1e-3 or max_value > 1.001:
+        raise ValueError(f"{label}数值范围={min_value:.4f}..{max_value:.4f}，应为 0..1")
+    return {"frames": int(images.shape[0]), "width": w, "height": h,
+            "min": min_value, "max": max_value}
+
+
+def _attach_union_control_conditioning(conditioning, control_config, model=None):
     """Attach persisted Union control metadata without copying control tensors.
 
     The native H3 transformer ignores unknown conditioning values, while a
@@ -1646,22 +1704,78 @@ def _attach_union_control_conditioning(conditioning, control_config):
         return conditioning
     if not bool(control_config.get("enabled")):
         return conditioning
+    model_capable, model_backend = _control_model_capability(model)
     payload = {
         "type": "h3_union_control",
         "control_mode": str(control_config.get("control_mode", "姿态+深度")),
+        "preprocess_device": str(control_config.get("preprocess_device", "GPU")),
+        "pose_model_profile": str(control_config.get("pose_model_profile", POSE_MODEL_PROFILES[0])),
+        "depth_model_profile": str(control_config.get("depth_model_profile", DEPTH_MODEL_PROFILES[1])),
         "pose_weight": float(control_config.get("pose_weight", 0.0) or 0.0),
         "depth_weight": float(control_config.get("depth_weight", 0.0) or 0.0),
         "segment_index": int(control_config.get("segment_index", 1) or 1),
         "fps": float(control_config.get("fps", FPS) or FPS),
         "frame_grid": str(control_config.get("frame_grid", "17*n+5")),
         "segments": copy.deepcopy(control_config.get("segments", {})),
+        "preprocess_status": str(control_config.get("preprocess_status", "unknown")),
         "requires_videox_fun": bool(control_config.get("requires_videox_fun", True)),
+        "control_backend": model_backend if model_capable else "metadata_only",
+        "control_applied": bool(model_capable),
     }
     LOG.info(
-        "H3 Auto Director: 已将 Union 控制接入采样条件：模式=%s，姿态权重=%.3f，深度权重=%.3f，片段=%d",
-        payload["control_mode"], payload["pose_weight"], payload["depth_weight"], payload["segment_index"],
+        "H3 Auto Director: 已将 Union 控制元数据附加到采样条件：模式=%s，设备=%s，姿态权重=%.3f，深度权重=%.3f，片段=%d",
+        payload["control_mode"], payload["preprocess_device"], payload["pose_weight"], payload["depth_weight"], payload["segment_index"],
     )
-    return node_helpers.conditioning_set_values(conditioning, {"h3_union_control": payload})
+    selected_record = (payload.get("segments") or {}).get(str(payload["segment_index"]))
+    if selected_record is None:
+        LOG.warning("H3 Auto Director: 当前片段 %d 没有预处理控制记录；请先执行姿态/深度预处理节点",
+                    payload["segment_index"])
+    else:
+        LOG.info("H3 Auto Director: 当前片段 %d 控制素材已传递：姿态=%s，深度=%s，帧数=%s",
+                 payload["segment_index"],
+                 "有" if selected_record.get("pose_path") else "无",
+                 "有" if selected_record.get("depth_path") else "无",
+                 selected_record.get("frames", 0))
+        for key, label in (("pose_file_audit", "姿态"), ("depth_file_audit", "深度")):
+            audit = selected_record.get(key)
+            if isinstance(audit, dict):
+                if audit.get("valid") is False:
+                    LOG.warning("H3 Auto Director: 当前片段 %d %s控制视频容器审计失败：%s",
+                                payload["segment_index"], label, audit.get("reason", "未知错误"))
+                else:
+                    LOG.info("H3 Auto Director: 当前片段 %d %s控制视频审计=%s",
+                             payload["segment_index"], label,
+                             "通过" if audit.get("valid") is True else audit.get("reason", "未执行"))
+    if model_capable:
+        LOG.info("H3 Auto Director: 当前采样模型检测到 ControlNet 执行接口（%s）", model_backend)
+    else:
+        LOG.warning(
+            "H3 Auto Director: 原生 MiniMaxH3Model 不会执行 Union ControlNet；"
+            "当前仅传递控制路径元数据（后端=%s）。请使用 VideoX-Fun MiniMaxH3ControlPipeline/"
+            "ControlTransformer，或连接带 control_blocks 的 H3 模型。",
+            model_backend,
+        )
+    # ComfyUI 0.34 can expose a CONDITIONING value as a single pair, while
+    # some compatibility/cache nodes may hand us a wrapper containing invalid
+    # entries.  ``node_helpers.conditioning_set_values`` assumes every item is
+    # exactly ``[embedding, metadata]`` and crashes with ``IndexError`` on
+    # those wrappers.  Update only valid pairs and preserve the original
+    # contract for anything else so control injection never aborts sampling.
+    entries = _conditioning_entries(conditioning)
+    valid_count = 0
+    updated = []
+    for entry in entries:
+        if not _is_conditioning_entry(entry):
+            updated.append(entry)
+            continue
+        metadata = dict(entry[1])
+        metadata["h3_union_control"] = payload
+        updated.append([entry[0], metadata, *entry[2:]])
+        valid_count += 1
+    if valid_count == 0:
+        LOG.warning("H3 Auto Director: 条件格式不是标准 CONDITIONING pair，跳过 Union 元数据注入（保留原条件）")
+        return conditioning
+    return updated
 
 
 def _flatten_video_frames(images):
@@ -1917,510 +2031,6 @@ def _upscale_rtx(images, width, height, quality="HIGH"):
     return restore(out)
 
 
-class H3AutoDirectorVideoSRVFI:
-    """Streaming video super-resolution + frame interpolation.
-
-    VFI is delegated to the installed ComfyUI-Frame-Interpolation nodes. Source
-    frames are super-resolved first, then sent to VFI in small overlapping
-    windows. Only one VFI window and one RTX-VSR frame are resident on the GPU
-    at a time; output frames are moved back to CPU before the next window.
-    """
-
-    MODEL_CHOICES = (
-        "AMT-G（通用高质量）",
-        "GMFSS Fortuna（动漫优先）",
-        "RIFE 4.9（速度优先）",
-    )
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {
-            "input_fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 0.01}),
-            "interpolation_multiplier": ("INT", {"default": 2, "min": 2, "max": 8}),
-            "vfi_model": (list(cls.MODEL_CHOICES), {"default": cls.MODEL_CHOICES[0]}),
-            "sr_frame_count": ("INT", {"default": 8, "min": 2, "max": 64,
-                                      "tooltip": "每批一次送入超分模型处理的帧数；越小越省显存。"}),
-            "sr_scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.05,
-                            "tooltip": "相对原视频分辨率的倍率；目标宽高会按源视频尺寸计算并对齐到 32 的倍数。"}),
-            "sr_quality": (["低", "中", "高", "最高"], {"default": "最高"}),
-        }, "optional": {
-            "frames": ("IMAGE",),
-            "video_source": ("H3_VIDEO_SOURCE",),
-            "enable_rtx_vsr": ("BOOLEAN", {"default": True, "tooltip": "开启后使用 NVIDIA RTX Video Super Resolution；失败时明确报错，不会静默产生低质量结果。"}),
-        }}
-
-    RETURN_TYPES = ("IMAGE", "FLOAT", "STRING", "INT")
-    RETURN_NAMES = ("超分补帧视频", "输出帧率", "处理信息", "超分处理帧数")
-    FUNCTION = "process"
-    CATEGORY = "H3 自动导演/视频工具"
-
-    @staticmethod
-    def _run_vfi(model_name, frames, multiplier):
-        mapping = getattr(nodes, "NODE_CLASS_MAPPINGS", {})
-        if model_name.startswith("AMT"):
-            cls = mapping.get("AMT VFI")
-            kwargs = {"ckpt_name": "amt-g.pth"}
-        elif model_name.startswith("GMFSS"):
-            cls = mapping.get("GMFSS Fortuna VFI")
-            kwargs = {"ckpt_name": "GMFSS_fortuna_union"}
-        else:
-            cls = mapping.get("RIFE VFI")
-            kwargs = {"ckpt_name": "rife49.pth", "fast_mode": True, "ensemble": False, "scale_factor": 1.0}
-        if cls is None:
-            raise RuntimeError("未找到视频补帧节点，请安装并启用 ComfyUI-Frame-Interpolation（AMT/GMFSS/RIFE）")
-        kwargs.update({"frames": frames, "clear_cache_after_n_frames": 1, "multiplier": int(multiplier)})
-        # VFI is an inference-only stage.  Explicitly disable autograd so a
-        # third-party interpolation node cannot retain computation graphs for
-        # every processed window.
-        with torch.inference_mode():
-            result = cls().vfi(**kwargs)
-        if not isinstance(result, (tuple, list)) or not result or not torch.is_tensor(result[0]):
-            raise RuntimeError("视频补帧节点返回了无效的 IMAGE")
-        return result[0].detach().cpu().contiguous()
-
-    def process(self, input_fps, interpolation_multiplier, vfi_model,
-                sr_frame_count, sr_scale, sr_quality, frames=None,
-                video_source=None, enable_rtx_vsr=True):
-        if video_source is not None:
-            if not isinstance(video_source, dict) or not video_source.get("path"):
-                raise ValueError("视频源句柄无效")
-            frames = H3AutoDirectorVideoLoad.decode_all(video_source.get("path"), int(sr_frame_count))
-        if not torch.is_tensor(frames) or frames.ndim not in (4, 5):
-            raise ValueError("视频超分补帧输入必须是 4/5 维 IMAGE")
-        flat, _restore = _flatten_video_frames(frames)
-        # Keep only the flattened view; retaining both names needlessly keeps
-        # an additional Python reference alive throughout the long operation.
-        del frames
-        if flat.shape[0] < 2:
-            raise ValueError("视频补帧至少需要 2 帧")
-        try:
-            multiplier_value = float(interpolation_multiplier)
-            multiplier = max(2, int(multiplier_value)) if math.isfinite(multiplier_value) else 2
-        except (TypeError, ValueError, OverflowError):
-            multiplier = 2
-        try:
-            source_fps_value = float(input_fps)
-            source_fps = max(1.0, source_fps_value) if math.isfinite(source_fps_value) else 24.0
-        except (TypeError, ValueError, OverflowError):
-            source_fps = 24.0
-        # VFI requires a pair of adjacent source frames.  A one-frame chunk
-        # cannot produce output until the next chunk arrives, so normalize the
-        # lower bound to two and avoid dropping the first frame at the stream
-        # boundary.
-        sr_frame_count = min(64, max(2, int(sr_frame_count)))
-        try:
-            scale = float(sr_scale)
-        except (TypeError, ValueError):
-            scale = 2.0
-        scale = min(4.0, max(1.0, scale)) if math.isfinite(scale) else 2.0
-        source_height, source_width = int(flat.shape[1]), int(flat.shape[2])
-        target_width = max(32, round(source_width * scale / 32) * 32)
-        target_height = max(32, round(source_height * scale / 32) * 32)
-        # Super-resolve source frames before VFI.  Keep this operation in small
-        # batches as a memory guard.  The VFI window below remains fixed and
-        # is intentionally not exposed as a user setting.
-        vfi_window_size = 8
-        # Process one super-resolution chunk directly into VFI windows.  The
-        # previous implementation accumulated every upscaled chunk in
-        # ``sr_frames``, then duplicated it with ``torch.cat`` and accumulated
-        # a second full copy in ``outputs``.  Long videos therefore consumed
-        # nearly all system RAM even though GPU tensors were released.  Keep
-        # only the source tensor (owned by the upstream graph), one chunk and
-        # one preallocated final output buffer.
-        source_total = int(flat.shape[0])
-        expected_output = max(1, (source_total - 1) * multiplier + 1)
-        result = None
-        written = 0
-        previous_tail = None
-        for chunk_start in range(0, source_total, sr_frame_count):
-            source_window = flat[chunk_start:min(source_total, chunk_start + sr_frame_count)].detach().cpu().contiguous()
-            if bool(enable_rtx_vsr):
-                upscaled = _upscale_rtx(source_window, target_width, target_height, str(sr_quality))
-            else:
-                upscaled = _upscale_interpolate(source_window, target_width, target_height)
-            del source_window
-            upscaled = upscaled.detach().cpu().contiguous()
-            # Share one source frame across super-resolution chunks.  The
-            # first generated frame of every chunk after the first is the
-            # shared boundary and is discarded below.
-            boundary_chunk = previous_tail is not None
-            if previous_tail is not None:
-                vfi_input = torch.cat((previous_tail, upscaled), dim=0)
-            else:
-                vfi_input = upscaled
-            previous_tail = upscaled[-1:].clone()
-            window_start = 0
-            input_total = int(vfi_input.shape[0])
-            while window_start < input_total - 1:
-                window_end = min(input_total, window_start + vfi_window_size)
-                window = vfi_input[window_start:window_end].detach().cpu().contiguous()
-                interpolated = self._run_vfi(vfi_model, window, multiplier).detach().cpu().contiguous()
-                drop_first = boundary_chunk or window_start > 0
-                if drop_first and interpolated.shape[0] > 0:
-                    interpolated = interpolated[1:]
-                if interpolated.shape[0] > 0:
-                    if result is None:
-                        result = torch.empty((expected_output, *interpolated.shape[1:]),
-                                             dtype=interpolated.dtype, device="cpu")
-                    count = min(int(interpolated.shape[0]), int(result.shape[0]) - written)
-                    if count > 0:
-                        result[written:written + count].copy_(interpolated[:count])
-                        written += count
-                del window, interpolated
-                window_start = window_end - 1
-                if window_end >= input_total:
-                    break
-            del vfi_input, upscaled
-            _release_video_memory()
-        if result is None or written < 1:
-            raise RuntimeError("超分补帧未产生有效输出帧")
-        # This is a view into the preallocated buffer; making it contiguous
-        # here would duplicate the entire output one more time.
-        result = result[:written]
-        total = source_total
-        out_fps = source_fps * multiplier
-        info = (f"模型={vfi_model}，输入={total}帧，输出={int(result.shape[0])}帧，"
-                f"源帧率={source_fps:.3f}，超分批大小={sr_frame_count}帧，输出帧率={out_fps:.3f}，"
-                f"原视频={source_width}x{source_height}，超分倍率={scale:.2f}x，"
-                f"输出={target_width}x{target_height}，VFI窗口=8，RTX VSR={'开启' if enable_rtx_vsr else '关闭'}")
-        LOG.info("H3 Auto Director: %s", info)
-        return (result, out_fps, info, int(sr_frame_count))
-
-
-class H3AutoDirectorVideoLoad:
-    """Load a video incrementally from disk into an IMAGE sequence.
-
-    Frames are decoded in small CPU batches and immediately released after
-    conversion.  This keeps decoder peak memory bounded and provides source
-    FPS/size metadata to the following nodes.
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        # The path is an internal serialized value populated by the upload
-        # button.  It is hidden so the node exposes only a direct file upload
-        # control instead of a misleading directory/path text box.
-        return {"required": {
-            "video_path": ("STRING", {"default": "", "multiline": False, "hidden": True}),
-        }}
-
-    RETURN_TYPES = ("H3_VIDEO_SOURCE", "FLOAT", "INT", "INT", "INT", "STRING")
-    RETURN_NAMES = ("视频源", "原视频帧率", "宽度", "高度", "总帧数", "视频信息")
-    FUNCTION = "load"
-    CATEGORY = "H3 自动导演/视频工具"
-
-    @staticmethod
-    def decode_all(video_path, decode_batch=8):
-        source = _direct_video_file(video_path)
-        container = av.open(str(source), "r")
-        chunks, window = [], []
-        try:
-            streams = tuple(container.streams.video)
-            if not streams:
-                raise ValueError("输入文件不包含视频流")
-            stream = streams[0]
-            width = int(getattr(stream, "width", 0) or getattr(stream.codec_context, "width", 0) or 0)
-            height = int(getattr(stream, "height", 0) or getattr(stream.codec_context, "height", 0) or 0)
-            expected = int(getattr(stream, "frames", 0) or 0)
-            # PyAV usually exposes an exact frame count for regular video
-            # files.  Preallocate once in that case instead of retaining a
-            # list of chunks and duplicating the whole source in torch.cat.
-            preallocated = torch.empty((expected, height, width, 3), dtype=torch.float32) if expected > 0 and width > 0 and height > 0 else None
-            decoded = 0
-            for frame in container.decode(stream):
-                image = torch.from_numpy(frame.to_ndarray(format="rgb24")).float().div_(255.0)
-                if preallocated is not None and decoded < preallocated.shape[0]:
-                    preallocated[decoded].copy_(image)
-                else:
-                    window.append(image)
-                    if len(window) >= max(1, int(decode_batch)):
-                        chunks.append(torch.stack(window, dim=0)); window.clear()
-                decoded += 1
-            if preallocated is not None and decoded > 0:
-                if decoded <= preallocated.shape[0]:
-                    return preallocated[:decoded].contiguous()
-                # A malformed stream reported too few frames; retain the
-                # overflow frames through the normal chunk fallback.
-                chunks.insert(0, preallocated)
-            if window: chunks.append(torch.stack(window, dim=0))
-            if not chunks: raise ValueError("输入视频没有可解码帧")
-            return torch.cat(chunks, dim=0).contiguous()
-        finally:
-            container.close(); gc.collect()
-
-    def load(self, video_path):
-        if av is None:
-            raise RuntimeError("加载视频需要 PyAV；请安装 av 后重启 ComfyUI")
-        source = _direct_video_file(video_path)
-        try:
-            container = av.open(str(source), "r")
-        except Exception as exc:
-            raise RuntimeError("无法读取输入视频：%s" % source) from exc
-        try:
-            streams = tuple(container.streams.video)
-            if not streams:
-                raise ValueError("输入文件不包含视频流")
-            stream = streams[0]
-            rate = stream.average_rate or stream.base_rate
-            fps = float(rate) if rate is not None and float(rate) > 0 else 24.0
-            width = int(getattr(stream, "width", 0) or getattr(stream.codec_context, "width", 0) or 0)
-            height = int(getattr(stream, "height", 0) or getattr(stream.codec_context, "height", 0) or 0)
-            total = int(getattr(stream, "frames", 0) or 0)
-            info = f"{source} | {width}x{height} | {fps:.3f} FPS | {total or '未知'} 帧"
-            LOG.info("H3 Auto Director: 加载视频 %s", info)
-            return ({"path": str(source), "fps": fps, "width": width, "height": height, "frames": total}, fps, width, height, total, info)
-        finally:
-            container.close()
-            gc.collect()
-
-
-class H3AutoDirectorVideoSave:
-    """Stream an IMAGE sequence to ffmpeg without making an extra copy."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {
-            "frames": ("IMAGE",),
-            "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 0.01}),
-            "filename": ("STRING", {"default": "H3_video.mp4", "multiline": False}),
-        }, "optional": {
-            "sr_frame_count": ("INT", {"default": 8, "min": 1, "max": 64,
-                                             "tooltip": "由超分补帧节点输出的超分处理帧数；未连接时使用 8。"}),
-        }}
-
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("已保存视频", "保存信息")
-    FUNCTION = "save"
-    CATEGORY = "H3 自动导演/视频工具"
-    OUTPUT_NODE = True
-
-    def save(self, frames, fps=24.0, filename="H3_video.mp4", sr_frame_count=8):
-        if not torch.is_tensor(frames) or frames.ndim not in (4, 5):
-            raise ValueError("保存视频输入必须是 4/5 维 IMAGE")
-        flat, _ = _flatten_video_frames(frames)
-        if flat.shape[0] < 1:
-            raise ValueError("没有可保存的视频帧")
-        ffmpeg = _find_ffmpeg()
-        if not ffmpeg:
-            raise RuntimeError("未找到 ffmpeg，无法保存视频")
-        clean = re.sub(r"[^A-Za-z0-9._-]+", "_", str(filename or "H3_video.mp4").strip()).strip("._") or "H3_video.mp4"
-        if not Path(clean).suffix:
-            clean += ".mp4"
-        output = _output_root() / "h3_video_tools" / clean
-        output.parent.mkdir(parents=True, exist_ok=True)
-        height, width = int(flat.shape[1]), int(flat.shape[2])
-        command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
-                   "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", f"{float(fps):.8f}",
-                   "-i", "pipe:0", "-c:v", "libx264", "-crf", "16", "-preset", "slow",
-                   "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)]
-        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        chunk = max(1, int(sr_frame_count))
-        try:
-            for start in range(0, int(flat.shape[0]), chunk):
-                data = flat[start:start + chunk].detach().cpu().clamp(0, 1).mul(255).round().byte().numpy()[..., :3]
-                process.stdin.write(data.tobytes())
-                del data
-            process.stdin.close()
-            stderr = process.stderr.read().decode(errors="replace")
-            if process.wait(timeout=600) != 0:
-                raise RuntimeError(stderr[-2000:] or "ffmpeg 编码失败")
-        except Exception:
-            if process.poll() is None:
-                process.terminate()
-            output.unlink(missing_ok=True)
-            raise
-        info = f"{output} | {int(flat.shape[0])} 帧 | {float(fps):.3f} FPS | 编码块={chunk}"
-        LOG.info("H3 Auto Director: 保存视频 %s", info)
-        return (str(output), info)
-
-
-class H3AutoDirectorStreamingVideoSRVFI:
-    """Disk-to-disk RTX VSR and VFI processing for long videos.
-
-    Unlike an IMAGE based graph, this node never creates a tensor containing
-    the full source or output video.  PyAV decodes a small overlapping source
-    window, the VFI model returns that window, RTX VSR processes it one frame
-    at a time, and ffmpeg immediately encodes the result to disk.
-    """
-
-    MODEL_CHOICES = H3AutoDirectorVideoSRVFI.MODEL_CHOICES
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {
-            "video_path": ("STRING", {"default": "", "multiline": False, "hidden": True}),
-            "interpolation_multiplier": ("INT", {"default": 2, "min": 2, "max": 8}),
-            "vfi_model": (list(cls.MODEL_CHOICES), {"default": cls.MODEL_CHOICES[0]}),
-            "chunk_size": ("INT", {"default": 8, "min": 2, "max": 64,
-                            "tooltip": "单次解码/补帧的源帧数；4 更省显存，8 是推荐默认值。"}),
-            "sr_scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.05,
-                            "tooltip": "相对原视频分辨率的倍率；目标宽高按源视频尺寸计算并对齐到 32 的倍数。"}),
-            "sr_quality": (["低", "中", "高", "最高"], {"default": "最高"}),
-            "filename_prefix": ("STRING", {"default": "H3_Video_SR_VFI"}),
-            "preserve_audio": ("BOOLEAN", {"default": True,
-                                "tooltip": "从源视频读取并重新封装音轨；不会把音频载入 PyTorch。"}),
-        }, "optional": {
-            "enable_rtx_vsr": ("BOOLEAN", {"default": True,
-                               "tooltip": "开启后必须使用 NVIDIA RTX Video Super Resolution；未安装 nvvfx 时会明确报错。"}),
-        }}
-
-    RETURN_TYPES = ("STRING", "FLOAT", "STRING")
-    RETURN_NAMES = ("已保存视频", "输出帧率", "处理信息")
-    FUNCTION = "process"
-    CATEGORY = "H3 自动导演/视频工具"
-    OUTPUT_NODE = True
-
-    @staticmethod
-    def _output_path(prefix):
-        clean = re.sub(r"[^A-Za-z0-9._-]+", "_", str(prefix or "H3_Video_SR_VFI").strip()).strip("._")
-        clean = clean or "H3_Video_SR_VFI"
-        directory = _output_root() / "h3_video_tools"
-        directory.mkdir(parents=True, exist_ok=True)
-        return directory / f"{clean}_{uuid.uuid4().hex[:8]}.mp4"
-
-    @staticmethod
-    def _encoder_command(ffmpeg, output, source, width, height, fps, preserve_audio):
-        # The output duration is unchanged by interpolation: only its frame
-        # rate rises.  Re-encode optional source audio so uncommon input audio
-        # codecs cannot make an otherwise successful video encode fail.
-        command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
-                   "-r", f"{fps:.8f}", "-i", "pipe:0"]
-        if preserve_audio:
-            command.extend(["-i", str(source), "-map", "0:v:0", "-map", "1:a?"])
-        else:
-            command.extend(["-map", "0:v:0", "-an"])
-        command.extend(["-c:v", "libx264", "-crf", "16", "-preset", "slow", "-pix_fmt", "yuv420p"])
-        if preserve_audio:
-            command.extend(["-c:a", "aac", "-b:a", "192k", "-shortest"])
-        command.extend(["-movflags", "+faststart", "-f", "mp4", str(output)])
-        return command
-
-    @staticmethod
-    def _write_chunk(process, images):
-        if images.numel() == 0:
-            return 0
-        rgb = images.detach().cpu().clamp(0, 1).mul(255).round().byte().numpy()[..., :3]
-        try:
-            process.stdin.write(rgb.tobytes())
-        except (BrokenPipeError, OSError) as exc:
-            raise RuntimeError("ffmpeg 视频编码进程提前结束") from exc
-        return int(rgb.shape[0])
-
-    def process(self, video_path, interpolation_multiplier, vfi_model, chunk_size,
-                sr_scale, sr_quality, filename_prefix, preserve_audio,
-                enable_rtx_vsr=True):
-        if av is None:
-            raise RuntimeError("流式视频超分补帧需要 PyAV；请安装 av 后重启 ComfyUI")
-        source = _direct_video_file(video_path)
-        ffmpeg = _find_ffmpeg()
-        if not ffmpeg:
-            raise RuntimeError("未找到 ffmpeg，无法流式写入超分补帧视频。请设置 FFMPEG_PATH 或安装 imageio-ffmpeg。")
-        chunk_size = max(2, int(chunk_size))
-        multiplier = max(2, int(interpolation_multiplier))
-        output = self._output_path(filename_prefix)
-
-        try:
-            container = av.open(str(source), "r")
-        except Exception as exc:
-            raise RuntimeError("无法读取输入视频：%s" % exc) from exc
-        encode_process = None
-        source_frames = 0
-        output_frames = 0
-        try:
-            streams = tuple(container.streams.video)
-            if not streams:
-                raise RuntimeError("输入文件不包含视频流")
-            stream = streams[0]
-            source_width = int(getattr(stream, "width", 0) or getattr(stream.codec_context, "width", 0) or 0)
-            source_height = int(getattr(stream, "height", 0) or getattr(stream.codec_context, "height", 0) or 0)
-            if source_width < 1 or source_height < 1:
-                raise RuntimeError("无法读取输入视频分辨率")
-            try:
-                scale = float(sr_scale)
-            except (TypeError, ValueError):
-                scale = 2.0
-            scale = min(4.0, max(1.0, scale))
-            target_width = max(32, round(source_width * scale / 32) * 32)
-            target_height = max(32, round(source_height * scale / 32) * 32)
-            rate = stream.average_rate or stream.base_rate
-            if rate is None or float(rate) <= 0:
-                raise RuntimeError("无法读取输入视频帧率")
-            input_fps = float(rate)
-            output_fps = input_fps * multiplier
-            encode_process = subprocess.Popen(
-                self._encoder_command(ffmpeg, output, source, target_width, target_height,
-                                      output_fps, bool(preserve_audio)),
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            )
-            window = []
-            has_previous_window = False
-            for frame in container.decode(stream):
-                # The decoded RGB frame lives only until its small overlapping
-                # VFI window has been written to ffmpeg.
-                window.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).float().div_(255.0))
-                source_frames += 1
-                if len(window) < chunk_size:
-                    continue
-                interpolated = H3AutoDirectorVideoSRVFI._run_vfi(
-                    vfi_model, torch.stack(window, dim=0), multiplier)
-                if bool(enable_rtx_vsr):
-                    interpolated = _upscale_rtx(interpolated, target_width, target_height, str(sr_quality))
-                else:
-                    interpolated = _upscale_interpolate(interpolated, target_width, target_height)
-                if has_previous_window:
-                    interpolated = interpolated[1:]
-                output_frames += self._write_chunk(encode_process, interpolated)
-                # Adjacent windows share exactly one source frame, preserving
-                # all VFI intervals while avoiding a duplicate output frame.
-                window = [window[-1]]
-                has_previous_window = True
-                del interpolated
-                _release_video_memory()
-            if len(window) >= 2:
-                interpolated = H3AutoDirectorVideoSRVFI._run_vfi(
-                    vfi_model, torch.stack(window, dim=0), multiplier)
-                if bool(enable_rtx_vsr):
-                    interpolated = _upscale_rtx(interpolated, target_width, target_height, str(sr_quality))
-                else:
-                    interpolated = _upscale_interpolate(interpolated, target_width, target_height)
-                if has_previous_window:
-                    interpolated = interpolated[1:]
-                output_frames += self._write_chunk(encode_process, interpolated)
-                del interpolated
-                _release_video_memory()
-            if source_frames < 2:
-                raise ValueError("视频补帧至少需要 2 帧")
-            encode_process.stdin.close()
-            stderr = encode_process.stderr.read().decode(errors="replace")
-            if encode_process.wait(timeout=600) != 0:
-                raise RuntimeError(stderr[-2000:] or "ffmpeg 编码失败")
-            if not output.is_file() or output.stat().st_size == 0:
-                raise RuntimeError("ffmpeg 没有写出有效视频文件")
-            info = (f"模型={vfi_model}，输入={source_frames}帧，输出={output_frames}帧，"
-                    f"帧率={output_fps:.3f}，原视频={source_width}x{source_height}，超分倍率={scale:.2f}x，"
-                    f"输出={target_width}x{target_height}，分块={chunk_size}，RTX VSR={'开启' if enable_rtx_vsr else '关闭'}，"
-                    f"文件={output}")
-            LOG.info("H3 Auto Director: %s", info)
-            return (str(output), output_fps, info)
-        except Exception:
-            if encode_process is not None and encode_process.poll() is None:
-                try:
-                    encode_process.stdin.close()
-                except Exception:
-                    pass
-                encode_process.terminate()
-                try:
-                    encode_process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    encode_process.kill()
-            output.unlink(missing_ok=True)
-            raise
-        finally:
-            container.close()
-            _release_video_memory()
-
-
 class H3AutoDirectorResolution:
     """Calculate aligned H3 resolutions for both stages of dual sampling."""
 
@@ -2442,8 +2052,8 @@ class H3AutoDirectorResolution:
                                   "tooltip": "H3 画布必须是 32 的倍数；旧工作流中的更小值会自动规范化。"}),
         }}
 
-    RETURN_TYPES = ("INT", "INT", "INT", "INT", "STRING")
-    RETURN_NAMES = ("第一阶段宽度", "第一阶段高度", "第二阶段宽度", "第二阶段高度", "分辨率预览")
+    RETURN_TYPES = ("INT", "INT", "INT", "INT", "STRING", "H3_RESOLUTION")
+    RETURN_NAMES = ("第一阶段宽度", "第一阶段高度", "第二阶段宽度", "第二阶段高度", "分辨率预览", "分辨率配置")
     FUNCTION = "calculate"
     CATEGORY = "H3 自动导演/采样"
 
@@ -2511,7 +2121,15 @@ class H3AutoDirectorResolution:
             ratio_label, first_width, first_height, second_width, second_height,
             float(stage1_megapixels), float(stage2_megapixels), int(multiple),
         )
-        return (first_width, first_height, second_width, second_height, preview)
+        config = {
+            "stage1_width": int(first_width), "stage1_height": int(first_height),
+            "stage2_width": int(second_width), "stage2_height": int(second_height),
+            "stage1_short_edge": int(min(first_width, first_height)),
+            "stage2_short_edge": int(min(second_width, second_height)),
+            "ratio": ratio_label, "stage1_megapixels": float(stage1_megapixels),
+            "stage2_megapixels": float(stage2_megapixels), "multiple": int(multiple),
+        }
+        return (first_width, first_height, second_width, second_height, preview, config)
 
 
 class H3AutoDirectorDualSampling:
@@ -2609,7 +2227,7 @@ class H3AutoDirectorDualSampling:
                 _audio_sampling_from_base_sigmas(stage1_sigmas)
                 or _audio_sampling_from_base_sigmas(stage2_sigmas)
             )
-        conditioning = _attach_union_control_conditioning(conditioning, control_config)
+        conditioning = _attach_union_control_conditioning(conditioning, control_config, stage1_model)
         stage1_conditioning = _prepare_dual_sampling_conditioning(conditioning)
         first_model = _apply_audio_sampling_config(stage1_model, audio_sampling, "一采模型")
         second_source_model = stage2_model or stage1_model
@@ -2748,7 +2366,7 @@ class H3AutoDirectorDualSampling:
             stage2_conditioning if _has_positive_conditioning(stage2_conditioning)
             else conditioning
         )
-        stage2_input_conditioning = _attach_union_control_conditioning(stage2_input_conditioning, control_config)
+        stage2_input_conditioning = _attach_union_control_conditioning(stage2_input_conditioning, control_config, second_model)
         final_conditioning = _prepare_stage2_conditioning(
             stage2_input_conditioning, refined, stage2_use_context, stage2_source
         )
@@ -3179,6 +2797,9 @@ class H3AutoDirectorVideoTransferPlan:
             "auto_run": ("BOOLEAN", {"default": True}),
             "output_root": ("STRING", {"default": "h3_video_transfer"}),
             "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": False, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
+        }, "optional": {
+            "use_reference_video_material": ("BOOLEAN", {"default": True,
+                "tooltip": "开启：上传视频同时作为每段的 Video 参考素材；关闭：视频仅用于计算片段数和姿态/深度预处理。"}),
         }, "hidden": {"project_dir": "STRING"}}
 
     RETURN_TYPES = ("H3_AUTO_PLAN",)
@@ -3187,7 +2808,7 @@ class H3AutoDirectorVideoTransferPlan:
     CATEGORY = "H3 自动导演/视频迁移"
 
     def create(self, project_id, prompt, reference_video_json, reference_assets_json,
-               segment_seconds, pass_reference_video_audio=False,
+               segment_seconds, use_reference_video_material=True, pass_reference_video_audio=False,
                enable_audio_continuation=True, audio_restart_segments="",
                previous_video_reference_segments="", cache_prompt_embeddings=True,
                skip_h3_audio_decode=False, final_audio_source="H3 生成音频",
@@ -3200,13 +2821,30 @@ class H3AutoDirectorVideoTransferPlan:
             raise ValueError("视频迁移素材 JSON 无效: %s" % exc) from exc
         if not isinstance(video, dict) or not (video.get("path") or video.get("name")):
             raise ValueError("请在“编辑视频迁移素材”中上传一个参考视频")
-        _reference_name(video)
+        requested_video_name = video.get("path") or video.get("name")
+        resolved_video = _resolve_reference_file(requested_video_name, "动作迁移参考视频")
+        video_root = _input_root().resolve()
+        video["path"] = resolved_video.relative_to(video_root).as_posix()
+        video["name"] = resolved_video.name
+        LOG.info("H3 Auto Director: 动作迁移参考视频已解析：请求=%s，实际=%s",
+                 requested_video_name, video["path"])
+        try:
+            video["insert_seconds"] = max(0.0, float(video.get("insert_seconds", 0) or 0))
+            video["insert_frames"] = max(0, int(video.get("insert_frames", 0) or 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("参考视频插入时间必须是非负秒数和帧数") from exc
         if not isinstance(assets, list):
             raise ValueError("图片与独立音频参考素材必须是 JSON 列表")
         for asset in assets:
             kind = str(asset.get("type", "")).lower() if isinstance(asset, dict) else ""
             if kind not in {"image", "audio"}:
                 raise ValueError("视频迁移节点的附加参考素材仅支持图片和独立音频；参考视频请在专用上传项中选择")
+            if isinstance(asset, dict):
+                try:
+                    asset["insert_seconds"] = max(0.0, float(asset.get("insert_seconds", 0) or 0))
+                    asset["insert_frames"] = max(0, int(asset.get("insert_frames", 0) or 0))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("附加素材插入时间必须是非负秒数和帧数") from exc
         _validate_reference_limits([{"type": "video"}] + assets, "视频迁移参考素材")
         # These controls serve different stages.  ``pass_reference_video_audio``
         # adds the source audio to H3's per-segment multimodal conditioning,
@@ -3216,13 +2854,22 @@ class H3AutoDirectorVideoTransferPlan:
         seconds = float(segment_seconds)
         if not 4.0 <= seconds <= 15.0:
             raise ValueError("单段秒数必须在 4 到 15 秒之间")
-        # Browser probing supplies the exact decoded 24 fps count. Fall back
-        # to duration for imported projects created without the editor.
-        source_frames = int(video.get("frame_count_24") or 0)
+        # Imported/older plans may not contain frame metadata (or may contain
+        # stale values after replacing a file). Probe the resolved file so the
+        # segment count always reflects the actual uploaded video.
+        metadata = _probe_reference_video(resolved_video)
+        source_frames = int(metadata.get("frame_count_24") or 0)
         if source_frames <= 0:
-            source_frames = int(round(float(video.get("duration", 0)) * FPS))
+            raise ValueError(
+                "动作迁移参考视频无法读取有效帧数：路径=%s；请确认文件是可解码的视频并重新上传。"
+                % video["path"]
+            )
+        video["duration"] = float(metadata["duration"])
+        video["fps"] = float(metadata["fps"])
+        video["frame_count_24"] = source_frames
         if source_frames < 5:
-            raise ValueError("参考视频时长不足，至少需要 5 帧")
+            raise ValueError("动作迁移参考视频帧数不足：实际 %d 帧，至少需要 5 帧；路径=%s"
+                             % (source_frames, video["path"]))
         per_segment_frames = max(1, int(round(seconds * FPS)))
         restart_at = _parse_segment_numbers(audio_restart_segments, "重新生成音频片段")
         previous_ref_at = _parse_segment_numbers(previous_video_reference_segments, "上段视频参考片段")
@@ -3246,6 +2893,9 @@ class H3AutoDirectorVideoTransferPlan:
                 "start_frame": start_frame, "source_frames": available,
                 "reference_frames": reference_frames,
                 "video_audio_enabled": bool(pass_reference_video_audio),
+                "prompt_material": bool(use_reference_video_material),
+                "insert_seconds": max(0.0, float(video.get("insert_seconds", 0) or 0)) if index == 1 else 0.0,
+                "insert_frames": max(0, int(video.get("insert_frames", 0) or 0)) if index == 1 else 0,
             }
             normalized.append({
                 "prompt": str(prompt or "").strip(), "duration": available / FPS,
@@ -3258,7 +2908,13 @@ class H3AutoDirectorVideoTransferPlan:
                 # therefore disables pixel/video context for that segment.
                 "continue_video": index > 1 and index not in previous_ref_at,
                 "use_previous_video_reference": index in previous_ref_at,
-                "references": [transfer_ref] + [dict(item) for item in assets],
+                "references": [transfer_ref] + [
+                    dict(item,
+                         insert_seconds=(float(item.get("insert_seconds", 0) or 0) if index == 1 else 0.0),
+                         insert_frames=(int(item.get("insert_frames", 0) or 0) if index == 1 else 0))
+                    if isinstance(item, dict) else item
+                    for item in assets
+                ],
             })
         requested_dir = str(project_dir or "").strip().strip('"')
         directory = Path(requested_dir).expanduser().resolve() if requested_dir else _safe_project_dir(project_id, output_root)
@@ -3267,6 +2923,9 @@ class H3AutoDirectorVideoTransferPlan:
         directory.mkdir(parents=True, exist_ok=True)
         for name in ("json", "cache", CONTEXT_DIR_NAME, "clips", "final"):
             (directory / name).mkdir(exist_ok=True)
+        # Keep encoded pose/depth preview videos separate from their tensor
+        # caches; the preprocess node creates per-segment subdirectories.
+        (directory / CONTROL_DIR_NAME / PREPROCESSED_DIR_NAME).mkdir(parents=True, exist_ok=True)
         plan = {
             "version": 3, "mode": "video_transfer", "project_id": project_id,
             "output_root": output_root, "duration": seconds,
@@ -3283,6 +2942,7 @@ class H3AutoDirectorVideoTransferPlan:
             "skip_h3_audio_decode": bool(skip_h3_audio_decode),
             "final_audio_source": str(final_audio_source),
             "reference_video": dict(video), "segments": normalized,
+            "use_reference_video_material": bool(use_reference_video_material),
             "project_dir": str(directory),
         }
         _atomic_json(directory / "json" / "project.json", {k: v for k, v in plan.items() if k != "project_dir"})
@@ -3293,6 +2953,21 @@ class H3AutoDirectorVideoTransferPlan:
 
 
 CONTROL_MODES = ("关闭", "姿态", "深度", "姿态+深度")
+CONTROL_BATCH_FRAMES = 7
+CONTROL_RESOLUTION_MODES = ("固定短边", "匹配生成分辨率（等比缩放后裁剪）")
+POSE_MODEL_PROFILES = ("真人（DWPose）", "动漫（OpenPose）")
+DEPTH_MODEL_PROFILES = ("Video Depth Anything（时序）", "Depth Anything V2 Large（高质量）", "Depth Anything V2 Small（低内存）")
+# DWPose exposes body, hand and face keypoint branches independently.  Keep
+# the conservative full-body branch as the default; optional branches can be
+# enabled when the source motion requires finger or facial detail.
+POSE_PREPROCESS_TYPES = ("全身", "身体", "身体+手部", "身体+脸部", "身体+手部+脸部")
+_POSE_CACHE_SUFFIXES = {
+    "全身": "full",
+    "身体": "body",
+    "身体+手部": "body_hands",
+    "身体+脸部": "body_face",
+    "身体+手部+脸部": "body_hands_face",
+}
 
 
 def _control_image_result(result):
@@ -3321,43 +2996,187 @@ def _align_control_frames(images):
     return images[:aligned], aligned
 
 
-def _control_cache_dir(plan, segment_index):
-    """Return the per-project directory for persisted control frames."""
+def _resize_control_to_generation(images, target_width, target_height):
+    """Fit control frames to the generation canvas by scale-and-center-crop.
+
+    ControlNet receives the same spatial grid as H3.  Scaling until both
+    target dimensions are covered, then center-cropping, avoids stretching
+    poses/depth maps and guarantees exact dimensions for Union conditioning.
+    """
+    if not torch.is_tensor(images) or images.ndim != 4:
+        raise ValueError("控制视频必须是 [帧,高,宽,RGB] IMAGE")
+    width, height = int(target_width or 0), int(target_height or 0)
+    if width < 2 or height < 2:
+        return images
+    # Union ControlNet is trained on the H3 canvas grid, not merely an even
+    # pixel size.  Rounding here prevents cached videos such as 1662x768 from
+    # being accepted even though the corresponding H3 latent is 1664x768.
+    width, height = _h3_canvas_dimensions(width, height)
+    source_h, source_w = int(images.shape[1]), int(images.shape[2])
+    if source_h == height and source_w == width:
+        return images.contiguous()
+    scale = max(float(width) / max(1, source_w), float(height) / max(1, source_h))
+    scaled_w = max(width, int(math.ceil(source_w * scale)))
+    scaled_h = max(height, int(math.ceil(source_h * scale)))
+    # Interpolate in NCHW, retaining the input device so GPU preprocessing
+    # does not incur an unnecessary host round-trip.
+    resized = torch.nn.functional.interpolate(
+        images.permute(0, 3, 1, 2), size=(scaled_h, scaled_w),
+        mode="bilinear", align_corners=False,
+    ).permute(0, 2, 3, 1)
+    top = max(0, (scaled_h - height) // 2)
+    left = max(0, (scaled_w - width) // 2)
+    return resized[:, top:top + height, left:left + width, :].contiguous()
+
+
+def _resize_control_to_short_edge(images, short_edge):
+    """Resize control frames by a configured shortest edge without cropping."""
+    if not torch.is_tensor(images) or images.ndim != 4:
+        raise ValueError("控制视频必须是 [帧,高,宽,RGB] IMAGE")
+    edge = max(2, int(short_edge or 0))
+    if edge <= 0:
+        return images
+    source_h, source_w = int(images.shape[1]), int(images.shape[2])
+    source_edge = min(source_h, source_w)
+    if source_edge == edge:
+        return images.contiguous()
+    scale = float(edge) / max(1, source_edge)
+    target_w = max(32, int(round(source_w * scale)))
+    target_h = max(32, int(round(source_h * scale)))
+    target_w, target_h = _h3_canvas_dimensions(target_w, target_h)
+    resized = torch.nn.functional.interpolate(
+        images.permute(0, 3, 1, 2), size=(target_h, target_w),
+        mode="bilinear", align_corners=False,
+    ).permute(0, 2, 3, 1)
+    return resized.contiguous()
+
+
+def _control_target_resolution(plan, target_width, target_height, resolution_mode, source_frames,
+                               resolution_config=None, target_short_edge=0):
+    """Resolve the optional generation canvas used by control preprocessing."""
+    mode = str(resolution_mode or CONTROL_RESOLUTION_MODES[0])
+    config = resolution_config if isinstance(resolution_config, dict) else {}
+    if mode == CONTROL_RESOLUTION_MODES[0]:
+        # A connected resolution configuration is authoritative.  This keeps
+        # the node synchronized with the workflow even when the visible
+        # fallback widget still contains its default value (768).
+        short_edge = int(config.get("stage1_short_edge", 0) or target_short_edge or 0)
+        return {"short_edge": short_edge} if short_edge >= 2 else None
+    width = int(config.get("stage1_width", 0) or target_width or 0)
+    height = int(config.get("stage1_height", 0) or target_height or 0)
+    # Pose/depth controls are consumed by the first sampling pass, therefore
+    # matching mode intentionally uses the first-stage canvas.
+    if isinstance(plan, dict):
+        width = width or int(plan.get("target_width", plan.get("width", 0)) or 0)
+        height = height or int(plan.get("target_height", plan.get("height", 0)) or 0)
+        resolution = plan.get("resolution")
+        if isinstance(resolution, dict):
+            width = width or int(resolution.get("width", 0) or 0)
+            height = height or int(resolution.get("height", 0) or 0)
+    if width < 2 or height < 2:
+        # A connected segment is already the generation canvas in legacy
+        # graphs; using its dimensions is the safest fallback.
+        if torch.is_tensor(source_frames) and source_frames.ndim == 4:
+            height, width = int(source_frames.shape[1]), int(source_frames.shape[2])
+    return (width, height) if width >= 2 and height >= 2 else None
+
+
+def _control_preprocessed_dir(plan, segment_index):
+    """Return the separate directory used for encoded pose/depth preview videos."""
     if not isinstance(plan, dict) or not plan.get("project_dir"):
         return None
-    directory = Path(plan["project_dir"]) / "control" / ("segment_%04d" % int(segment_index))
+    directory = (Path(plan["project_dir"]) / CONTROL_DIR_NAME / PREPROCESSED_DIR_NAME /
+                 ("segment_%04d" % int(segment_index)))
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
 
-def _control_cache_paths(plan, segment_index, kind):
-    directory = _control_cache_dir(plan, segment_index)
-    if directory is None:
+def _control_cache_paths(plan, segment_index, kind, pose_preprocess_type="全身",
+                         pose_model_profile=POSE_MODEL_PROFILES[0],
+                         depth_model_profile=DEPTH_MODEL_PROFILES[1]):
+    # Control tensors are intentionally not persisted as .pt files.  They can
+    # be very large and are not portable between devices.  The durable cache
+    # is the encoded preview video under control/preprocessed/.
+    video_directory = _control_preprocessed_dir(plan, segment_index)
+    if video_directory is None:
         return None, None
-    return directory / ("%s.pt" % kind), directory / ("%s.mp4" % kind)
+    filename = str(kind)
+    if filename == "pose" and str(pose_preprocess_type) in _POSE_CACHE_SUFFIXES:
+        suffix = _POSE_CACHE_SUFFIXES[str(pose_preprocess_type)]
+        if suffix != "body":
+            filename = "pose_%s" % suffix
+        if str(pose_model_profile).startswith("动漫"):
+            filename += "_anime"
+    elif filename == "depth":
+        depth_suffix = {
+            DEPTH_MODEL_PROFILES[0]: "video",
+            DEPTH_MODEL_PROFILES[1]: "v2_large",
+            DEPTH_MODEL_PROFILES[2]: "v2_small",
+        }.get(str(depth_model_profile), "v2_large")
+        filename = "depth_%s" % depth_suffix
+    return None, video_directory / ("%s.mp4" % filename)
 
 
-def _load_control_tensor(path):
+def _legacy_control_video_path(plan, segment_index, kind):
+    """Locate preprocessed videos written by versions before the subfolder split."""
+    if not isinstance(plan, dict) or not plan.get("project_dir"):
+        return None
+    return (Path(plan["project_dir"]) / CONTROL_DIR_NAME /
+            ("segment_%04d" % int(segment_index)) / ("%s.mp4" % kind))
+
+
+def _load_control_video(path):
+    """Read a persisted preprocessed control video, if available."""
     if not path or not Path(path).is_file():
         return None
     try:
-        value = torch.load(str(path), map_location="cpu", weights_only=True)
-    except TypeError:
-        value = torch.load(str(path), map_location="cpu")
+        value = _load_video_frames_av(path)
+        if not torch.is_tensor(value) or value.ndim != 4:
+            return None
+        return value.float().clamp(0, 1).contiguous()
     except Exception as exc:
-        LOG.warning("H3 Auto Director: 控制帧缓存读取失败，将重新预处理：%s", exc)
+        LOG.warning("H3 Auto Director: 预处理视频缓存读取失败，将重新处理：%s：%s", path, exc)
         return None
-    if not torch.is_tensor(value) or value.ndim != 4:
-        return None
-    return value.float().clamp(0, 1).contiguous()
 
 
-def _save_control_tensor(path, images):
-    if path is None:
-        return
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(images.detach().float().cpu().contiguous(), str(temporary))
-    temporary.replace(path)
+def _probe_control_video_file(path):
+    """Probe an encoded control MP4 without loading every frame into RAM."""
+    value = Path(path) if path else None
+    if value is None or not value.is_file() or value.stat().st_size <= 0:
+        return {"valid": False, "reason": "文件不存在或为空", "path": str(value or "")}
+    ffprobe = _find_ffprobe()
+    if not ffprobe:
+        # Tensor validation still protects the sampling path when ffprobe is
+        # unavailable; report that the container-level probe was skipped.
+        return {"valid": None, "reason": "未找到 ffprobe，已跳过容器探测", "path": str(value)}
+    command = [ffprobe, "-v", "error", "-select_streams", "v:0", "-count_frames",
+               "-show_entries", "stream=codec_name,width,height,avg_frame_rate,nb_read_frames",
+               "-of", "json", str(value)]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+        if result.returncode != 0:
+            return {"valid": False, "reason": result.stderr.strip() or "ffprobe 失败", "path": str(value)}
+        data = json.loads(result.stdout or "{}")
+        streams = data.get("streams") or []
+        if not streams:
+            return {"valid": False, "reason": "文件没有视频流", "path": str(value)}
+        stream = streams[0]
+        frame_count = int(stream.get("nb_read_frames") or 0)
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        multiple = max(32, int(getattr(_minimax_h3, "CANVAS_MULTIPLE", 32) or 32))
+        valid = bool(width >= multiple and height >= multiple and frame_count >= 5
+                    and width % multiple == 0 and height % multiple == 0
+                    and frame_count % 17 == 5)
+        reason = ""
+        if not valid:
+            reason = (f"H3 网格不匹配：{width}x{height}、{frame_count} 帧；"
+                      f"要求尺寸为 {multiple} 的倍数且帧数为 17*n+5")
+        return {"valid": valid, "reason": reason, "path": str(value),
+                "codec": stream.get("codec_name", ""), "width": width, "height": height,
+                "fps": str(stream.get("avg_frame_rate") or ""), "frames": frame_count}
+    except Exception as exc:
+        return {"valid": False, "reason": f"ffprobe 异常：{exc}", "path": str(value)}
 
 
 def _control_mode_has_pose(mode):
@@ -3415,54 +3234,469 @@ def _control_preprocessor_mappings():
                 break
         except Exception:
             continue
+    # ComfyUI 0.34 may already contain a node with the generic
+    # ``DWPreprocessor`` key, which can override AUX_NODE_MAPPINGS above.
+    # Resolve the concrete DWPose class from the loaded wrapper module so GPU
+    # mode cannot accidentally receive an unrelated implementation.
+    for module_name in ("custom_nodes.comfyui_controlnet_aux.node_wrappers.dwpose",
+                        "comfyui_controlnet_aux.node_wrappers.dwpose"):
+        try:
+            dwpose_module = importlib.import_module(module_name)
+            dwpose_class = getattr(dwpose_module, "DWPose_Preprocessor", None)
+            if dwpose_class is not None:
+                mappings = dict(mappings)
+                mappings["DWPreprocessor"] = dwpose_class
+                break
+        except Exception:
+            continue
     return mappings
 
 
-def _run_pose_preprocessor(video_frames, resolution, mappings):
-    # DWPose is the most reliable common denominator for real and anime
-    # footage.  An AnimePose node is used only when DWPose is unavailable.
-    cls = next((mappings.get(name) for name in ("DWPreprocessor", "OpenposePreprocessor",
-                                                "AnimePosePreprocessor", "AnimePose")
-                if mappings.get(name) is not None), None)
+@contextlib.contextmanager
+def _control_preprocess_device(device):
+    """Temporarily select the device used by ControlNet preprocessors.
+
+    The bundled controlnet_aux wrappers ask ComfyUI for their Torch device at
+    model construction time. DWPose's ONNX sessions additionally read a
+    module-level provider list. Keep both in sync for the duration of the
+    preprocessing call, then restore every process-global value so sampling
+    nodes and other workflows are unaffected.
+    """
+    requested = str(device or "GPU").strip().upper()
+    if requested not in {"CPU", "GPU"}:
+        requested = "GPU"
+    original_get_device = model_management.get_torch_device
+    old_env_present = "AUX_ORT_PROVIDERS" in os.environ
+    old_env = os.environ.get("AUX_ORT_PROVIDERS")
+    provider_modules = []
+    for module in list(sys.modules.values()):
+        if module is None or not str(getattr(module, "__name__", "")).endswith("dwpose.util"):
+            continue
+        if hasattr(module, "ONNX_PROVIDERS"):
+            provider_modules.append((module, getattr(module, "ONNX_PROVIDERS")))
+
+    available = set()
+    try:
+        import onnxruntime as ort
+        available = set(ort.get_available_providers())
+    except Exception:
+        # Torch-only preprocessors can still honor the device choice when ORT
+        # is not installed; DWPose will report its own actionable error.
+        pass
+
+    if requested == "CPU":
+        target_device = torch.device("cpu")
+        providers = ["CPUExecutionProvider"] if not available or "CPUExecutionProvider" in available else []
+    else:
+        # Do not inherit ComfyUI's CPU fallback here: choosing GPU in this
+        # node must actually construct TorchScript/PyTorch preprocessors on
+        # CUDA whenever CUDA is available.  ``get_torch_device`` may return
+        # CPU in low-VRAM/offload configurations even though CUDA works.
+        if torch.cuda.is_available():
+            target_device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            try:
+                target_device = original_get_device()
+            except Exception:
+                target_device = torch.device("cpu")
+            LOG.warning("H3 Auto Director: 预处理选择 GPU，但 PyTorch 未检测到 CUDA，实际使用 %s", target_device)
+        if not isinstance(target_device, torch.device):
+            target_device = torch.device(str(target_device))
+        # TensorRT is intentionally excluded: it is often advertised by the
+        # ORT wheel but unavailable without separate TensorRT DLLs, causing
+        # DWPose to emit an EP error before falling back to CUDA.
+        # GPU mode uses the CUDA TorchScript DWPose path exclusively.  Do not
+        # expose ORT's CPU fallback here: it can make a later preprocessor
+        # silently construct a CPU session and makes the device log ambiguous.
+        providers = []
+        if not torch.cuda.is_available():
+            LOG.warning("H3 Auto Director: 预处理选择 GPU，但 PyTorch 未检测到 CUDA")
+
+    if not providers and requested == "CPU":
+        # An empty provider list makes DWPose fail with a cryptic ORT error;
+        # leave the environment explicit so the failure remains diagnosable.
+        providers = ["CPUExecutionProvider"]
+    provider_text = ",".join(providers)
+    os.environ["AUX_ORT_PROVIDERS"] = provider_text
+    for module, _ in provider_modules:
+        module.ONNX_PROVIDERS = list(providers)
+
+    model_management.get_torch_device = lambda *args, **kwargs: target_device
+    effective = "CPU" if target_device.type == "cpu" else "GPU"
+    onnx_text = provider_text if provider_text else ("禁用（GPU 使用 TorchScript）" if effective == "GPU" else "不可用")
+    LOG.info("H3 Auto Director: 控制预处理设备=%s（Torch=%s，ONNX=%s）",
+             effective, target_device, onnx_text)
+    try:
+        yield effective
+    finally:
+        model_management.get_torch_device = original_get_device
+        for module, old_providers in provider_modules:
+            module.ONNX_PROVIDERS = old_providers
+        if old_env_present:
+            os.environ["AUX_ORT_PROVIDERS"] = old_env
+        else:
+            os.environ.pop("AUX_ORT_PROVIDERS", None)
+
+
+def _ensure_local_aux_model_layout():
+    """Expose flat downloaded aux models under their Hugging Face repo paths.
+
+    comfyui_controlnet_aux resolves DWPose files as
+    ``ckpts/yzd-v/DWPose/<filename>``.  Older installs (and our initial
+    downloader) may have placed the same files directly in ``ckpts``.  Link
+    those files locally so preprocessing never falls back to an unnecessary
+    network request; a copy is used only when hard links are unavailable.
+    """
+    ckpts = Path(__file__).resolve().parents[1] / "comfyui_controlnet_aux" / "ckpts"
+    if not ckpts.is_dir():
+        return
+    aliases = (
+        ("yzd-v/DWPose/yolox_l.onnx", "yolox_l.onnx"),
+        ("yzd-v/DWPose/dw-ll_ucoco_384.onnx", "dw-ll_ucoco_384.onnx"),
+        ("depth-anything/Depth-Anything-V2-Large/depth_anything_v2_vitl.pth", "depth_anything_v2_vitl.pth"),
+    )
+    for relative_target, relative_source in aliases:
+        target, source = ckpts / relative_target, ckpts / relative_source
+        if target.is_file() or not source.is_file():
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(str(source), str(target))
+            except OSError:
+                shutil.copy2(str(source), str(target))
+            LOG.info("H3 Auto Director: 已就地映射预处理模型 %s", target)
+        except OSError as exc:
+            LOG.warning("H3 Auto Director: 无法映射预处理模型 %s：%s", target, exc)
+
+
+def _control_onnx_gpu_available():
+    """Return whether DWPose can actually create an accelerated ORT session.
+
+    ``onnxruntime.get_available_providers()`` only reports compiled-in
+    providers. A CUDA provider can still fail at session creation when CUDA or
+    cuDNN DLLs are missing, in which case DWPose silently falls back to CPU.
+    Probe the cached DWPose model once so GPU mode can select TorchScript
+    instead of unknowingly running an ONNX CPU session.
+    """
+    providers = {item.strip() for item in os.getenv("AUX_ORT_PROVIDERS", "").split(",") if item.strip()}
+    candidates = tuple(item for item in ("CUDAExecutionProvider",
+                                         "ROCMExecutionProvider", "DirectMLExecutionProvider",
+                                         "OpenVINOExecutionProvider", "CoreMLExecutionProvider")
+                       if item in providers)
+    if not candidates:
+        return False
+    key = tuple(candidates)
+    if key in _CONTROL_ORT_GPU_PROBES:
+        return _CONTROL_ORT_GPU_PROBES[key]
+    model_root = Path(__file__).resolve().parents[1] / "comfyui_controlnet_aux" / "ckpts"
+    probe = next((path for path in (
+        model_root / "yzd-v" / "DWPose" / "dw-ll_ucoco_384.onnx",
+        model_root / "dw-ll_ucoco_384.onnx",
+    ) if path.is_file()), None)
+    if probe is None:
+        # The model will be downloaded by DWPose later. Avoid trusting a
+        # provider that has not yet been proven to work; TorchScript remains
+        # the deterministic GPU path in this case.
+        _CONTROL_ORT_GPU_PROBES[key] = False
+        return False
+    try:
+        import onnxruntime as ort
+        session = ort.InferenceSession(str(probe), providers=[*candidates, "CPUExecutionProvider"])
+        active = set(session.get_providers())
+        result = bool(active & set(candidates))
+    except Exception as exc:
+        LOG.warning("H3 Auto Director: ONNX GPU provider 创建失败，将使用 GPU TorchScript：%s", exc)
+        result = False
+    _CONTROL_ORT_GPU_PROBES[key] = result
+    return result
+
+
+def _run_pose_preprocessor(video_frames, resolution, mappings, preprocess_device="GPU", pose_type="全身",
+                           model_profile="真人（DWPose）"):
+    """Run the selected human-pose estimator on one bounded frame chunk.
+
+    DWPose is preferred for live-action footage.  Anime footage can use the
+    bundled OpenPose estimator, whose human skeleton is less dependent on
+    realistic limb proportions.  If OpenPose is not installed, the anime
+    choice falls back to DWPose with an explicit warning rather than silently
+    disabling pose control.
+    """
+    profile = str(model_profile or "真人（DWPose）").strip()
+    anime = profile.startswith("动漫")
+    if anime:
+        cls = mappings.get("OpenposePreprocessor")
+        if cls is None:
+            LOG.warning("H3 Auto Director: 未找到 OpenPose 动漫预处理器，将回退 DWPose")
+            cls = mappings.get("DWPreprocessor")
+    else:
+        cls = mappings.get("DWPreprocessor")
     if cls is None:
-        raise RuntimeError("未找到姿态预处理器，请安装 comfyui_controlnet_aux（可选安装 ComfyUI-AnimePose）")
+        cls = next((mappings.get(name) for name in ("AnimePosePreprocessor", "AnimePose")
+                    if mappings.get(name) is not None), None)
+    if cls is None:
+        raise RuntimeError("未找到姿态预处理器，请安装 comfyui_controlnet_aux")
+    # GPU mode deliberately uses the TorchScript graph. Even a CUDA-enabled
+    # ONNX Runtime can retain a CPU session in DWPose's global cache after a
+    # previous CPU run; selecting the distinct TorchScript filename guarantees
+    # the model is rebuilt on the requested CUDA device.
+    use_torchscript = str(preprocess_device or "GPU").strip().upper() == "GPU"
+    pose_type = str(pose_type or "全身").strip()
+    if pose_type not in POSE_PREPROCESS_TYPES:
+        pose_type = "全身"
+    # "全身" preserves the historical behavior (body + hands + face).
+    detect_body = pose_type in {"全身", "身体", "身体+手部", "身体+脸部", "身体+手部+脸部"}
+    detect_hand = pose_type in {"全身", "身体+手部", "身体+手部+脸部"}
+    detect_face = pose_type in {"全身", "身体+脸部", "身体+手部+脸部"}
+    cls_name = str(getattr(cls, "__name__", type(cls).__name__))
+    is_openpose = "OpenPose" in cls_name or "Openpose" in cls_name
+    if is_openpose:
+        # OpenPose's wrapper does not expose DWPose detector/model selectors.
+        try:
+            result = cls().estimate_pose(
+                video_frames,
+                detect_hand="enable" if detect_hand else "disable",
+                detect_body="enable" if detect_body else "disable",
+                detect_face="enable" if detect_face else "disable",
+                resolution=int(resolution), scale_stick_for_xinsr_cn="disable")
+        except TypeError as exc:
+            result = cls().estimate_pose(video_frames, resolution=int(resolution))
+        LOG.info("H3 Auto Director: 姿态预处理模型=%s（%s）", cls_name, profile)
+        return _control_image_result(result), cls_name
+    if use_torchscript:
+        if "DWPose" not in cls_name:
+            raise RuntimeError("GPU 预处理必须使用 comfyui_controlnet_aux 的 DWPose TorchScript，未找到可用的 DWPose 节点。")
+        # CPU-only onnxruntime cannot honor the GPU selection.  Using the
+        # TorchScript pose model changes the cached DWPose model identity and
+        # therefore also prevents a CPU ONNX session from being reused after
+        # switching devices.  The bundled wrapper has no GPU detector
+        # fallback, so ``None`` makes it estimate the pose on the full frame.
+        bbox_detector = "None"
+        pose_estimator = "dw-ll_ucoco_384_bs5.torchscript.pt"
+        if not torch.cuda.is_available():
+            raise RuntimeError("已选择 GPU 预处理，但 PyTorch 未检测到 CUDA；不会回退到 CPU。")
+        model_path = (Path(__file__).resolve().parents[1] / "comfyui_controlnet_aux" / "ckpts"
+                      / "hr16" / "DWPose-TorchScript-BatchSize5" / pose_estimator)
+        if not model_path.is_file():
+            raise FileNotFoundError(f"GPU 姿态模型不存在：{model_path}")
+        model_key = str(model_path.resolve())
+        if model_key not in _CONTROL_TS_GPU_VERIFIED:
+            # Verify the same artifact used by controlnet_aux before invoking
+            # its wrapper.  A CPU-loaded TorchScript module is rejected instead
+            # of producing a misleadingly successful CPU inference.
+            probe = torch.jit.load(str(model_path), map_location=torch.device("cuda", torch.cuda.current_device()))
+            probe.eval().to(torch.device("cuda", torch.cuda.current_device()))
+            devices = {str(item.device) for item in list(probe.parameters()) + list(probe.buffers())}
+            del probe
+            if not devices or not all(item.startswith("cuda:") for item in devices):
+                raise RuntimeError(f"GPU 姿态模型未加载到 CUDA（实际设备：{sorted(devices) or ['未知']}）")
+            _CONTROL_TS_GPU_VERIFIED.add(model_key)
+            LOG.info("H3 Auto Director: 已验证 TorchScript 姿态模型设备=%s", sorted(devices))
+        LOG.info("H3 Auto Director: GPU 模式使用 TorchScript 姿态模型（全画面检测，避免 ONNX CPU 会话复用）")
+    else:
+        bbox_detector = "yolox_l.onnx"
+        pose_estimator = "dw-ll_ucoco_384.onnx"
     try:
         result = cls().estimate_pose(
-            video_frames, detect_hand="enable", detect_body="enable", detect_face="enable",
-            resolution=int(resolution), bbox_detector="yolox_l.onnx",
-            pose_estimator="dw-ll_ucoco_384.onnx", scale_stick_for_xinsr_cn="disable")
-    except TypeError:
+            video_frames,
+            detect_hand="enable" if detect_hand else "disable",
+            detect_body="enable" if detect_body else "disable",
+            detect_face="enable" if detect_face else "disable",
+            resolution=int(resolution), bbox_detector=bbox_detector,
+            pose_estimator=pose_estimator, scale_stick_for_xinsr_cn="disable")
+    except TypeError as exc:
+        if use_torchscript:
+            raise RuntimeError("DWPose GPU 接口不支持 TorchScript 参数，已拒绝回退到可能使用 CPU 的预处理器。") from exc
+        # Older controlnet_aux releases expose only ``images`` and
+        # ``resolution``.  Keep CPU compatibility while retaining the richer
+        # branch selection whenever the extended signature is available.
         result = cls().estimate_pose(video_frames, resolution=int(resolution))
+    if use_torchscript:
+        # Validate the exact global model object used by controlnet_aux.  The
+        # wrapper keeps a process-wide cache, so checking a separate probe
+        # alone would not catch a stale CPU-loaded cache.
+        try:
+            # node_wrappers.dwpose imports the implementation through the
+            # bundled ``.src.custom_controlnet_aux`` package.  Search loaded
+            # modules instead of importing the similarly named top-level
+            # package, which would inspect a different cache object.
+            cached = None
+            for module in list(sys.modules.values()):
+                if module is None or not str(getattr(module, "__name__", "")).endswith("custom_controlnet_aux.dwpose"):
+                    continue
+                candidate = getattr(getattr(module, "global_cached_dwpose", None), "pose", None)
+                if candidate is not None:
+                    cached = candidate
+                    break
+            cached_devices = ({str(item.device) for item in list(cached.parameters()) + list(cached.buffers())}
+                              if cached is not None else set())
+        except Exception as exc:
+            raise RuntimeError(f"无法验证 DWPose TorchScript 实际设备：{exc}") from exc
+        if not cached_devices or not all(item.startswith("cuda:") for item in cached_devices):
+            raise RuntimeError(f"DWPose 实际缓存未运行在 CUDA（设备：{sorted(cached_devices) or ['未知']}）")
+        torch.cuda.synchronize()
+        model_bytes = 0
+        if cached is not None:
+            model_bytes = sum(int(item.numel()) * int(item.element_size())
+                              for item in list(cached.parameters()) + list(cached.buffers()))
+        allocated = int(torch.cuda.memory_allocated() / (1024 * 1024))
+        reserved = int(torch.cuda.memory_reserved() / (1024 * 1024))
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(torch.cuda.current_device())
+            device_info = "，设备总量=%d MiB，可用=%d MiB" % (
+                int(total_bytes / (1024 * 1024)), int(free_bytes / (1024 * 1024)))
+        except (RuntimeError, AttributeError):
+            device_info = ""
+        # ``memory_allocated`` is process-level live tensor memory, not the
+        # GPU's total VRAM and not a measure of inference utilization. A small
+        # DWPose TorchScript model legitimately reports roughly 100–200 MiB;
+        # temporary seven-frame activations are released after each batch.
+        LOG.info("H3 Auto Director: DWPose 实际缓存设备=%s，模型参数约=%d MiB，进程已分配=%d MiB，保留=%d MiB%s",
+                 sorted(cached_devices), int(model_bytes / (1024 * 1024)), allocated, reserved, device_info)
+    LOG.info("H3 Auto Director: 姿态预处理模型=%s（%s），类型=%s（身体=开启，手部=%s，脸部=%s）",
+             cls_name, profile, pose_type, "开启" if detect_hand else "关闭", "开启" if detect_face else "关闭")
     return _control_image_result(result), type(cls()).__name__
 
 
-def _run_depth_preprocessor(video_frames, resolution, mappings):
-    # Prefer a temporal depth implementation when installed; otherwise use
-    # the widely available Depth Anything V2 node.
-    cls = next((mappings.get(name) for name in ("VideoDepthAnythingPreprocessor", "VideoDepthAnything")
-                if mappings.get(name) is not None), None)
-    if cls is not None:
-        try:
-            result = cls().execute(video_frames, resolution=int(resolution))
-            return _control_image_result(result), type(cls()).__name__
-        except (TypeError, RuntimeError, ValueError) as exc:
-            LOG.warning("H3 Auto Director: Video Depth Anything 处理失败，回退 Depth Anything V2：%s", exc)
+def _run_depth_preprocessor(video_frames, resolution, mappings,
+                            model_profile=DEPTH_MODEL_PROFILES[1]):
+    """Run the selected depth model while preserving older AUX APIs."""
+    profile = str(model_profile or DEPTH_MODEL_PROFILES[1]).strip()
+    if profile == DEPTH_MODEL_PROFILES[0]:
+        cls = next((mappings.get(name) for name in ("VideoDepthAnythingPreprocessor", "VideoDepthAnything")
+                    if mappings.get(name) is not None), None)
+        if cls is None:
+            LOG.warning("H3 Auto Director: 未找到 Video Depth Anything，将回退 Depth Anything V2 Large")
+        else:
+            try:
+                result = cls().execute(video_frames, resolution=int(resolution))
+                return _control_image_result(result), type(cls()).__name__
+            except (TypeError, RuntimeError, ValueError) as exc:
+                LOG.warning("H3 Auto Director: Video Depth Anything 处理失败，将回退 V2 Large：%s", exc)
     cls = mappings.get("DepthAnythingV2Preprocessor")
     if cls is None:
         raise RuntimeError("未找到深度预处理器，请安装 comfyui_controlnet_aux 或 Video-Depth-Anything")
-    result = cls().execute(video_frames, ckpt_name="depth_anything_v2_vitl.pth", resolution=int(resolution))
+    ckpt_name = "depth_anything_v2_vits.pth" if profile == DEPTH_MODEL_PROFILES[2] else "depth_anything_v2_vitl.pth"
+    result = cls().execute(video_frames, ckpt_name=ckpt_name, resolution=int(resolution))
     return _control_image_result(result), type(cls()).__name__
+
+
+def _system_memory_percent():
+    """Return host RAM usage without making psutil a hard dependency."""
+    try:
+        import psutil
+        return float(psutil.virtual_memory().percent)
+    except Exception:
+        return None
+
+
+def _run_control_in_chunks(video_frames, runner, batch_size=CONTROL_BATCH_FRAMES):
+    """Run a control preprocessor on small frame windows and release buffers.
+
+    ControlNet preprocessors often receive an entire segment as one IMAGE
+    batch. For long segments that retains every intermediate tensor on the
+    accelerator until the call returns. Seven-frame windows keep peak memory
+    bounded while preserving frame order; outputs are moved to CPU before the
+    next window is submitted.
+    """
+    if not torch.is_tensor(video_frames) or video_frames.ndim != 4:
+        raise ValueError("控制视频片段必须是 [帧,高,宽,RGB] IMAGE")
+    batch_size = max(1, int(batch_size))
+    # Preallocate one CPU output buffer after the first result.  The previous
+    # list+torch.cat implementation kept every chunk and then allocated a
+    # second full-size tensor during concatenation, briefly doubling system
+    # RAM for long clips.
+    output = None
+    fallback_chunks = None
+    write_offset = 0
+    preprocessors = []
+    total = int(video_frames.shape[0])
+    start = 0
+    active_batch_size = batch_size
+    while start < total:
+        ram_percent = _system_memory_percent()
+        if ram_percent is not None and ram_percent >= 89.0 and active_batch_size > 1:
+            active_batch_size = max(1, active_batch_size // 2)
+            LOG.warning("H3 Auto Director: 系统内存 %.1f%%，将预处理分块从 %d 帧降至 %d 帧",
+                        ram_percent, batch_size, active_batch_size)
+        end = min(total, start + active_batch_size)
+        chunk = video_frames[start:end].contiguous()
+        with torch.inference_mode():
+            result, name = runner(chunk)
+        if not torch.is_tensor(result):
+            raise ValueError("控制预处理器返回了无效的 IMAGE 结果")
+        cpu_result = result.detach().float().cpu().contiguous()
+        if output is None:
+            if cpu_result.ndim != 4 or int(cpu_result.shape[0]) <= 0:
+                raise ValueError("控制预处理器返回了无效的 IMAGE 结果")
+            output = torch.empty((total, *cpu_result.shape[1:]), dtype=cpu_result.dtype)
+        if (fallback_chunks is None and cpu_result.ndim == output.ndim
+                and tuple(cpu_result.shape[1:]) == tuple(output.shape[1:])
+                and write_offset + int(cpu_result.shape[0]) <= total):
+            output[write_offset:write_offset + int(cpu_result.shape[0])].copy_(cpu_result)
+            write_offset += int(cpu_result.shape[0])
+        else:
+            if fallback_chunks is None:
+                fallback_chunks = [output[:write_offset].clone()]
+            fallback_chunks.append(cpu_result)
+        preprocessors.append(name)
+        del result, cpu_result, chunk
+        _release_video_memory()
+        start = end
+    if output is None:
+        raise ValueError("控制视频片段没有可处理的帧")
+    if fallback_chunks is not None:
+        output = torch.cat(fallback_chunks, dim=0).contiguous()
+        del fallback_chunks
+    elif write_offset != total:
+        output = output[:write_offset].contiguous()
+    return output, "+".join(dict.fromkeys(preprocessors))
+
+
+def _prepare_control_frames(video_frames):
+    """Normalize control input without duplicating an already suitable batch.
+
+    Video loaders normally provide CPU float32 IMAGE tensors.  Reusing that
+    detached contiguous storage avoids a full-video RAM copy before the
+    bounded preprocessor loop.  Conversion remains explicit for GPU, integer,
+    non-contiguous, or grad-tracking inputs.
+    """
+    if not torch.is_tensor(video_frames) or video_frames.ndim != 4:
+        raise ValueError("控制视频输入必须是 [帧,高,宽,RGB] IMAGE")
+    if (video_frames.device.type == "cpu" and video_frames.dtype == torch.float32
+            and video_frames.is_contiguous() and not video_frames.requires_grad):
+        return video_frames.detach()
+    return video_frames.detach().to(device="cpu", dtype=torch.float32).clamp(0, 1).contiguous()
+
+
+def _run_control_preprocess(video_frames, runner, use_chunks=True, batch_size=CONTROL_BATCH_FRAMES):
+    """Run a control preprocessor either in windows or once for the segment."""
+    if bool(use_chunks):
+        return _run_control_in_chunks(video_frames, runner, batch_size=batch_size)
+    if not torch.is_tensor(video_frames) or video_frames.ndim != 4:
+        raise ValueError("控制视频片段必须是 [帧,高,宽,RGB] IMAGE")
+    with torch.inference_mode():
+        result, name = runner(video_frames.contiguous())
+    if not torch.is_tensor(result):
+        raise ValueError("控制预处理器返回了无效的 IMAGE 结果")
+    output = result.detach().float().cpu().contiguous()
+    del result
+    _release_video_memory()
+    return output, name
 
 
 def _persist_control_video(path, images):
     try:
-        _write_segment_video(path, images.detach().float().cpu().contiguous(), None,
+        frames = images.detach().float().cpu().contiguous()
+        _audit_control_frames(frames, "待保存控制视频")
+        _write_segment_video(path, frames, None,
                              FPS, "mp4", "h264", "CPU", "最高质量")
         return bool(path.is_file() and path.stat().st_size > 0)
     except Exception as exc:
-        # A .pt cache is still sufficient for an in-process/external runner;
-        # missing ffmpeg should not abort H3 sampling.
-        LOG.warning("H3 Auto Director: 控制视频 MP4 保存失败（已保留 PT 缓存）：%s", exc)
+        # The control node deliberately has no tensor-file fallback.  Surface
+        # the encoding failure so the user knows why a later cache lookup will
+        # rerun preprocessing.
+        LOG.warning("H3 Auto Director: 控制视频 MP4 保存失败，将在下次运行重新预处理：%s", exc)
         return False
 
 
@@ -3480,10 +3714,12 @@ class H3AutoDirectorControlPreprocess:
         return {"required": {
             "control_mode": (list(CONTROL_MODES), {"default": "姿态+深度"}),
             "resolution": ("INT", {"default": 768, "min": 256, "max": 2048, "step": 32}),
+            "preprocess_device": (["GPU", "CPU"], {"default": "GPU",
+                "tooltip": "选择姿态/深度预处理运行设备。GPU 使用当前 ComfyUI 加速设备；CPU 强制 Torch 与 DWPose ONNX 在 CPU 上运行。"}),
             "enabled": ("BOOLEAN", {"default": True, "label_on": "启用预处理", "label_off": "关闭预处理",
                                        "tooltip": "默认启用姿态/深度预处理。关闭时只对齐并转发原视频帧。"}),
             "save_preprocessed": ("BOOLEAN", {"default": True, "label_on": "保存预处理视频", "label_off": "不保存预处理视频",
-                                                "tooltip": "默认保存到项目 control/segment_XXXX；同时保留 PT 缓存供后端读取。"}),
+                                                "tooltip": "默认保存到项目 control/preprocessed/segment_XXXX；仅保存 MP4 预处理视频，不写入 PT 张量缓存。"}),
             "preprocess_all_segments": ("BOOLEAN", {"default": False, "label_on": "一次性预处理全部片段", "label_off": "仅当前片段",
                                                        "tooltip": "开启后按动作迁移计划完整预处理所有视频片段；适合开始采样前一次性生成控制缓存。"}),
             "pose_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
@@ -3493,8 +3729,28 @@ class H3AutoDirectorControlPreprocess:
             "plan": ("H3_AUTO_PLAN", {"tooltip": "连接动作迁移项目计划，自动读取并缓存对应参考视频片段。"}),
             "segment_index": ("INT", {"default": 1, "min": 1, "max": 9999,
                                          "tooltip": "动作迁移计划中的生成片段编号；应连接 H3 片段节点输出。"}),
-            "source_video_path": ("STRING", {"default": "", "multiline": False,
-                                               "tooltip": "可选。input 目录内的视频相对路径；优先级低于 video_frames 和 plan。"}),
+            # Optional keeps the positional widget order of older workflows;
+            # ComfyUI will still render this as a normal selectable widget.
+            "pose_preprocess_type": (list(POSE_PREPROCESS_TYPES), {"default": "全身",
+                "tooltip": "姿态预处理范围。默认只检测全身骨架；需要手指或面部关键点时选择对应组合。"}),
+            "pose_model_profile": (list(POSE_MODEL_PROFILES), {"default": POSE_MODEL_PROFILES[0],
+                "tooltip": "真人使用 DWPose；动漫人物可切换 OpenPose。若未安装 OpenPose，将明确回退到 DWPose。"}),
+            "depth_model_profile": (list(DEPTH_MODEL_PROFILES), {"default": DEPTH_MODEL_PROFILES[1],
+                "tooltip": "深度模型选择。Video Depth Anything 提供时序稳定性；V2 Large 质量高；V2 Small 占用较低。"}),
+            "resolution_mode": (list(CONTROL_RESOLUTION_MODES), {"default": CONTROL_RESOLUTION_MODES[0],
+                "tooltip": "匹配生成分辨率时，控制帧会等比例缩放并中心裁剪到生成画布；请连接双采样分辨率输出。"}),
+            "resolution_config": ("H3_RESOLUTION", {"tooltip": "连接 H3 分辨率选择节点的“分辨率配置”，自动读取第一阶段宽高和最短边。"}),
+            "generation_width": ("INT", {"default": 0, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 32,
+                "tooltip": "可直接连接分辨率节点的第一阶段宽度；匹配模式优先使用此值。"}),
+            "generation_height": ("INT", {"default": 0, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 32,
+                "tooltip": "可直接连接分辨率节点的第一阶段高度；匹配模式优先使用此值。"}),
+            "target_short_edge": ("INT", {"default": 0, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 32,
+                "tooltip": "固定短边模式的覆盖值；留空/0 时直接使用分辨率配置中的第一阶段最短边。"}),
+            "enable_preprocess_chunking": ("BOOLEAN", {"default": True,
+                "label_on": "启用分块", "label_off": "整段处理",
+                "tooltip": "开启后按指定帧数分块处理；关闭时每个片段一次性送入姿态/深度模型。"}),
+            "preprocess_chunk_frames": ("INT", {"default": CONTROL_BATCH_FRAMES, "min": 1, "max": 256, "step": 1,
+                "tooltip": "每次送入姿态/深度预处理器的帧数，仅在启用分块时生效。"}),
         }}
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "H3_CONTROL_CONFIG", "IMAGE", "STRING")
@@ -3502,92 +3758,215 @@ class H3AutoDirectorControlPreprocess:
     FUNCTION = "preprocess"
     CATEGORY = "H3 自动导演/动作迁移/ControlNet"
 
-    def preprocess(self, control_mode="姿态+深度", resolution=768, enabled=True,
+    def preprocess(self, control_mode="姿态+深度", pose_preprocess_type="全身", resolution=768, preprocess_device="GPU", enabled=True,
                    save_preprocessed=True, preprocess_all_segments=False,
                    pose_weight=1.0, depth_weight=1.0, video_frames=None, plan=None,
-                   segment_index=1, source_video_path="", **_legacy):
+                   segment_index=1, resolution_mode=CONTROL_RESOLUTION_MODES[0],
+                   resolution_config=None, generation_width=0, generation_height=0,
+                   target_short_edge=0, enable_preprocess_chunking=True,
+                   preprocess_chunk_frames=CONTROL_BATCH_FRAMES,
+                   pose_model_profile=POSE_MODEL_PROFILES[0], depth_model_profile=DEPTH_MODEL_PROFILES[1], **_legacy):
+        # Keep accepting the previous width/height sockets for old workflows;
+        # new graphs should connect the single H3_RESOLUTION configuration.
+        target_width = generation_width or _legacy.get("target_width", 0)
+        target_height = generation_height or _legacy.get("target_height", 0)
         mode = str(control_mode or "姿态+深度")
         # Retain old graph compatibility without exposing the retired style
         # widget.  The former control_type determines the new mode when used.
         if mode not in CONTROL_MODES:
             old_type = str(_legacy.get("control_type", mode))
             mode = "姿态" if old_type.startswith("姿态") else "深度" if old_type.startswith("深度") else "关闭"
+        pose_preprocess_type = str(pose_preprocess_type or _legacy.get("pose_type", "全身")).strip()
+        if pose_preprocess_type not in POSE_PREPROCESS_TYPES:
+            pose_preprocess_type = "全身"
+        pose_model_profile = str(pose_model_profile or POSE_MODEL_PROFILES[0]).strip()
+        if pose_model_profile not in POSE_MODEL_PROFILES:
+            pose_model_profile = POSE_MODEL_PROFILES[0]
+        depth_model_profile = str(depth_model_profile or DEPTH_MODEL_PROFILES[1]).strip()
+        if depth_model_profile not in DEPTH_MODEL_PROFILES:
+            depth_model_profile = DEPTH_MODEL_PROFILES[1]
+        resolution_mode = str(resolution_mode or CONTROL_RESOLUTION_MODES[0])
+        if resolution_mode not in CONTROL_RESOLUTION_MODES:
+            resolution_mode = CONTROL_RESOLUTION_MODES[0]
         need_pose, need_depth = _control_mode_has_pose(mode), _control_mode_has_depth(mode)
         connected_frames = video_frames is not None
         if (video_frames is None and not bool(enabled) and not preprocess_all_segments
-                and plan is None and not str(source_video_path or "").strip()):
+                and plan is None):
             video_frames = torch.zeros((5, 16, 16, 3), dtype=torch.float32)
         if video_frames is None and isinstance(plan, dict):
             video_frames = _load_transfer_source_frames(plan, segment_index)
         if video_frames is None:
-            source = str(source_video_path or "").strip().strip('"')
-            if not source:
-                raise ValueError("请连接视频帧、动作迁移项目计划，或填写 input 目录内的视频路径")
-            try:
-                video_frames, _ = _load_reference_video(source)
-            except Exception as exc:
-                if av is None:
-                    raise RuntimeError("无法读取控制视频；请安装 VideoHelperSuite 或 PyAV") from exc
-                video_frames = _load_video_frames_av((_input_root() / _reference_name(source)).resolve())
+            raise ValueError("请连接视频帧或动作迁移项目计划；姿态/深度预处理不再接受视频路径")
         if not torch.is_tensor(video_frames) or video_frames.ndim != 4:
             raise ValueError("控制视频输入必须是 [帧,高,宽,RGB] IMAGE")
         if int(video_frames.shape[0]) < 5:
             raise ValueError("控制视频至少需要 5 帧（约 0.2 秒）")
-        full_frames = video_frames.float().clamp(0, 1).contiguous()
+        full_frames = _prepare_control_frames(video_frames)
         indices = [max(1, int(segment_index))]
         if bool(preprocess_all_segments) and isinstance(plan, dict) and str(plan.get("mode", "")) == "video_transfer":
             indices = list(range(1, len(plan.get("segments", [])) + 1))
+        chunk_frames = max(1, int(preprocess_chunk_frames or CONTROL_BATCH_FRAMES))
+        LOG.info("H3 Auto Director: 控制预处理将按片段顺序处理 %d 个窗口（当前片段=%d%s），%s",
+                 len(indices), int(segment_index), ", 已开启一次性全部片段" if bool(preprocess_all_segments) else "",
+                 ("每批 %d 帧" % chunk_frames) if bool(enable_preprocess_chunking) else "每个片段整段一次处理")
+        _ensure_local_aux_model_layout()
         mappings = _control_preprocessor_mappings()
         current_pose = current_depth = None
         records = {}
-        for index in indices:
-            if connected_frames:
-                segment_frames = _control_frames_for_segment(plan, index, full_frames)
-                if (segment_frames is full_frames and plan is not None
-                        and str(plan.get("mode", "")) == "video_transfer"
-                        and index != int(segment_index)):
-                    # A connected batch that is already a segment cannot be
-                    # reused for another window; load that plan window on demand.
-                    segment_frames = _load_transfer_source_frames(plan, index)
-            else:
-                segment_frames = full_frames if index == int(segment_index) and not preprocess_all_segments \
-                    else _load_transfer_source_frames(plan, index)
-            if not torch.is_tensor(segment_frames) or segment_frames.ndim != 4:
-                raise ValueError("控制视频片段必须是 [帧,高,宽,RGB] IMAGE")
-            cache_pose, video_pose = _control_cache_paths(plan, index, "pose")
-            cache_depth, video_depth = _control_cache_paths(plan, index, "depth")
-            pose = _load_control_tensor(cache_pose) if need_pose else None
-            depth = _load_control_tensor(cache_depth) if need_depth else None
-            preprocessors = {}
-            if bool(enabled):
-                if need_pose and pose is None:
-                    pose, preprocessors["pose"] = _run_pose_preprocessor(segment_frames, resolution, mappings)
-                    pose, _ = _align_control_frames(pose)
-                if need_depth and depth is None:
-                    depth, preprocessors["depth"] = _run_depth_preprocessor(segment_frames, resolution, mappings)
-                    depth, _ = _align_control_frames(depth)
+        device_context = _control_preprocess_device(preprocess_device) if bool(enabled) else contextlib.nullcontext("DISABLED")
+        with device_context as effective_device:
             if not bool(enabled):
-                passthrough, _ = _align_control_frames(segment_frames)
-                pose = passthrough if need_pose else None
-                depth = passthrough if need_depth else None
-            if pose is not None:
-                _save_control_tensor(cache_pose, pose)
-                if bool(save_preprocessed) and video_pose is not None and not video_pose.is_file():
-                    _persist_control_video(video_pose, pose)
-            if depth is not None:
-                _save_control_tensor(cache_depth, depth)
-                if bool(save_preprocessed) and video_depth is not None and not video_depth.is_file():
-                    _persist_control_video(video_depth, depth)
-            records[str(index)] = {
-                "pose_path": str(video_pose) if pose is not None and video_pose is not None else "",
-                "depth_path": str(video_depth) if depth is not None and video_depth is not None else "",
-                "pose_cache": str(cache_pose) if pose is not None and cache_pose is not None else "",
-                "depth_cache": str(cache_depth) if depth is not None and cache_depth is not None else "",
-                "frames": int(max(pose.shape[0] if pose is not None else 0, depth.shape[0] if depth is not None else 0)),
-                "preprocessors": preprocessors,
-            }
-            if index == int(segment_index):
-                current_pose, current_depth = pose, depth
+                LOG.info("H3 Auto Director: 控制预处理已关闭，跳过姿态/深度模型（设备选项=%s）", str(preprocess_device or "GPU"))
+            for index in indices:
+                if connected_frames:
+                    segment_frames = _control_frames_for_segment(plan, index, full_frames)
+                    if (segment_frames is full_frames and plan is not None
+                            and str(plan.get("mode", "")) == "video_transfer"
+                            and index != int(segment_index)):
+                        # A connected batch that is already a segment cannot be
+                        # reused for another window; load that plan window on demand.
+                        segment_frames = _load_transfer_source_frames(plan, index)
+                else:
+                    segment_frames = full_frames if index == int(segment_index) and not preprocess_all_segments \
+                        else _load_transfer_source_frames(plan, index)
+                if not torch.is_tensor(segment_frames) or segment_frames.ndim != 4:
+                    raise ValueError("控制视频片段必须是 [帧,高,宽,RGB] IMAGE")
+                target_resolution = _control_target_resolution(
+                    plan, target_width, target_height, resolution_mode, segment_frames,
+                    resolution_config=resolution_config, target_short_edge=target_short_edge
+                )
+                if resolution_mode == CONTROL_RESOLUTION_MODES[1] and target_resolution is None:
+                    LOG.warning("H3 Auto Director: 已选择匹配生成分辨率，但未取得第一阶段宽高；将使用输入视频尺寸。请连接分辨率节点的第一阶段宽度/高度输出或分辨率配置")
+                preprocess_frames = segment_frames
+                if isinstance(target_resolution, dict):
+                    preprocess_frames = _resize_control_to_short_edge(
+                        segment_frames, target_resolution.get("short_edge", 0)
+                    )
+                    LOG.info("H3 Auto Director: 片段 %d 控制预处理使用第二阶段最短边=%d（保持比例）",
+                             int(index), int(min(preprocess_frames.shape[1], preprocess_frames.shape[2])))
+                elif target_resolution is not None:
+                    preprocess_frames = _resize_control_to_generation(
+                        segment_frames, target_resolution[0], target_resolution[1]
+                    )
+                    LOG.info("H3 Auto Director: 片段 %d 控制预处理匹配生成分辨率=%dx%d（等比缩放后中心裁剪）",
+                             int(index), int(preprocess_frames.shape[2]), int(preprocess_frames.shape[1]))
+                transfer_meta = None
+                if isinstance(plan, dict) and str(plan.get("mode", "")) == "video_transfer":
+                    try:
+                        transfer_meta = next(item for item in _segment(plan, index).get("references", [])
+                                             if isinstance(item, dict) and item.get("type") == "transfer_video_segment")
+                    except (StopIteration, ValueError):
+                        transfer_meta = None
+                if transfer_meta is not None:
+                    start_frame = int(transfer_meta.get("start_frame", 0) or 0)
+                    source_frames = int(transfer_meta.get("source_frames", segment_frames.shape[0]) or segment_frames.shape[0])
+                    LOG.info("H3 Auto Director: 预处理片段 %d/%d，源帧 %d-%d，输入 %d 帧%s",
+                             int(index), len(indices), start_frame, start_frame + max(0, source_frames - 1),
+                             int(segment_frames.shape[0]), "（缓存命中前仍按该窗口读取）" if bool(preprocess_all_segments) else "")
+                else:
+                    LOG.info("H3 Auto Director: 预处理片段 %d/%d，输入 %d 帧", int(index), len(indices), int(segment_frames.shape[0]))
+                _, video_pose = _control_cache_paths(
+                    plan, index, "pose", pose_preprocess_type, pose_model_profile)
+                _, video_depth = _control_cache_paths(plan, index, "depth",
+                                                      depth_model_profile=depth_model_profile)
+                legacy_video_pose = _legacy_control_video_path(plan, index, "pose")
+                legacy_video_depth = _legacy_control_video_path(plan, index, "depth")
+                # Only the encoded MP4 is durable.  Legacy .pt tensor files are
+                # intentionally ignored so device-specific tensors cannot be
+                # reused across runs.
+                pose = (_load_control_video(video_pose) if need_pose and video_pose is not None else None)
+                pose_cache_rebuild = bool(need_pose and pose is None)
+                if (pose is None and need_pose and legacy_video_pose is not None
+                        and not pose_model_profile.startswith("动漫")):
+                    pose = _load_control_video(legacy_video_pose)
+                    pose_cache_rebuild = bool(pose is None)
+                depth = (_load_control_video(video_depth) if need_depth and video_depth is not None else None)
+                depth_cache_rebuild = bool(need_depth and depth is None)
+                if (depth is None and need_depth and legacy_video_depth is not None
+                        and depth_model_profile == DEPTH_MODEL_PROFILES[1]):
+                    depth = _load_control_video(legacy_video_depth)
+                    depth_cache_rebuild = bool(depth is None)
+                if pose is not None:
+                    pose, _ = _align_control_frames(pose)
+                    try:
+                        _audit_control_frames(pose, "姿态控制缓存")
+                    except ValueError as exc:
+                        LOG.info("H3 Auto Director: 丢弃无效姿态缓存：%s", exc)
+                        pose = None
+                        pose_cache_rebuild = True
+                    if (pose is not None and target_resolution is not None
+                            and (int(pose.shape[1]), int(pose.shape[2])) != (int(preprocess_frames.shape[1]), int(preprocess_frames.shape[2]))):
+                        LOG.info("H3 Auto Director: 丢弃尺寸不匹配的姿态缓存（%sx%s）",
+                                 int(pose.shape[2]), int(pose.shape[1]))
+                        pose = None
+                        pose_cache_rebuild = True
+                if depth is not None:
+                    depth, _ = _align_control_frames(depth)
+                    try:
+                        _audit_control_frames(depth, "深度控制缓存")
+                    except ValueError as exc:
+                        LOG.info("H3 Auto Director: 丢弃无效深度缓存：%s", exc)
+                        depth = None
+                        depth_cache_rebuild = True
+                    if (depth is not None and target_resolution is not None
+                            and (int(depth.shape[1]), int(depth.shape[2])) != (int(preprocess_frames.shape[1]), int(preprocess_frames.shape[2]))):
+                        LOG.info("H3 Auto Director: 丢弃尺寸不匹配的深度缓存（%sx%s）",
+                                 int(depth.shape[2]), int(depth.shape[1]))
+                        depth = None
+                        depth_cache_rebuild = True
+                preprocessors = {}
+                if bool(enabled):
+                    if need_pose and pose is None:
+                        pose, preprocessors["pose"] = _run_control_preprocess(
+                            preprocess_frames,
+                            lambda chunk: _run_pose_preprocessor(
+                                chunk, resolution, mappings, effective_device, pose_preprocess_type,
+                                pose_model_profile),
+                            use_chunks=enable_preprocess_chunking, batch_size=chunk_frames,
+                        )
+                        pose, _ = _align_control_frames(pose)
+                    if need_depth and depth is None:
+                        depth, preprocessors["depth"] = _run_control_preprocess(
+                            preprocess_frames,
+                            lambda chunk: _run_depth_preprocessor(chunk, resolution, mappings, depth_model_profile),
+                            use_chunks=enable_preprocess_chunking, batch_size=chunk_frames,
+                        )
+                        depth, _ = _align_control_frames(depth)
+                if not bool(enabled):
+                    passthrough, _ = _align_control_frames(preprocess_frames)
+                    pose = passthrough if need_pose else None
+                    depth = passthrough if need_depth else None
+                pose_audit = _audit_control_frames(pose, "姿态控制视频") if pose is not None else None
+                depth_audit = _audit_control_frames(depth, "深度控制视频") if depth is not None else None
+                if pose is not None:
+                    if bool(save_preprocessed) and video_pose is not None and (pose_cache_rebuild or not video_pose.is_file()):
+                        _persist_control_video(video_pose, pose)
+                if depth is not None:
+                    if bool(save_preprocessed) and video_depth is not None and (depth_cache_rebuild or not video_depth.is_file()):
+                        _persist_control_video(video_depth, depth)
+                pose_file_audit = _probe_control_video_file(video_pose) if pose is not None and video_pose is not None and video_pose.is_file() else None
+                depth_file_audit = _probe_control_video_file(video_depth) if depth is not None and video_depth is not None and video_depth.is_file() else None
+                for file_audit, kind in ((pose_file_audit, "姿态"), (depth_file_audit, "深度")):
+                    if file_audit and file_audit.get("valid") is False:
+                        raise RuntimeError(f"{kind}控制视频已写入但无法通过视频流检查：{file_audit.get('reason', '未知错误')}")
+                records[str(index)] = {
+                    # Prefer the new isolated folder, while retaining read
+                    # compatibility for projects created before the split.
+                    "pose_path": str(video_pose) if pose is not None and video_pose is not None and video_pose.is_file()
+                                 else (str(legacy_video_pose) if pose is not None and legacy_video_pose is not None and legacy_video_pose.is_file() else ""),
+                    "depth_path": str(video_depth) if depth is not None and video_depth is not None and video_depth.is_file()
+                                  else (str(legacy_video_depth) if depth is not None and legacy_video_depth is not None and legacy_video_depth.is_file() else ""),
+                    "pose_cache": "",
+                    "depth_cache": "",
+                    "frames": int(max(pose.shape[0] if pose is not None else 0, depth.shape[0] if depth is not None else 0)),
+                    "pose_audit": pose_audit,
+                    "depth_audit": depth_audit,
+                    "pose_file_audit": pose_file_audit,
+                    "depth_file_audit": depth_file_audit,
+                    "preprocessors": preprocessors,
+                }
+                if index == int(segment_index):
+                    current_pose, current_depth = pose, depth
         if current_pose is None and current_depth is None:
             fallback = _align_control_frames(full_frames)[0]
             current_pose = current_depth = fallback
@@ -3597,19 +3976,39 @@ class H3AutoDirectorControlPreprocess:
             "type": "h3_union_control",
             "enabled": bool(enabled) and mode != "关闭" and bool(need_pose or need_depth),
             "control_mode": mode,
+            "pose_preprocess_type": pose_preprocess_type,
+            "pose_model_profile": pose_model_profile,
+            "depth_model_profile": depth_model_profile,
+            "resolution_mode": resolution_mode,
+            "target_short_edge": int(target_short_edge or 0),
+            "generation_width": int(target_width or 0),
+            "generation_height": int(target_height or 0),
+            "enable_preprocess_chunking": bool(enable_preprocess_chunking),
+            "preprocess_chunk_frames": int(chunk_frames),
+            "preprocess_device": str(effective_device),
             "pose_weight": max(0.0, min(2.0, float(pose_weight))) if need_pose else 0.0,
             "depth_weight": max(0.0, min(2.0, float(depth_weight))) if need_depth else 0.0,
             "segment_index": int(segment_index), "fps": FPS, "frame_grid": "17*n+5",
             "segments": records,
+            "preprocess_status": "validated" if records else "no_records",
             "requires_videox_fun": True,
         }
         preview = current_pose if current_pose is not None else current_depth
         info = {"type": "h3_union_control", "mode": mode, "enabled": payload["enabled"],
+                "preprocess_device": str(effective_device),
+                "resolution_mode": resolution_mode,
+                "target_width": int(target_width or 0), "target_height": int(target_height or 0),
+                "enable_preprocess_chunking": bool(enable_preprocess_chunking),
+                "preprocess_chunk_frames": int(chunk_frames),
                 "pose_weight": payload["pose_weight"], "depth_weight": payload["depth_weight"],
+                "pose_preprocess_type": pose_preprocess_type,
+                "pose_model_profile": pose_model_profile,
+                "depth_model_profile": depth_model_profile,
                 "current_segment": int(segment_index), "processed_segments": [int(x) for x in indices],
                 "saved": bool(save_preprocessed), "records": records}
-        LOG.info("H3 Auto Director: 控制预处理完成：模式=%s，姿态权重=%.3f，深度权重=%.3f，片段=%s",
-                 mode, payload["pose_weight"], payload["depth_weight"], ",".join(map(str, indices)))
+        LOG.info("H3 Auto Director: 控制预处理完成：模式=%s，姿态类型=%s，深度模型=%s，设备=%s，姿态权重=%.3f，深度权重=%.3f，片段=%s",
+                 mode, pose_preprocess_type, depth_model_profile, effective_device,
+                 payload["pose_weight"], payload["depth_weight"], ",".join(map(str, indices)))
         return (current_pose if current_pose is not None else blank,
                 current_depth if current_depth is not None else blank,
                 payload, preview if preview is not None else blank,
@@ -3719,6 +4118,7 @@ class H3AutoDirectorControlExport:
         name = _output_filename(output_name) if str(output_name or "").strip() else control_type
         path = control_dir / (name + ".mp4")
         images = config["control_video"].detach().float().clamp(0, 1).cpu().contiguous()
+        _audit_control_frames(images, "待导出控制视频")
         _write_segment_video(path, images, None, FPS, "mp4", video_codec, "CPU", "最高质量")
         if not path.is_file() or path.stat().st_size == 0:
             raise RuntimeError("控制视频导出失败：%s" % path)
@@ -3740,6 +4140,18 @@ class H3AutoDirectorControlBackendCheck:
     CATEGORY = "H3 自动导演/动作迁移/ControlNet"
 
     def check(self, config):
+        if not isinstance(config, dict):
+            return (False, "控制配置不是字典，无法检查")
+        video = config.get("control_video")
+        tensor_status = "未提供内存中的控制帧"
+        if video is not None:
+            try:
+                audit = _audit_control_frames(video, "控制视频")
+                tensor_status = ("控制帧有效：%d 帧，%dx%d，范围 %.3f..%.3f" %
+                                 (audit["frames"], audit["width"], audit["height"],
+                                  audit["min"], audit["max"]))
+            except (TypeError, ValueError) as exc:
+                return (False, "控制帧审计失败：%s" % exc)
         try:
             import videox_fun  # noqa: F401
             package = True
@@ -3752,10 +4164,327 @@ class H3AutoDirectorControlBackendCheck:
             message = ("VideoX-Fun 后端不可用：请安装 VideoX-Fun，并将 "
                        "MiniMax-H3-Fun-Controlnet-Union.safetensors 路径填入控制配置节点。")
         elif required:
-            message = "VideoX-Fun Union 控制后端与权重路径检查通过；该配置需交给专用 VideoX-Fun 采样节点执行。"
+            message = ("VideoX-Fun Union 后端与权重路径检查通过；%s。"
+                       "这只证明输入可用，必须由 VideoX-Fun 专用采样节点执行。" % tensor_status)
         else:
-            message = "当前为仅记录配置模式，不会向原生 H3 采样注入 Union 控制。"
+            message = "当前为仅记录配置模式，不会向原生 H3 采样注入 Union 控制；%s。" % tensor_status
         return (ok, message)
+
+
+_VIDEOX_FUN_PIPELINE_CACHE = {}
+
+
+def _inspect_h3_model_file(path):
+    """Inspect a local checkpoint header without materialising its weights.
+
+    ComfyUI's H3 files use the native ``blocks.*``/``*_patch_proj`` names,
+    while VideoX-Fun expects a Diffusers directory.  Keeping this probe
+    separate lets the sampler give an actionable error before allocating a
+    20GB transformer.
+    """
+    path = Path(str(path)).expanduser()
+    if not path.is_file() or path.suffix.lower() != ".safetensors":
+        return {"format": "unknown", "path": str(path), "keys": 0}
+    if st_safe_open is None:
+        raise RuntimeError("当前 ComfyUI 环境缺少 safetensors，无法识别 H3 模型")
+    with st_safe_open(str(path), framework="pt", device="cpu") as reader:
+        keys = list(reader.keys())
+        metadata = reader.metadata() or {}
+        quant_keys = [key for key in keys if key.endswith(".comfy_quant")]
+        curve = "adaln_t_table" in keys
+        native = any(key.startswith("blocks.") for key in keys) and any(
+            key.startswith("video_patch_proj.") for key in keys
+        )
+        control = any(key.startswith("control_blocks.") for key in keys)
+        return {
+            "format": "comfyui_h3" if native else "unknown_safetensors",
+            "path": str(path),
+            "keys": len(keys),
+            "quantized": bool(quant_keys),
+            "quant_layers": len(quant_keys),
+            "curve_adaln": curve,
+            "has_control": control,
+            "metadata": metadata,
+        }
+
+
+def _videox_fun_pipeline_key(model_path, controlnet_path, config_path, dtype, memory_mode, device,
+                              components_path=""):
+    return tuple(str(Path(item).resolve()) if item else "" for item in
+                 (model_path, controlnet_path, config_path, components_path)) + (str(dtype), str(memory_mode), str(device))
+
+
+def _load_videox_fun_control_pipeline(model_path, controlnet_path, config_path,
+                                      memory_mode="model_group_offload", device="cuda",
+                                      dtype_name="bf16", videox_fun_path="", components_path=""):
+    """Load the official VideoX-Fun MiniMax-H3 Union pipeline lazily.
+
+    The external package is intentionally optional: importing this plugin must
+    continue to work in native ComfyUI installations.  Only this node adds the
+    VideoX-Fun source root to ``sys.path`` and loads its Diffusers components.
+    """
+    model_path = Path(str(model_path or "").strip().strip('"')).expanduser()
+    controlnet_path = Path(str(controlnet_path or "").strip().strip('"')).expanduser()
+    if not controlnet_path.is_file():
+        raise FileNotFoundError("找不到 MiniMax-H3-Fun-Controlnet-Union 权重：%s" % controlnet_path)
+    source_root = Path(str(videox_fun_path or "").strip().strip('"')).expanduser() if videox_fun_path else None
+    if source_root is not None:
+        if (source_root / "videox_fun").is_dir():
+            source_root = source_root
+        elif (source_root.parent / "videox_fun").is_dir():
+            source_root = source_root.parent
+        else:
+            raise FileNotFoundError("VideoX-Fun 路径下没有 videox_fun 包：%s" % source_root)
+        if str(source_root) not in sys.path:
+            sys.path.insert(0, str(source_root))
+    try:
+        from videox_fun.models import (AutoencoderKLMiniMaxH3,
+                                       AutoencoderKLMiniMaxH3Audio,
+                                       MiniMaxH3ControlTransformer3DModel,
+                                       Qwen2TokenizerFast,
+                                       Qwen3VLForConditionalGeneration,
+                                       Qwen3VLProcessor)
+        from videox_fun.pipeline import MiniMaxH3ControlPipeline
+        from videox_fun.utils import MiniMaxH3Scheduler, register_auto_device_hook, safe_enable_group_offload
+    except Exception as exc:
+        raise RuntimeError(
+            "无法导入 VideoX-Fun。请将官方仓库根目录填入‘VideoX-Fun 路径’，"
+            "并在当前 ComfyUI Python 中安装其 requirements。原生 H3 不会执行 Union ControlNet。"
+        ) from exc
+    try:
+        from omegaconf import OmegaConf
+    except Exception as exc:
+        raise RuntimeError("VideoX-Fun 需要 omegaconf") from exc
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}.get(str(dtype_name), torch.bfloat16)
+    if str(device).lower() == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("已选择 CUDA，但当前 PyTorch 未检测到 CUDA")
+    run_device = torch.device("cuda", torch.cuda.current_device()) if str(device).lower() == "cuda" else torch.device("cpu")
+    config_file = Path(config_path) if str(config_path or "").strip() else None
+    if config_file is None or not config_file.is_file():
+        if source_root is not None:
+            config_file = source_root / "config" / "minimax_h3" / "minimax_h3_control.yaml"
+    if config_file is None or not config_file.is_file():
+        raise FileNotFoundError("找不到 minimax_h3_control.yaml；请连接配置文件或填写 VideoX-Fun 根目录")
+    config = OmegaConf.load(str(config_file))
+    transformer_kwargs = OmegaConf.to_container(config.get("transformer_additional_kwargs", {}), resolve=True)
+    transformer_kwargs = dict(transformer_kwargs or {})
+    # The released Union checkpoint is trained with these exact branches.
+    transformer_kwargs.setdefault("control_blocks_places", [0, 10, 20, 30, 40])
+    transformer_kwargs.setdefault("control_apply_audio", False)
+    # VideoX-Fun's control transformer expects an official Diffusers model
+    # directory.  Native ComfyUI single-file checkpoints use a different
+    # layout (QKV packing, ConvRot/AdaLN variants and quantisation sidecars),
+    # so do not perform a partial conversion here.  The format-check node can
+    # still inspect such files and reports why they are not loadable.
+    components_root = Path(str(components_path or "").strip().strip('"')).expanduser() if components_path else None
+    if model_path.is_file():
+        source_info = _inspect_h3_model_file(model_path)
+        LOG.info("H3 Auto Director: 识别模型格式=%s，键数=%d，量化层=%d，AdaLN曲线=%s，控制分支=%s",
+                 source_info.get("format"), source_info.get("keys", 0), source_info.get("quant_layers", 0),
+                 source_info.get("curve_adaln", False), source_info.get("has_control", False))
+        if source_info.get("format") == "comfyui_h3":
+            detail = "ComfyUI H3 单文件（%s）" % (
+                "INT8/ConvRot 或 AdaLN 曲线格式" if source_info.get("quantized") or source_info.get("curve_adaln")
+                else "原生权重布局"
+            )
+            raise RuntimeError(
+                "%s 不能直接用于 VideoX-Fun Union。请提供官方 Diffusers 模型目录（包含 transformer、VAE、"
+                "音频 VAE、文本编码器、tokenizer、processor、scheduler 和 audio_scheduler）：%s" % (detail, model_path)
+            )
+        raise RuntimeError("模型路径必须是 VideoX-Fun Diffusers 目录；不支持将未知 safetensors 单文件直接加载：%s" % model_path)
+    elif not model_path.is_dir():
+        raise FileNotFoundError(
+            "基础模型必须是 VideoX-Fun 官方 Diffusers 目录：%s" % model_path
+        )
+    if components_root is not None:
+        components_root = components_root.resolve()
+        if not components_root.is_dir():
+            raise FileNotFoundError("VideoX-Fun 组件目录不存在：%s" % components_root)
+        # An optional component root can provide shared Diffusers assets while
+        # the transformer remains in the selected official model directory.
+        if (components_root / "vae").is_dir() and model_path.name != components_root.name:
+            model_path_for_components = components_root
+        else:
+            model_path_for_components = model_path
+    else:
+        model_path_for_components = model_path
+    required_components = ("vae", "audio_vae", "text_encoder", "tokenizer", "processor", "scheduler", "audio_scheduler")
+    missing_components = [name for name in required_components if not (model_path_for_components / name).exists()]
+    if missing_components:
+        raise FileNotFoundError("VideoX-Fun 模型目录缺少组件：%s（目录：%s）" %
+                                (", ".join(missing_components), model_path_for_components))
+    transformer_path = model_path / "transformer"
+    model_root = model_path_for_components
+    if not transformer_path.is_dir():
+        raise FileNotFoundError("VideoX-Fun transformer 目录不存在：%s" % transformer_path)
+
+    key = _videox_fun_pipeline_key(model_path, controlnet_path, config_file, dtype_name, memory_mode, run_device,
+                                    model_root)
+    if key in _VIDEOX_FUN_PIPELINE_CACHE:
+        return _VIDEOX_FUN_PIPELINE_CACHE[key]
+    LOG.info("H3 Auto Director: 加载 VideoX-Fun Union 专用管线（模型=%s，控制=%s，显存模式=%s）",
+             model_path, controlnet_path, memory_mode)
+    transformer = MiniMaxH3ControlTransformer3DModel.from_pretrained(
+        str(model_path), subfolder="transformer", low_cpu_mem_usage=True,
+        torch_dtype=dtype, **transformer_kwargs)
+    state_dict = comfy.utils.load_torch_file(str(controlnet_path), safe_load=True)
+    if isinstance(state_dict, dict) and "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    missing, unexpected = transformer.load_state_dict(state_dict, strict=False)
+    if len(missing) == 0:
+        LOG.info("H3 Auto Director: Union 控制权重加载完整（unexpected=%d）", len(unexpected))
+    else:
+        raise RuntimeError("Union 控制权重布局不匹配：缺少 %d 个参数，额外 %d 个参数；请确认使用官方 minimax_h3_control 配置" %
+                           (len(missing), len(unexpected)))
+    vae = AutoencoderKLMiniMaxH3.from_pretrained(str(model_root), subfolder="vae",
+                                                  low_cpu_mem_usage=True, torch_dtype=dtype)
+    audio_vae = AutoencoderKLMiniMaxH3Audio.from_pretrained(str(model_root), subfolder="audio_vae",
+                                                            low_cpu_mem_usage=True, torch_dtype=dtype)
+    tokenizer = Qwen2TokenizerFast.from_pretrained(str(model_root / "tokenizer"))
+    processor = Qwen3VLProcessor.from_pretrained(str(model_root / "processor"))
+    text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+        str(model_root / "text_encoder"), low_cpu_mem_usage=True, torch_dtype=dtype).eval()
+    scheduler = MiniMaxH3Scheduler.from_pretrained(str(model_root), subfolder="scheduler")
+    audio_scheduler = MiniMaxH3Scheduler.from_pretrained(str(model_root), subfolder="audio_scheduler")
+    pipeline = MiniMaxH3ControlPipeline(vae=vae, audio_vae=audio_vae, text_encoder=text_encoder,
+                                        tokenizer=tokenizer, processor=processor, transformer=transformer,
+                                        scheduler=scheduler, audio_scheduler=audio_scheduler)
+    mode = str(memory_mode or "model_group_offload")
+    if mode == "model_group_offload":
+        register_auto_device_hook(pipeline.transformer)
+        safe_enable_group_offload(pipeline, onload_device=run_device, offload_device="cpu",
+                                  offload_type="leaf_level", use_stream=True)
+    elif mode == "model_cpu_offload":
+        pipeline.enable_model_cpu_offload(device=run_device)
+    elif mode == "sequential_cpu_offload":
+        pipeline.enable_sequential_cpu_offload(device=run_device)
+    else:
+        pipeline.to(device=run_device)
+    pipeline._h3_auto_director_backend = "videox_fun_union"
+    pipeline._h3_auto_director_control_blocks = tuple(transformer_kwargs["control_blocks_places"])
+    _VIDEOX_FUN_PIPELINE_CACHE[key] = pipeline
+    return pipeline
+
+
+def _normalize_videox_output(output):
+    videos = getattr(output, "videos", None)
+    if not torch.is_tensor(videos):
+        raise RuntimeError("VideoX-Fun 管线没有返回 videos 张量")
+    if videos.ndim == 5 and videos.shape[-1] >= 3:
+        images = videos[0, ..., :3]
+    elif videos.ndim == 5 and videos.shape[1] >= 3:
+        images = videos[0].permute(1, 2, 3, 0)[..., :3]
+    elif videos.ndim == 4 and videos.shape[-1] >= 3:
+        images = videos[..., :3]
+    else:
+        raise RuntimeError("VideoX-Fun videos 输出形状无法转换为 ComfyUI IMAGE：%s" % (tuple(videos.shape),))
+    audio = getattr(output, "audio", None)
+    if not torch.is_tensor(audio):
+        raise RuntimeError("VideoX-Fun 管线没有返回 audio 张量")
+    if audio.ndim == 2:
+        audio = audio.unsqueeze(0)
+    elif audio.ndim == 3 and audio.shape[0] != 1 and audio.shape[1] == 1:
+        audio = audio.transpose(0, 1)
+    return images.detach().float().cpu().clamp(0, 1).contiguous(), audio.detach().float().cpu().contiguous()
+
+
+class H3AutoDirectorModelFormat:
+    """Read-only H3 checkpoint format probe for workflow diagnostics."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model_path": ("STRING", {"default": "", "multiline": False,
+                                         "tooltip": "填写 H3 Diffusers 目录或 ComfyUI .safetensors 文件。"}),
+        }}
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("模型格式报告",)
+    FUNCTION = "inspect"
+    CATEGORY = "H3 自动导演/模型加载"
+
+    def inspect(self, model_path):
+        path = Path(str(model_path or "").strip().strip('"')).expanduser()
+        if path.is_dir():
+            required = ("transformer", "vae", "audio_vae", "text_encoder", "tokenizer", "processor",
+                        "scheduler", "audio_scheduler")
+            missing = [name for name in required if not (path / name).exists()]
+            return ("VideoX-Fun Diffusers 目录：%s；缺少组件：%s" %
+                    (path, ", ".join(missing) if missing else "无"),)
+        info = _inspect_h3_model_file(path)
+        if info.get("format") == "comfyui_h3":
+            if info.get("quantized"):
+                detail = "ComfyUI INT8/ConvRot（VideoX-Fun stock 不兼容）"
+            elif info.get("curve_adaln"):
+                detail = "ComfyUI AdaLN 曲线裁剪（VideoX-Fun stock 不兼容）"
+            else:
+                detail = "ComfyUI 原生单文件布局（VideoX-Fun 不支持直接转换）"
+            return ("ComfyUI H3 safetensors：%s；键数=%d；量化层=%d；%s" %
+                    (path, info.get("keys", 0), info.get("quant_layers", 0), detail),)
+        return ("无法识别的 H3 模型路径：%s" % path,)
+
+
+class H3AutoDirectorVideoXFunControl:
+    """Run the official VideoX-Fun MiniMax-H3 Union ControlNet pipeline."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "control_video": ("IMAGE", {"tooltip": "连接姿态或深度预处理输出；官方管线一次接收一种控制类型。"}),
+            "prompt": ("STRING", {"multiline": True, "default": ""}),
+            "model_path": ("STRING", {"default": "", "multiline": False,
+                                         "tooltip": "VideoX-Fun 官方 Diffusers 模型目录。"}),
+            "controlnet_path": ("STRING", {"default": "", "multiline": False,
+                                             "tooltip": "MiniMax-H3-Fun-Controlnet-Union.safetensors 完整路径。"}),
+            "steps": ("INT", {"default": 40, "min": 1, "max": 100}),
+            "guidance_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.01}),
+            "control_context_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+            "seed": ("INT", {"default": 43, "min": 0, "max": 0xffffffffffffffff}),
+            "memory_mode": (["model_group_offload", "model_cpu_offload", "sequential_cpu_offload", "model_full_load"],
+                            {"default": "model_group_offload"}),
+            "device": (["cuda", "cpu"], {"default": "cuda"}),
+            "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
+        }, "optional": {
+            "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+            "config_path": ("STRING", {"default": "", "multiline": False}),
+            "components_path": ("STRING", {"default": "", "multiline": False,
+                                                 "tooltip": "可选的 Diffusers 组件目录，用于补充或覆盖模型目录中的组件；不用于转换 ComfyUI 单文件模型。"}),
+            "videox_fun_path": ("STRING", {"default": "", "multiline": False,
+                                               "tooltip": "VideoX-Fun 仓库根目录；目录内应包含 videox_fun/ 和 config/。"}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "AUDIO", "STRING")
+    RETURN_NAMES = ("ControlNet 视频", "ControlNet 音频", "执行状态")
+    FUNCTION = "run"
+    CATEGORY = "H3 自动导演/动作迁移/ControlNet"
+
+    def run(self, control_video, prompt, model_path, controlnet_path, steps=40,
+            guidance_scale=1.0, control_context_scale=1.0, seed=43,
+            memory_mode="model_group_offload", device="cuda", dtype="bf16",
+            negative_prompt="", config_path="", components_path="", videox_fun_path=""):
+        audit = _audit_control_frames(control_video, "VideoX-Fun 控制视频")
+        if float(guidance_scale) != 1.0:
+            LOG.warning("H3 Auto Director: Union 是 guidance-distilled，建议 guidance_scale=1.0，当前=%s", guidance_scale)
+        pipeline = _load_videox_fun_control_pipeline(
+            model_path, controlnet_path, config_path, memory_mode, device, dtype, videox_fun_path, components_path)
+        run_device = torch.device("cuda", torch.cuda.current_device()) if str(device).lower() == "cuda" else torch.device("cpu")
+        control = control_video.detach().float().clamp(0, 1).permute(3, 0, 1, 2).unsqueeze(0).contiguous()
+        generator = torch.Generator(device=run_device).manual_seed(int(seed))
+        output = pipeline(prompt=str(prompt or ""), negative_prompt=str(negative_prompt or ""),
+                          control_video=control.to(run_device),
+                          control_context_scale=float(control_context_scale),
+                          height=int(audit["height"]), width=int(audit["width"]),
+                          num_frames=int(audit["frames"]), num_inference_steps=int(steps),
+                          guidance_scale=float(guidance_scale), generator=generator,
+                          output_type="pt")
+        images, waveform = _normalize_videox_output(output)
+        sample_rate = int(getattr(output, "sampling_rate", 44100) or 44100)
+        status = ("VideoX-Fun Union 已实际执行：control_blocks=%s，%d 帧，%dx%d，steps=%d，"
+                  "control_context_scale=%.3f，设备=%s" %
+                  (getattr(pipeline, "_h3_auto_director_control_blocks", "未知"), audit["frames"],
+                   audit["width"], audit["height"], int(steps), float(control_context_scale), run_device))
+        LOG.info("H3 Auto Director: %s", status)
+        return (images, {"waveform": waveform, "sample_rate": sample_rate}, status)
 
 
 def _h3_model_options(weight_dtype):
@@ -4061,14 +4790,113 @@ def _reference_name(value):
     return name
 
 
+def _resolve_reference_file(value, media_label="参考素材"):
+    """Resolve exactly the path stored in the plan under ComfyUI/input.
+
+    Do not infer alternate names (including ``_1``/``_2`` upload suffixes):
+    silently substituting a different file can produce an apparently valid but
+    incorrect generation. The editor must save the newly uploaded path.
+    """
+    clean = _reference_name(value)
+    root = _input_root().resolve()
+    requested = (root / clean).resolve()
+    if not requested.is_file():
+        raise FileNotFoundError(
+            "%s文件不存在：请求=%s；检查=%s。不会自动尝试 _1/_2 或其他文件名，"
+            "请在项目编辑器中重新上传并点击保存。" % (media_label, clean, requested)
+        )
+    selected = requested
+    try:
+        relative = selected.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError("%s必须位于 ComfyUI/input 内：%s" % (media_label, selected)) from exc
+    return selected
+
+
+def _probe_reference_video(path):
+    """Read duration/fps and the 24-fps frame count from a resolved video."""
+    if av is None:
+        # Some portable ComfyUI installations launch with a different Python
+        # interpreter than the one used to install dependencies. Keep plan
+        # creation usable through the bundled ffprobe in that case.
+        ffprobe = _find_ffprobe()
+        if ffprobe:
+            try:
+                probe = subprocess.run([
+                    ffprobe, "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=avg_frame_rate,nb_frames,duration:format=duration",
+                    "-of", "json", str(path),
+                ], capture_output=True, text=True, timeout=30)
+                data = json.loads(probe.stdout or "{}")
+                stream = (data.get("streams") or [{}])[0]
+                rate = str(stream.get("avg_frame_rate") or "24/1")
+                if "/" in rate:
+                    numerator, denominator = rate.split("/", 1)
+                    fps = float(numerator) / max(float(denominator), 1.0)
+                else:
+                    fps = float(rate)
+                duration = float(stream.get("duration") or (data.get("format") or {}).get("duration") or 0.0)
+                raw_frames = int(float(stream.get("nb_frames"))) if str(stream.get("nb_frames", "")).strip().isdigit() else 0
+                if raw_frames <= 0 and duration > 0:
+                    raw_frames = int(round(duration * fps))
+                if raw_frames > 0 and fps > 0:
+                    return {"duration": max(0.0, duration), "fps": fps,
+                            "frame_count_24": max(1, int(round(raw_frames * FPS / fps)))}
+            except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.SubprocessError):
+                pass
+        raise RuntimeError("读取参考视频需要 PyAV 或 ffprobe；请在 ComfyUI 使用的 Python 中安装 av：%s" % path)
+    container = None
+    try:
+        container = av.open(str(path), "r")
+        stream = next((item for item in container.streams if item.type == "video"), None)
+        if stream is None:
+            raise ValueError("文件中没有视频流")
+        rate = stream.average_rate or stream.base_rate
+        fps = float(rate) if rate is not None and float(rate) > 0 else float(FPS)
+        duration = None
+        if stream.duration is not None and stream.time_base is not None:
+            duration = float(stream.duration * stream.time_base)
+        if not duration and container.duration:
+            duration = float(container.duration) / float(av.time_base)
+        duration = max(0.0, float(duration or 0.0))
+        # Container metadata is preferred; decode only when unavailable.
+        raw_frames = int(stream.frames or 0)
+        if raw_frames <= 0 and duration > 0:
+            raw_frames = int(round(duration * fps))
+        if raw_frames <= 0:
+            raw_frames = sum(1 for _ in container.decode(stream))
+        frame_count_24 = max(1, int(round(raw_frames * float(FPS) / fps)))
+        if duration <= 0 and raw_frames > 0:
+            duration = raw_frames / fps
+        return {"duration": duration, "fps": fps, "frame_count_24": frame_count_24}
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("参考视频元数据读取失败：%s：%s" % (path, exc)) from exc
+    finally:
+        if container is not None:
+            try:
+                container.close()
+            except Exception:
+                pass
+
+
 def _load_reference_image(name):
-    image, _ = nodes.LoadImage().load_image(_reference_name(name))
+    """Load an image using the exact path persisted by the project editor."""
+    selected = _resolve_reference_file(name, "参考图片")
+    input_root = _input_root().resolve()
+    relative = selected.relative_to(input_root).as_posix()
+    clean = _reference_name(name)
+    try:
+        image, _ = nodes.LoadImage().load_image(relative)
+    except Exception as exc:
+        raise RuntimeError("参考图片读取失败：路径=%s（原请求=%s），请检查文件是否损坏或格式是否受支持：%s"
+                           % (relative, clean, exc)) from exc
     return image
 
 
 def _load_reference_video(name):
-    clean = _reference_name(name)
-    video_path = (_input_root() / clean).resolve()
+    video_path = _resolve_reference_file(name, "参考视频")
     loader = nodes.NODE_CLASS_MAPPINGS.get("VHS_LoadVideoPath")
     if loader is None:
         loader = nodes.NODE_CLASS_MAPPINGS.get("VHS_LoadVideo")
@@ -4136,7 +4964,7 @@ def _reference_video_has_audio(path):
 
 def _load_transfer_video_segment(ref):
     """Load one 24 fps reference-video window and pad its tail to H3's grid."""
-    clean = _reference_name(ref.get("path") or ref.get("name"))
+    video_path = _resolve_reference_file(ref.get("path") or ref.get("name"), "动作迁移参考视频")
     loader = nodes.NODE_CLASS_MAPPINGS.get("VHS_LoadVideoPath")
     if loader is None:
         loader = nodes.NODE_CLASS_MAPPINGS.get("VHS_LoadVideo")
@@ -4146,7 +4974,7 @@ def _load_transfer_video_segment(ref):
     source_frames = max(5, int(ref.get("source_frames", ref.get("reference_frames", 5))))
     reference_frames = max(source_frames, int(ref.get("reference_frames", source_frames)))
     result = loader().load_video(
-        video=str((_input_root() / clean).resolve()), force_rate=24,
+        video=str(video_path), force_rate=24,
         custom_width=0, custom_height=0, frame_load_cap=source_frames,
         skip_first_frames=start_frame, select_every_nth=1)
     frames = result[0]
@@ -4166,10 +4994,9 @@ def _load_transfer_video_audio(ref):
     if loader is None:
         LOG.warning("VideoHelperSuite audio loader unavailable; reference-video audio is skipped")
         return None
-    clean = _reference_name(ref.get("path") or ref.get("name"))
+    video_path = _resolve_reference_file(ref.get("path") or ref.get("name"), "动作迁移参考视频")
     start_seconds = max(0.0, float(ref.get("start_frame", 0)) / FPS)
     duration_seconds = max(0.1, float(ref.get("source_frames", 5)) / FPS)
-    video_path = (_input_root() / clean).resolve()
     if _reference_video_has_audio(video_path) is False:
         return None
     try:
@@ -6544,6 +7371,8 @@ NODE_CLASS_MAPPINGS = {
     "H3AutoDirectorControlConfig": H3AutoDirectorControlConfig,
     "H3AutoDirectorControlExport": H3AutoDirectorControlExport,
     "H3AutoDirectorControlBackendCheck": H3AutoDirectorControlBackendCheck,
+    "H3AutoDirectorVideoXFunControl": H3AutoDirectorVideoXFunControl,
+    "H3AutoDirectorModelFormat": H3AutoDirectorModelFormat,
     "H3AutoDirectorHybridModelLoader": H3AutoDirectorHybridModelLoader,
     "H3AutoDirectorTransferModelLoader": H3AutoDirectorTransferModelLoader,
     "H3AutoDirectorDualStageModelLoader": H3AutoDirectorDualStageModelLoader,
@@ -6575,6 +7404,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3AutoDirectorControlConfig": "H3 动作迁移｜Union 控制配置",
     "H3AutoDirectorControlExport": "H3 动作迁移｜导出 Union 控制视频",
     "H3AutoDirectorControlBackendCheck": "H3 动作迁移｜Union 后端检查",
+    "H3AutoDirectorVideoXFunControl": "H3 动作迁移｜VideoX-Fun Union 专用采样",
+    "H3AutoDirectorModelFormat": "H3 模型格式检查",
     "H3AutoDirectorHybridModelLoader": "H3 自动导演｜多模态参考模型加载",
     "H3AutoDirectorTransferModelLoader": "H3 自动导演｜动作迁移模型加载",
     "H3AutoDirectorDualStageModelLoader": "H3 自动导演｜一采/二采模型加载",
