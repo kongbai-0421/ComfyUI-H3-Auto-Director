@@ -6997,13 +6997,21 @@ class H3AutoDirectorSaveSegment:
                 st_save({"video": stage1_parts[0].detach().cpu().contiguous(),
                          "audio": stage1_audio.detach().cpu().contiguous()},
                         str(stage1_cache), metadata={"format": "h3_auto_director_av_stage1_v1", "segment_index": str(int(segment_index))})
-                if stage1_images is not None and torch.is_tensor(stage1_images) and stage1_images.numel():
+                # Unified-decode mode must not materialize *any* per-segment
+                # video, including the optional first-pass preview cache.
+                # Older graphs keep ``stage1_images`` connected, so checking
+                # only the main ``deferred_decode`` branch above was not
+                # sufficient and still wrote context_stage1/*.mp4 midway.
+                if (not deferred_decode and stage1_images is not None
+                        and torch.is_tensor(stage1_images) and stage1_images.numel()):
                     stage1_images, _ = _trim_context_prefix(stage1_images, None, requested_trim, FPS)
                     stage1_video, _ = _paths(plan, int(segment_index), output_root, video_format,
                                              for_write=True, for_context=True, context_stage=1)
                     stage1_video.parent.mkdir(parents=True, exist_ok=True)
                     _write_segment_video(stage1_video, stage1_images, audio, fps,
                                          video_format, video_codec, encoder_device, quality)
+                elif deferred_decode and stage1_images is not None:
+                    LOG.info("H3 Auto Director: 统一解码模式跳过第 %d 段一采预览视频写入", int(segment_index))
                 LOG.info("H3 Auto Director: 已保存第 %d 段一采上下文 latent 与二采上下文 latent", int(segment_index))
         state_path = _state_path(plan)
         state = _load_json(state_path, {"version": 3, "segments": {}})
