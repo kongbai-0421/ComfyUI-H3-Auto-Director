@@ -20,6 +20,9 @@
 
 ## 安装与依赖
 
+> **重要提示**：**必须使用最新版本的 ComfyUI（建议更新至最新 master 分支或 >= v0.34.0）**。
+> 插件的自动导演工作流已升级集成 ComfyUI 官方原生最新的 `Block Sparse Attention`（块稀疏注意力）与 `ModelAttentionBackend` 节点。旧版 ComfyUI 因缺少这些官方新特性会导致节点缺失或无法运行。
+
 将目录放入：
 
 ```text
@@ -32,7 +35,10 @@ ComfyUI/custom_nodes/ComfyUI-H3-Auto-Director
 
 ## 工作流
 
-仓库中的 `example_workflows/` 保存示例 JSON。本地工作流可以单独维护，不会在插件加载时自动覆盖。动作迁移和 TTS 工作流均为实验性工作流，不保证效果、长序列稳定性或所有版本兼容性。
+仓库中的 `example_workflows/` 保存示例 JSON：
+
+- `MiniMax H3 Auto Director.json`：标准多片段自动导演工作流。**已全面接入 ComfyUI 官方最新的 `Block Sparse Attention` 稀疏注意力加速方案**（替代旧版第三方 LowVRAM 补丁），在保留原画质的同时实现更低的显存峰值与更快的生成速度。请务必搭配最新版 ComfyUI 使用。
+- 本地工作流可以单独维护，不会在插件加载时自动覆盖。动作迁移和 TTS 工作流均为实验性工作流，不保证效果、长序列稳定性或所有版本兼容性。
 
 基础动作迁移链路：
 
