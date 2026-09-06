@@ -141,9 +141,11 @@ function writePickerOptions(options) {
 
 function normalizeSegment(value) {
   const seg = value && typeof value === "object" ? value : {};
+  const durationMode = ["frame", "frames", "帧", "frame_count"].includes(String(seg.duration_mode || "").toLowerCase()) ? "frames" : "seconds";
   const normalized = {
     prompt: String(seg.prompt || ""),
-    duration: Number(seg.duration) || 5,
+    duration: durationMode === "frames" ? 5 / 24 : (Number(seg.duration) || 5),
+    duration_mode: durationMode,
     audio_filename: String(seg.audio_filename || ""),
     audio_restart: !!seg.audio_restart,
     continue_audio: seg.continue_audio !== false,
@@ -160,10 +162,29 @@ function normalizeSegment(value) {
       return normalized;
     }) : [],
   };
+  if (durationMode === "frames") normalized.frame_count = Math.max(5, Math.floor(Number(seg.frame_count) || 5));
   if (Object.prototype.hasOwnProperty.call(seg, "use_previous_video_reference")) {
     normalized.use_previous_video_reference = !!seg.use_previous_video_reference;
   }
   return normalized;
+}
+
+function segmentLengthValid(seg) {
+  if (seg?.duration_mode === "frames") return Number(seg.frame_count) >= 5;
+  return Number(seg?.duration) >= 1 && Number(seg?.duration) <= 15;
+}
+
+function setSegmentLengthMode(seg, mode) {
+  if (mode === "frames") {
+    seg.duration_mode = "frames";
+    seg.frame_count = 5;
+    seg.duration = 5 / 24;
+  } else {
+    seg.duration_mode = "seconds";
+    delete seg.frame_count;
+    // Restore a practical seconds value when leaving the fixed 5-frame mode.
+    if (!(Number(seg.duration) >= 1)) seg.duration = 5;
+  }
 }
 
 function normalizeSegments(value) {
@@ -423,6 +444,7 @@ function applyChineseLabels(node) {
     project: "项目计划", plan: "项目计划", project_id: "总文件夹名称", segments_json: "片段配置", duration: "默认片段时长",
     global_reference_set: "统一参考集", auto_run: "自动连续生成", continuation_mode: "接续模式", auto_context_crop_frames: "自动裁剪上下文帧数",
     decode_after_all_segments: "所有片段完成后统一解码（逐段处理）",
+    enable_audio_drive: "启用音频驱动", audio_drive_file: "音频驱动文件",
     cache_prompt_embeddings: "一次性缓存提示词向量", cache_prompt_embeddings_to_disk: "缓存提示词向量到硬盘", global_assets_json: "统一参考素材",
     segment_index: nodeClass === SEGMENT_NODE || nodeClass === CONTEXT_NODE || nodeClass === RESUME_NODE ? "上下文片段序号" : "片段序号",
     context_length: "上下文长度", prompt: "提示词", references_json: "参考素材 JSON",
@@ -800,11 +822,11 @@ function openTTSPlanEditor(node) {
     }
   });
   const shade = document.createElement("div"); shade.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:10000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif";
-  const panel = document.createElement("div"); panel.style.cssText = "width:min(1120px,95vw);height:min(860px,92vh);max-height:92vh;box-sizing:border-box;resize:both;overflow:hidden;background:#20252b;color:#eee;border:1px solid #59636e;border-radius:8px;padding:18px;display:flex;flex-direction:column";
+  const panel = document.createElement("div"); panel.style.cssText = "width:min(1120px,95vw);height:min(860px,92vh);min-width:min(760px,calc(100vw - 24px));min-height:min(520px,calc(100vh - 24px));max-height:92vh;box-sizing:border-box;resize:both;overflow:hidden;background:#20252b;color:#eee;border:1px solid #59636e;border-radius:8px;padding:18px;display:flex;flex-direction:column";
   const title = document.createElement("h2"); title.textContent = "H3 自动导演｜TTS 片段计划"; title.style.margin = "0 0 12px"; panel.appendChild(title);
   const notice = document.createElement("div"); notice.style.cssText = "color:#aeb7c1;font-size:12px;min-height:22px"; panel.appendChild(notice);
   const settings = document.createElement("div"); settings.style.cssText = "display:flex;flex-wrap:wrap;gap:12px;padding:10px;background:#15191d;border:1px solid #424b55;border-radius:6px;margin-bottom:12px"; panel.appendChild(settings);
-  const checkbox = (label, name, fallback) => { const wrap = document.createElement("label"); wrap.style.cssText = "display:flex;align-items:center;gap:6px"; const input = document.createElement("input"); input.type = "checkbox"; input.checked = !!get(name, fallback); wrap.append(input, label); settings.appendChild(wrap); return input; };
+  const checkbox = (label, name, fallback) => { const wrap = document.createElement("label"); wrap.style.cssText = "display:flex;align-items:flex-start;gap:6px;flex:1 1 240px;min-width:180px;line-height:1.4;white-space:normal;overflow-wrap:anywhere"; const input = document.createElement("input"); input.type = "checkbox"; input.checked = !!get(name, fallback); input.style.cssText = "flex:0 0 auto;margin-top:2px"; const text = document.createElement("span"); text.textContent = label; wrap.append(input, text); settings.appendChild(wrap); return input; };
   const unified = checkbox("统一参考集（所有片段使用第 1 段素材）", "global_reference_set", false);
   const concat = checkbox("拼接最终长音频", "concat_final_audio", true);
   const continuation = checkbox("开启音频上下文接续", "enable_audio_continuation", true);
@@ -831,10 +853,11 @@ function openTTSPlanEditor(node) {
       const box = document.createElement("div"); box.style.cssText = "padding:10px;background:#15191d;border:1px solid #424b55;border-radius:6px";
       const head = document.createElement("div"); head.textContent = `片段 ${index + 1}`; head.style.fontWeight = "600"; box.appendChild(head);
       const prompt = document.createElement("textarea"); prompt.value = String(seg.prompt || ""); prompt.placeholder = "H3 TTS 完整提示词"; prompt.style.cssText = "width:100%;min-height:70px;box-sizing:border-box;margin-top:7px;background:#20252b;color:#eee;border:1px solid #59636e;padding:7px"; prompt.oninput = () => { seg.prompt = prompt.value; }; box.appendChild(prompt);
-      const controls = document.createElement("div"); controls.style.cssText = "display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:7px";
-      const duration = document.createElement("input"); duration.type = "number"; duration.min = "4"; duration.max = "15"; duration.step = "0.1"; duration.value = Number(seg.duration) || 5; duration.style.width = "80px"; duration.oninput = () => { seg.duration = Number(duration.value) || 5; };
-      const filename = document.createElement("input"); filename.type = "text"; filename.value = String(seg.audio_filename || ""); filename.placeholder = `H3_${String(index + 1).padStart(5, "0")}.wav`; filename.style.cssText = "width:250px;background:#20252b;color:#eee;border:1px solid #59636e;padding:5px"; filename.oninput = () => { seg.audio_filename = filename.value; };
-      controls.append("秒数", duration, "音频文件名", filename); if (segments.length > 1) controls.appendChild(makeButton("删除片段", () => { segments.splice(index, 1); render(); })); box.appendChild(controls);
+      const controls = document.createElement("div"); controls.style.cssText = "display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:7px;min-width:0";
+      const mode = document.createElement("select"); mode.innerHTML = "<option value=\"seconds\">秒数</option><option value=\"frames\">5 帧</option>"; mode.value = seg.duration_mode || "seconds"; mode.onchange = () => { setSegmentLengthMode(seg, mode.value); render(); };
+      const duration = document.createElement("input"); duration.type = "number"; duration.min = "1"; duration.max = "15"; duration.step = "0.1"; duration.value = Number(seg.duration) >= 1 ? Number(seg.duration) : 5; duration.style.width = "80px"; duration.disabled = mode.value === "frames"; duration.oninput = () => { seg.duration = Math.max(1, Number(duration.value) || 5); };
+      const filename = document.createElement("input"); filename.type = "text"; filename.value = String(seg.audio_filename || ""); filename.placeholder = `H3_${String(index + 1).padStart(5, "0")}.wav`; filename.style.cssText = "width:250px;max-width:100%;box-sizing:border-box;background:#20252b;color:#eee;border:1px solid #59636e;padding:5px"; filename.oninput = () => { seg.audio_filename = filename.value; };
+      controls.append(mode, duration, "音频文件名", filename); if (segments.length > 1) controls.appendChild(makeButton("删除片段", () => { segments.splice(index, 1); render(); })); box.appendChild(controls);
       const details = document.createElement("details"); details.open = seg._media_references_open === true; details.ontoggle = () => { seg._media_references_open = details.open; }; details.style.cssText = "margin-top:9px;padding:8px;background:#20252b;border:1px solid #59636e;border-radius:5px"; const summary = document.createElement("summary"); summary.textContent = `图片/视频参考（${seg.references.filter((r) => r.type === "image" || r.type === "video").length}）`; summary.style.cursor = "pointer"; details.appendChild(summary);
       const mediaList = document.createElement("div"); mediaList.style.cssText = "display:flex;flex-direction:column;gap:6px;margin-top:8px";
       const audioDetails = document.createElement("details"); audioDetails.open = seg._audio_references_open !== false; audioDetails.ontoggle = () => { seg._audio_references_open = audioDetails.open; }; audioDetails.style.cssText = "margin-top:8px;padding:8px;background:#20252b;border:1px solid #59636e;border-radius:5px"; const audioSummary = document.createElement("summary"); audioSummary.textContent = `音频参考（${seg.references.filter((r) => r.type === "audio").length}）`; audioSummary.style.cursor = "pointer"; audioDetails.appendChild(audioSummary); const audioList = document.createElement("div"); audioList.style.cssText = "display:flex;flex-direction:column;gap:6px;margin-top:8px"; audioDetails.appendChild(audioList);
@@ -854,8 +877,8 @@ function openTTSPlanEditor(node) {
               renderRefs();
             }).catch(() => { ref.has_audio = null; renderRefs(); });
           }
-          const row = document.createElement("div"); row.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px;background:#15191d;border:1px solid #424b55;border-radius:4px";
-          row.append(refLabel(ref, type, refs)); if (type === "video") { const toggle = document.createElement("label"); toggle.style.cssText = "margin-left:auto;display:flex;align-items:center;gap:4px;font-size:12px;white-space:nowrap"; const input = document.createElement("input"); input.type = "checkbox"; input.checked = ref.video_audio_enabled !== false; input.disabled = !editable; input.title = "关闭后只传递视频画面"; input.onchange = () => { ref.video_audio_enabled = input.checked; renderRefs(); }; toggle.append(input, ref.has_audio === false ? "传递视频音频（未检测到音轨）" : "传递视频音频"); row.appendChild(toggle); }
+          const row = document.createElement("div"); row.style.cssText = "display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;min-width:0;padding:6px;background:#15191d;border:1px solid #424b55;border-radius:4px";
+          const refText = document.createElement("span"); refText.textContent = refLabel(ref, type, refs); refText.style.cssText = "flex:1 1 180px;min-width:0;overflow-wrap:anywhere;line-height:1.4"; row.appendChild(refText); if (type === "video") { const toggle = document.createElement("label"); toggle.style.cssText = "display:flex;align-items:flex-start;gap:4px;flex:1 1 220px;min-width:180px;font-size:12px;line-height:1.4;white-space:normal;overflow-wrap:anywhere"; const input = document.createElement("input"); input.type = "checkbox"; input.checked = ref.video_audio_enabled !== false; input.disabled = !editable; input.title = "关闭后只传递视频画面"; input.style.cssText = "flex:0 0 auto;margin-top:2px"; input.onchange = () => { ref.video_audio_enabled = input.checked; renderRefs(); }; const toggleText = document.createElement("span"); toggleText.textContent = ref.has_audio === false ? "传递视频音频（未检测到音轨）" : "传递视频音频"; toggle.append(input, toggleText); row.appendChild(toggle); }
           if (editable) row.appendChild(makeButton("删除", () => { seg.references.splice(seg.references.indexOf(ref), 1); renderRefs(); }));
           (type === "audio" ? audioList : mediaList).appendChild(row);
         });
@@ -868,8 +891,8 @@ function openTTSPlanEditor(node) {
   };
   const editableOrNotice = (flag, index, fn, message) => { if (flag.checked && index > 0) { message.textContent = "统一参考集已开启，请编辑第 1 段或关闭统一参考集。"; return; } Promise.resolve(fn()).catch((error) => { message.textContent = error.message || String(error); }); };
   unified.onchange = render;
-  const actions = document.createElement("div"); actions.style.cssText = "flex:0 0 auto;display:flex;justify-content:flex-end;gap:8px;margin:14px -18px -18px;padding:12px 18px;background:rgba(32,37,43,.98);border-top:1px solid #59636e";
-  actions.append(makeButton("+ 添加片段", () => { segments.push({ prompt: "", duration: 5, audio_filename: "", audio_restart: false, continue_audio: continuation.checked, references: [], _media_references_open: false, _audio_references_open: true }); render(); }), makeButton("将第 1 段参考素材应用到全部", () => { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); unified.checked = true; render(); }), makeButton("取消", () => shade.remove()), makeButton("保存", () => { const names = new Set(); for (const seg of segments) { if (Number(seg.duration) < 4 || Number(seg.duration) > 15) { notice.textContent = "每段时长必须在 4 到 15 秒之间。"; return; } const name = String(seg.audio_filename || "").trim(); if (name && !name.toLowerCase().endsWith(".wav")) { notice.textContent = "音频文件名必须使用 .wav 扩展名。"; return; } if (name && names.has(name.toLowerCase())) { notice.textContent = `音频文件名重复：${name}`; return; } if (name) names.add(name.toLowerCase()); } if (unified.checked) { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); } const savedSegments = segments.map((seg) => { const copy = { ...seg }; delete copy._media_references_open; delete copy._audio_references_open; return copy; }); set("segments_json", JSON.stringify(savedSegments, null, 2)); set("global_reference_set", unified.checked); set("cache_prompt_embeddings", cache.checked); set("cache_prompt_embeddings_to_disk", diskCache.checked); set("enable_audio_continuation", continuation.checked); set("concat_final_audio", concat.checked); node.setDirtyCanvas(true, true); shade.remove(); }));
+  const actions = document.createElement("div"); actions.style.cssText = "flex:0 0 auto;display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;min-width:0;margin:14px -18px -18px;padding:12px 18px;background:rgba(32,37,43,.98);border-top:1px solid #59636e";
+  actions.append(makeButton("+ 添加片段", () => { segments.push({ prompt: "", duration: 5, duration_mode: "seconds", audio_filename: "", audio_restart: false, continue_audio: continuation.checked, references: [], _media_references_open: false, _audio_references_open: true }); render(); }), makeButton("将第 1 段参考素材应用到全部", () => { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); unified.checked = true; render(); }), makeButton("取消", () => shade.remove()), makeButton("保存", () => { const names = new Set(); for (const seg of segments) { if (!segmentLengthValid(seg)) { notice.textContent = "每段时长最低 1 秒，或选择有效的 5 帧模式。"; return; } const name = String(seg.audio_filename || "").trim(); if (name && !name.toLowerCase().endsWith(".wav")) { notice.textContent = "音频文件名必须使用 .wav 扩展名。"; return; } if (name && names.has(name.toLowerCase())) { notice.textContent = `音频文件名重复：${name}`; return; } if (name) names.add(name.toLowerCase()); } if (unified.checked) { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); } const savedSegments = segments.map((seg) => { const copy = { ...seg }; delete copy._media_references_open; delete copy._audio_references_open; return copy; }); set("segments_json", JSON.stringify(savedSegments, null, 2)); set("global_reference_set", unified.checked); set("cache_prompt_embeddings", cache.checked); set("cache_prompt_embeddings_to_disk", diskCache.checked); set("enable_audio_continuation", continuation.checked); set("concat_final_audio", concat.checked); node.setDirtyCanvas(true, true); shade.remove(); }));
   panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade); render();
 }
 
@@ -897,19 +920,20 @@ function openTransferEditor(node) {
   const shade = document.createElement("div");
   shade.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:10000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif";
   const panel = document.createElement("div");
-  panel.style.cssText = "width:min(920px,94vw);height:min(760px,90vh);resize:both;overflow:auto;background:#20252b;color:#eee;border:1px solid #59636e;border-radius:8px;padding:18px;box-shadow:0 16px 60px #000";
+  panel.style.cssText = "width:min(920px,94vw);height:min(760px,90vh);min-width:min(680px,calc(100vw - 24px));min-height:min(480px,calc(100vh - 24px));resize:both;overflow:auto;background:#20252b;color:#eee;border:1px solid #59636e;border-radius:8px;padding:18px;box-shadow:0 16px 60px #000;box-sizing:border-box";
   const title = document.createElement("h2"); title.textContent = "H3 自动导演｜动作迁移项目计划"; title.style.margin = "0 0 12px"; panel.appendChild(title);
   const notice = document.createElement("div"); notice.style.cssText = "color:#aeb7c1;font-size:12px;min-height:22px;margin:6px 0"; panel.appendChild(notice);
   const summary = document.createElement("div"); summary.style.cssText = "padding:10px;background:#15191d;border:1px solid #424b55;border-radius:6px;margin-bottom:12px;line-height:1.6"; panel.appendChild(summary);
   const refreshSummary = () => {
-    const seconds = Number(get("segment_seconds", 5)) || 5;
+    const seconds = lengthMode.value === "frames" ? 5 / 24 : (Number(get("segment_seconds", 5)) || 5);
     const duration = Number(video.duration || 0);
     const count = duration > 0 ? Math.ceil(duration / seconds) : 0;
     summary.textContent = video.path ? `参考视频：${video.originalName || video.name || video.path}｜时长：${formatDuration(duration)}｜按 ${seconds.toFixed(2)} 秒/段：${count || "等待读取"} 段` : "尚未上传参考视频";
   };
-  const row = (label, control) => { const wrap = document.createElement("label"); wrap.style.cssText = "display:flex;align-items:center;gap:8px;margin:8px 0"; wrap.append(label, control); panel.appendChild(wrap); return control; };
+  const row = (label, control) => { const wrap = document.createElement("label"); wrap.style.cssText = "display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;min-width:0;margin:8px 0;line-height:1.4"; const text = document.createElement("span"); text.textContent = label; text.style.cssText = "flex:1 1 240px;min-width:150px;white-space:normal;overflow-wrap:anywhere"; control.style.maxWidth = "100%"; control.style.boxSizing = "border-box"; wrap.append(text, control); panel.appendChild(wrap); return control; };
   const prompt = document.createElement("textarea"); prompt.value = get("prompt", ""); prompt.style.cssText = "width:100%;min-height:100px;box-sizing:border-box;background:#15191d;color:#eee;border:1px solid #59636e;padding:8px"; prompt.placeholder = "所有片段复用的 H3 完整提示词"; panel.appendChild(prompt);
-  const seconds = document.createElement("input"); seconds.type = "number"; seconds.min = "4"; seconds.max = "15"; seconds.step = "0.1"; seconds.value = get("segment_seconds", 5); seconds.style.width = "110px"; seconds.oninput = refreshSummary; row("每段秒数", seconds);
+  const lengthMode = document.createElement("select"); lengthMode.innerHTML = "<option value=\"seconds\">秒数</option><option value=\"frames\">5 帧</option>"; lengthMode.value = get("segment_length_mode", "秒数") === "5帧" ? "frames" : "seconds";
+  const seconds = document.createElement("input"); seconds.type = "number"; seconds.min = "1"; seconds.max = "15"; seconds.step = "0.1"; seconds.value = get("segment_seconds", 5); seconds.style.width = "110px"; seconds.disabled = lengthMode.value === "frames"; seconds.oninput = refreshSummary; lengthMode.onchange = () => { seconds.disabled = lengthMode.value === "frames"; refreshSummary(); }; const lengthWrap = document.createElement("label"); lengthWrap.style.cssText = "display:flex;align-items:center;gap:8px;margin:8px 0"; lengthWrap.append("片段长度", lengthMode, seconds, "秒"); panel.appendChild(lengthWrap);
   const checkbox = (label, name, checked) => { const input = document.createElement("input"); input.type = "checkbox"; input.checked = !!get(name, checked); row(label, input); return input; };
   const useVideoMaterial = checkbox("将上传视频作为多模态参考素材", "use_reference_video_material", true);
   const passAudio = checkbox("传递参考视频音频", "pass_reference_video_audio", false);
@@ -921,7 +945,7 @@ function openTransferEditor(node) {
   const audioMode = document.createElement("select"); audioMode.innerHTML = "<option>H3 生成音频</option><option>参考视频音频</option>"; audioMode.value = get("final_audio_source", "H3 生成音频"); row("最终视频音频来源", audioMode);
   const restart = document.createElement("input"); restart.type = "text"; restart.value = get("audio_restart_segments", ""); restart.placeholder = "例如 3，6,9"; restart.style.width = "220px"; row("重新生成音频片段", restart);
   const previous = document.createElement("input"); previous.type = "text"; previous.value = get("previous_video_reference_segments", ""); previous.placeholder = "例如 2,5"; previous.style.width = "220px"; row("使用上段视频参考片段", previous);
-  const videoCard = document.createElement("div"); videoCard.style.cssText = "display:flex;gap:10px;align-items:center;padding:8px;background:#15191d;border:1px solid #424b55;border-radius:6px;margin:12px 0"; panel.appendChild(videoCard);
+  const videoCard = document.createElement("div"); videoCard.style.cssText = "display:flex;flex-wrap:wrap;gap:10px;align-items:center;min-width:0;padding:8px;background:#15191d;border:1px solid #424b55;border-radius:6px;margin:12px 0"; panel.appendChild(videoCard);
   const renderVideoCard = () => {
     videoCard.replaceChildren();
     if (!video.path) { videoCard.textContent = "尚未上传参考视频"; return; }
@@ -1014,12 +1038,121 @@ function openTransferEditor(node) {
     } catch (error) { notice.textContent = error.message || String(error); }
   };
   panel.appendChild(makeButton(video.path ? "重新上传参考视频" : "+ 上传参考视频", uploadVideo));
-  const actions = document.createElement("div"); actions.style.cssText = "display:flex;justify-content:flex-end;gap:8px;margin-top:16px";
+  const actions = document.createElement("div"); actions.style.cssText = "display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;min-width:0;margin-top:16px";
   actions.append(makeButton("取消", () => shade.remove()), makeButton("保存", () => {
     if (!video.path) { notice.textContent = "请先上传参考视频。"; return; }
-    set("prompt", prompt.value); set("segment_seconds", Number(seconds.value) || 5); set("use_reference_video_material", useVideoMaterial.checked); set("pass_reference_video_audio", passAudio.checked); set("enable_audio_continuation", audioCont.checked); set("cache_prompt_embeddings", cachePrompts.checked); set("cache_prompt_embeddings_to_disk", diskCachePrompts.checked); set("auto_run", autoRun.checked); set("skip_h3_audio_decode", skipDecode.checked); set("final_audio_source", audioMode.value); set("audio_restart_segments", restart.value); set("previous_video_reference_segments", previous.value); set("reference_video_json", JSON.stringify(video, null, 2)); set("reference_assets_json", JSON.stringify(assets, null, 2)); syncSerializedWidgets(node); node.setDirtyCanvas(true, true); node.graph?.setDirtyCanvas?.(true, true); shade.remove();
+    set("prompt", prompt.value); set("segment_seconds", Number(seconds.value) || 5); set("segment_length_mode", lengthMode.value === "frames" ? "5帧" : "秒数"); set("use_reference_video_material", useVideoMaterial.checked); set("pass_reference_video_audio", passAudio.checked); set("enable_audio_continuation", audioCont.checked); set("cache_prompt_embeddings", cachePrompts.checked); set("cache_prompt_embeddings_to_disk", diskCachePrompts.checked); set("auto_run", autoRun.checked); set("skip_h3_audio_decode", skipDecode.checked); set("final_audio_source", audioMode.value); set("audio_restart_segments", restart.value); set("previous_video_reference_segments", previous.value); set("reference_video_json", JSON.stringify(video, null, 2)); set("reference_assets_json", JSON.stringify(assets, null, 2)); syncSerializedWidgets(node); node.setDirtyCanvas(true, true); node.graph?.setDirtyCanvas?.(true, true); shade.remove();
   }));
   panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade); renderAssets(); renderVideoCard(); refreshSummary();
+}
+
+
+async function probeAudioDuration(path) {
+  if (!path) return 0;
+  try {
+    const res = await fetch("/h3_auto_director/audio_info", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && Number.isFinite(data.duration) && data.duration > 0) {
+        return Number(data.duration);
+      }
+    }
+  } catch (_) {}
+  return 0;
+}
+
+function getSegmentAudioAndEffectiveDuration(seg, index, cropFramesValue = 0) {
+  const dur = Number(seg?.duration) || 5;
+  if (index === 0) {
+    return { contextFrames: 0, contextSec: 0, effectiveDuration: dur, audioDuration: dur };
+  }
+  const continueVideo = seg?.continue_video !== false;
+  const prevVideoRef = !!seg?.use_previous_video_reference;
+  if (!continueVideo || prevVideoRef) {
+    return { contextFrames: 0, contextSec: 0, effectiveDuration: dur, audioDuration: dur };
+  }
+  const cropVal = Math.max(0, Math.floor(Number(cropFramesValue) || 0));
+  const ctxFrames = cropVal > 0 ? cropVal : 22;
+  const ctxSec = ctxFrames / 24.0;
+  const audioDuration = Math.max(0.1, dur - ctxSec);
+  return { contextFrames: ctxFrames, contextSec: ctxSec, effectiveDuration: audioDuration, audioDuration: audioDuration };
+}
+
+function adjustSegmentsToAudioDuration(segments, audioSec, cropFramesValue = 0) {
+  let remainingAudio = Math.max(1.0, audioSec);
+  const adjusted = [];
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (remainingAudio <= 0) break;
+    const info = getSegmentAudioAndEffectiveDuration(seg, i, cropFramesValue);
+    const ctxSec = info.contextSec;
+    const normalAudioDur = info.audioDuration;
+    if (i === segments.length - 1 || remainingAudio <= normalAudioDur) {
+      seg.duration = Math.round((remainingAudio + ctxSec) * 100) / 100;
+      setSegmentLengthMode(seg, "seconds");
+      adjusted.push(seg);
+      remainingAudio = 0;
+      break;
+    } else {
+      adjusted.push(seg);
+      remainingAudio -= normalAudioDur;
+    }
+  }
+  if (adjusted.length > 1 && adjusted[adjusted.length - 1].duration < 1.0) {
+    const last = adjusted[adjusted.length - 1];
+    const prev = adjusted[adjusted.length - 2];
+    const need = 1.0 - last.duration;
+    if (prev.duration - need >= 1.0) {
+      prev.duration = Math.round((prev.duration - need) * 100) / 100;
+      last.duration = 1.0;
+    }
+  }
+  segments.length = 0;
+  segments.push(...adjusted);
+}
+
+function showAudioShortageDialog({ audioDuration, totalVideoDuration, onModifyVideoDuration, onSaveDirectly }) {
+  const modalShade = document.createElement("div");
+  modalShade.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:10001;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif";
+  const box = document.createElement("div");
+  box.style.cssText = "width:min(520px,90vw);background:#20252b;color:#eee;border:1px solid #e3b341;border-radius:8px;padding:20px;box-shadow:0 16px 50px #000;display:flex;flex-direction:column;gap:14px;box-sizing:border-box";
+
+  const title = document.createElement("h3");
+  title.textContent = "⚠️ 音频驱动时长提示";
+  title.style.cssText = "margin:0;font-size:18px;color:#e3b341;display:flex;align-items:center;gap:8px";
+  box.appendChild(title);
+
+  const desc = document.createElement("div");
+  desc.style.cssText = "font-size:13px;line-height:1.6;color:#c9d1d9";
+  desc.innerHTML = `检测到上传的驱动音频时长（<b style="color:#58a6ff">${audioDuration.toFixed(2)} 秒</b>）短于视频计划总时长（<b style="color:#f85149">${totalVideoDuration.toFixed(2)} 秒</b>）。<br>差额：<b>${(totalVideoDuration - audioDuration).toFixed(2)} 秒</b>。<br><br>请选择处理方式：<br>• <b>修改视频时长</b>：自动缩短或调整视频片段时长以完全匹配音频时长。<br>• <b>直接保存</b>：视频总时长不变，音频不足的末端片段将直接原样音频潜空间强制替换（静音填充）。`;
+  box.appendChild(desc);
+
+  const btnRow = document.createElement("div");
+  btnRow.style.cssText = "display:flex;flex-wrap:wrap;justify-content:flex-end;gap:10px;margin-top:8px";
+
+  const cancelBtn = makeButton("取消", () => modalShade.remove());
+  cancelBtn.style.cssText = "padding:6px 14px;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;cursor:pointer";
+
+  const modifyBtn = makeButton("修改视频时长", () => {
+    modalShade.remove();
+    onModifyVideoDuration();
+  });
+  modifyBtn.style.cssText = "padding:6px 14px;background:#1f6feb;color:#fff;border:1px solid #388bfd;border-radius:6px;cursor:pointer;font-weight:600";
+
+  const saveDirectlyBtn = makeButton("直接保存", () => {
+    modalShade.remove();
+    onSaveDirectly();
+  });
+  saveDirectlyBtn.style.cssText = "padding:6px 14px;background:#238636;color:#fff;border:1px solid #2ea043;border-radius:6px;cursor:pointer;font-weight:600";
+
+  btnRow.append(cancelBtn, modifyBtn, saveDirectlyBtn);
+  box.appendChild(btnRow);
+  modalShade.appendChild(box);
+  document.body.appendChild(modalShade);
 }
 
 function openEditor(node) {
@@ -1032,20 +1165,20 @@ function openEditor(node) {
   const shade = document.createElement("div");
   shade.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:10000;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif";
   const panel = document.createElement("div");
-  panel.style.cssText = "width:min(1240px,96vw);height:min(88vh,900px);min-width:760px;min-height:520px;resize:both;overflow:auto;background:#20252b;color:#eee;border:1px solid #59636e;border-radius:8px;padding:20px;box-shadow:0 16px 60px #000;display:flex;flex-direction:column";
+  panel.style.cssText = "width:min(1240px,96vw);height:min(88vh,900px);min-width:min(760px,calc(100vw - 24px));min-height:min(520px,calc(100vh - 24px));resize:both;overflow:auto;background:#20252b;color:#eee;border:1px solid #59636e;border-radius:8px;padding:20px;box-shadow:0 16px 60px #000;display:flex;flex-direction:column;box-sizing:border-box";
   const title = document.createElement("h2");
   title.textContent = "H3 自动导演｜片段列表";
   title.style.cssText = "margin:0 0 12px;font-size:22px";
   panel.appendChild(title);
 
   const dirPanel = document.createElement("div");
-  dirPanel.style.cssText = "display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;padding:10px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px";
+  dirPanel.style.cssText = "display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;padding:10px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px";
   const dirTitle = document.createElement("div");
   dirTitle.textContent = "默认打开路径只影响文件选择器，导入后的素材固定保存到 h3_refs/*。Python 模式在 ComfyUI 所在机器打开系统对话框。";
   dirTitle.style.cssText = "grid-column:1/-1;font-size:12px;color:#aeb7c1";
   dirPanel.appendChild(dirTitle);
   const pickerControls = document.createElement("div");
-  pickerControls.style.cssText = "grid-column:1/-1;display:flex;align-items:center;gap:14px;font-size:12px";
+  pickerControls.style.cssText = "grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:14px;font-size:12px;min-width:0";
   const defaultLabel = document.createElement("label"); defaultLabel.style.cssText = "display:flex;align-items:center;gap:6px";
   const defaultToggle = document.createElement("input"); defaultToggle.type = "checkbox"; defaultToggle.checked = pickerOptions.useDefaultPath;
   defaultToggle.onchange = () => { pickerOptions.useDefaultPath = defaultToggle.checked; writePickerOptions(pickerOptions); };
@@ -1092,14 +1225,14 @@ function openEditor(node) {
   const directSummary = document.createElement("summary"); directSummary.textContent = "直接输入片段配置 JSON"; directSummary.style.cursor = "pointer"; directPanel.appendChild(directSummary);
   const directHelp = document.createElement("div"); directHelp.textContent = "可直接粘贴片段数组并点击应用；应用前会检查时长和素材数量。"; directHelp.style.cssText = "font-size:11px;color:#aeb7c1;margin:7px 0"; directPanel.appendChild(directHelp);
   const directInput = document.createElement("textarea"); directInput.rows = 6; directInput.value = JSON.stringify(segments, null, 2); directInput.style.cssText = "width:100%;box-sizing:border-box;resize:vertical;background:#0d1013;color:#eee;border:1px solid #59636e;padding:6px;font-family:monospace;font-size:12px"; directPanel.appendChild(directInput);
-  const directActions = document.createElement("div"); directActions.style.cssText = "display:flex;gap:6px;margin-top:7px";
+  const directActions = document.createElement("div"); directActions.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;margin-top:7px";
   directActions.appendChild(makeButton("应用 JSON", () => {
     try {
       const parsed = JSON.parse(directInput.value);
       const next = normalizeSegments(parsed);
       if (!next.length) throw new Error("片段配置必须是非空数组");
       if (!confirmSegmentReduction(segments, next.length)) { notice.textContent = "已取消减少片段。"; return; }
-      if (next.some((seg) => seg.duration < 4 || seg.duration > 15)) throw new Error("片段时长必须在 4～15 秒之间");
+      if (next.some((seg) => !segmentLengthValid(seg))) throw new Error("片段时长最低 1 秒，或选择有效的 5 帧模式");
       if (next.some((seg) => totalRefs(seg) > MAX_TOTAL_REFS || Object.entries(MAX_REFS).some(([type, max]) => countRefs(seg, type) > max))) throw new Error(`每段参考素材最多 ${MAX_TOTAL_REFS} 个`);
       segments = next; directInput.value = JSON.stringify(segments, null, 2); segmentCountInput.value = segments.length; render(); notice.textContent = "已应用直接输入的片段配置。";
     } catch (error) { notice.textContent = `JSON 无效：${error.message || error}`; }
@@ -1107,26 +1240,26 @@ function openEditor(node) {
   directActions.appendChild(makeButton("从列表更新 JSON", () => { directInput.value = JSON.stringify(segments, null, 2); }));
   directPanel.appendChild(directActions); panel.appendChild(directPanel);
 
-  const segmentDurationPanel = document.createElement("div"); segmentDurationPanel.style.cssText = "display:flex;align-items:center;gap:8px;padding:8px 10px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px;font-size:12px";
+  const segmentDurationPanel = document.createElement("div"); segmentDurationPanel.style.cssText = "display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 10px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px;font-size:12px;min-width:0";
   segmentDurationPanel.append("统一片段秒数");
-  const segmentSeconds = document.createElement("input"); segmentSeconds.type = "number"; segmentSeconds.min = "4"; segmentSeconds.max = "15"; segmentSeconds.step = "0.1"; segmentSeconds.value = "5"; segmentSeconds.style.cssText = "width:76px;background:#15191d;color:#eee;border:1px solid #59636e;padding:5px"; segmentDurationPanel.appendChild(segmentSeconds);
+  const segmentSeconds = document.createElement("input"); segmentSeconds.type = "number"; segmentSeconds.min = "1"; segmentSeconds.max = "15"; segmentSeconds.step = "0.1"; segmentSeconds.value = "5"; segmentSeconds.style.cssText = "width:76px;background:#15191d;color:#eee;border:1px solid #59636e;padding:5px"; segmentDurationPanel.appendChild(segmentSeconds);
   segmentDurationPanel.appendChild(makeButton("应用到全部片段", () => {
-    const value = Math.max(4, Math.min(15, Number(segmentSeconds.value) || 5));
+    const value = Math.max(1, Math.min(15, Number(segmentSeconds.value) || 5));
     segmentSeconds.value = String(value);
-    segments.forEach((seg) => { seg.duration = value; });
+    segments.forEach((seg) => { setSegmentLengthMode(seg, "seconds"); seg.duration = value; });
     directInput.value = JSON.stringify(segments, null, 2);
     render();
     notice.textContent = `已将全部片段的秒数设置为 ${value}。`;
   }));
   panel.appendChild(segmentDurationPanel);
 
-  const segmentCountPanel = document.createElement("div"); segmentCountPanel.style.cssText = "display:flex;align-items:center;gap:8px;padding:8px 10px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px;font-size:12px";
+  const segmentCountPanel = document.createElement("div"); segmentCountPanel.style.cssText = "display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 10px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px;font-size:12px;min-width:0";
   segmentCountPanel.append("片段数量");
   const segmentCountInput = document.createElement("input"); segmentCountInput.type = "number"; segmentCountInput.min = "1"; segmentCountInput.max = "999"; segmentCountInput.step = "1"; segmentCountInput.value = String(segments.length); segmentCountInput.style.cssText = "width:76px;background:#15191d;color:#eee;border:1px solid #59636e;padding:5px"; segmentCountPanel.appendChild(segmentCountInput);
   segmentCountPanel.appendChild(makeButton("应用片段数量", () => {
     const target = Math.max(1, Math.min(999, Math.floor(Number(segmentCountInput.value) || segments.length)));
     if (!confirmSegmentReduction(segments, target)) { segmentCountInput.value = String(segments.length); notice.textContent = "已取消减少片段。"; return; }
-    while (segments.length < target) segments.push({ prompt: "", duration: 5, audio_restart: false, continue_audio: true, continue_video: true, references: [], _references_open: false });
+    while (segments.length < target) segments.push({ prompt: "", duration: 5, duration_mode: "seconds", audio_restart: false, continue_audio: true, continue_video: true, references: [], _references_open: false });
     if (segments.length > target) segments.length = target;
     segmentCountInput.value = String(target); directInput.value = JSON.stringify(segments, null, 2); render(); notice.textContent = `片段数量已设置为 ${target}。`;
   }));
@@ -1140,14 +1273,181 @@ function openEditor(node) {
   cropFrames.title = "0 表示按当前上下文长度自动计算；大于 0 时使用指定帧数";
   cropFrames.style.cssText = "width:88px;background:#15191d;color:#eee;border:1px solid #59636e;padding:5px";
   cropPanel.append(cropFrames, "帧（0=自动计算；大于 0 时自动启用裁剪）");
+  cropFrames.oninput = () => { if (typeof updateAudioComparison === "function") updateAudioComparison(); };
   panel.appendChild(cropPanel);
 
-  const deferredPanel = document.createElement("label"); deferredPanel.style.cssText = "display:flex;align-items:center;gap:8px;padding:8px 10px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px;font-size:12px";
+  const deferredPanel = document.createElement("label"); deferredPanel.style.cssText = "display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;padding:8px 10px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px;font-size:12px;line-height:1.45;min-width:0";
   const deferredWidget = widget(node, "decode_after_all_segments");
   const deferredDecode = document.createElement("input"); deferredDecode.type = "checkbox"; deferredDecode.checked = !!deferredWidget?.value;
   deferredDecode.title = "全部采样后从硬盘逐段读取 latent、逐段解码并拼接；开启时视频上下文固定使用缓存潜空间直取。";
   deferredPanel.append(deferredDecode, "所有片段采样完成后统一解码（逐段处理，不同时占用多段显存）");
   panel.appendChild(deferredPanel);
+
+  // Audio Drive Panel
+  const audioDriveWidget = widget(node, "enable_audio_drive");
+  const audioDriveFileWidget = widget(node, "audio_drive_file");
+  let currentAudioDuration = 0;
+
+  const audioDrivePanel = document.createElement("div");
+  audioDrivePanel.style.cssText = "padding:10px 12px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px;display:flex;flex-direction:column;gap:8px;font-size:12px";
+
+  const audioDriveHeader = document.createElement("div");
+  audioDriveHeader.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap";
+
+  const audioDriveLabel = document.createElement("label");
+  audioDriveLabel.style.cssText = "display:flex;align-items:center;gap:6px;font-weight:700;cursor:pointer;color:#f0f3f6";
+  const audioDriveToggle = document.createElement("input");
+  audioDriveToggle.type = "checkbox";
+  audioDriveToggle.checked = !!audioDriveWidget?.value;
+  audioDriveLabel.append(audioDriveToggle, "启用音频驱动（切分上传音频并强制替换音频潜空间）");
+  audioDriveHeader.appendChild(audioDriveLabel);
+  audioDrivePanel.appendChild(audioDriveHeader);
+
+  const audioDriveContent = document.createElement("div");
+  audioDriveContent.style.cssText = `display:${audioDriveToggle.checked ? "flex" : "none"};flex-direction:column;gap:8px;margin-top:4px`;
+
+  const audioDriveHelp = document.createElement("div");
+  audioDriveHelp.style.cssText = "font-size:11px;color:#aeb7c1;line-height:1.4";
+  audioDriveHelp.textContent = "开启后上传音频，插件自动根据当前片段的秒数切分音频并音频潜空间强制替换。音频时长大于视频总时长则舍弃多余音频；短于视频总时长在保存时可选择自动修改视频时长或直接保存。";
+  audioDriveContent.appendChild(audioDriveHelp);
+
+  const audioDriveFileRow = document.createElement("div");
+  audioDriveFileRow.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap";
+
+  const audioDrivePath = document.createElement("input");
+  audioDrivePath.type = "text";
+  audioDrivePath.value = String(audioDriveFileWidget?.value || "");
+  audioDrivePath.placeholder = "上传音频后自动填写，或直接输入 input/ 相对路径 / 绝对路径";
+  audioDrivePath.style.cssText = "flex:1;min-width:220px;background:#0d1013;color:#eee;border:1px solid #59636e;padding:5px;border-radius:4px";
+  audioDriveFileRow.appendChild(audioDrivePath);
+
+  const audioPlayer = document.createElement("audio");
+  audioPlayer.controls = true;
+  audioPlayer.preload = "metadata";
+  audioPlayer.style.cssText = "width:100%;display:none;margin-top:4px";
+
+  const audioCompareRow = document.createElement("div");
+  audioCompareRow.style.cssText = "font-size:12px;color:#c9d1d9;display:flex;align-items:center;gap:12px;flex-wrap:wrap";
+
+  const updateAudioComparison = () => {
+    const cropVal = cropWidget ? Math.max(0, Math.floor(Number(cropFrames.value) || 0)) : 0;
+    const segmentInfos = segments.map((s, i) => getSegmentAudioAndEffectiveDuration(s, i, cropVal));
+    const totalAudioNeeded = segmentInfos.reduce((sum, item) => sum + item.audioDuration, 0);
+    const rawSetDuration = segments.reduce((sum, s) => sum + (Number(s.duration) || 5), 0);
+
+    if (!audioDriveToggle.checked || !audioDrivePath.value.trim()) {
+      audioCompareRow.innerHTML = "";
+      return;
+    }
+    const diff = totalAudioNeeded - currentAudioDuration;
+    let badge = "";
+    if (currentAudioDuration <= 0) {
+      badge = `<span style="color:#8b949e">（等待解析音频时长…）</span>`;
+    } else if (Math.abs(diff) <= 0.05) {
+      badge = `<span style="color:#3fb950;font-weight:600">✓ 时长完美匹配</span>`;
+    } else if (diff < 0) {
+      badge = `<span style="color:#58a6ff;font-weight:600">ℹ 音频多出 ${Math.abs(diff).toFixed(2)} 秒（生成时自动舍弃多余音频）</span>`;
+    } else {
+      badge = `<span style="color:#e3b341;font-weight:600">⚠️ 音频短缺 ${diff.toFixed(2)} 秒（保存时将提示修改时长或直接保存）</span>`;
+    }
+    const hasContextReduction = Math.abs(totalAudioNeeded - rawSetDuration) > 0.01;
+    const contextHint = hasContextReduction
+      ? ` (接续裁剪后；设置总长 ${rawSetDuration.toFixed(2)} 秒)`
+      : "";
+    audioCompareRow.innerHTML = `<span>驱动音频时长：<b style="color:#58a6ff">${currentAudioDuration > 0 ? currentAudioDuration.toFixed(2) + " 秒" : "未知"}</b></span> | <span>全部片段视频总时长：<b style="color:#f0f3f6">${totalAudioNeeded.toFixed(2)} 秒</b> (${segments.length}段${contextHint})</span> | ${badge}`;
+  };
+
+  const refreshAudioPath = async (filePath) => {
+    audioDrivePath.value = filePath || "";
+    if (!filePath) {
+      currentAudioDuration = 0;
+      audioPlayer.style.display = "none";
+      audioPlayer.src = "";
+      updateAudioComparison();
+      return;
+    }
+    const refObj = { type: "audio", path: filePath, name: filePath.split("/").pop() };
+    audioPlayer.src = mediaUrl(refObj);
+    audioPlayer.style.display = "block";
+    try {
+      const dur = await probeAudioDuration(filePath);
+      if (dur > 0) {
+        currentAudioDuration = dur;
+        updateAudioComparison();
+      }
+    } catch (_) {}
+  };
+
+  audioPlayer.onloadedmetadata = () => {
+    if (Number.isFinite(audioPlayer.duration) && audioPlayer.duration > 0) {
+      currentAudioDuration = audioPlayer.duration;
+      updateAudioComparison();
+    }
+  };
+
+  audioDrivePath.oninput = () => {
+    refreshAudioPath(audioDrivePath.value.trim());
+  };
+
+  const audioFileInput = document.createElement("input");
+  audioFileInput.type = "file";
+  audioFileInput.accept = "audio/*";
+  audioFileInput.style.display = "none";
+  audioFileInput.onchange = async () => {
+    const file = audioFileInput.files?.[0];
+    if (!file) return;
+    try {
+      notice.textContent = "正在上传驱动音频…";
+      const uploaded = await uploadOne(file, "audio");
+      notice.textContent = `音频上传完成：${uploaded.name}`;
+      await refreshAudioPath(uploaded.path);
+    } catch (err) {
+      notice.textContent = `上传失败：${err.message || err}`;
+    }
+    audioFileInput.value = "";
+  };
+  audioDriveContent.appendChild(audioFileInput);
+
+  const uploadBtn = makeButton("+ 上传音频", () => {
+    audioFileInput.click();
+  });
+  audioDriveFileRow.appendChild(uploadBtn);
+
+  const pythonPickBtn = makeButton("选择音频文件", async () => {
+    if (pickerOptions.mode === "python") {
+      try {
+        notice.textContent = "正在打开 Python 系统文件选择器…";
+        const selected = await selectFilesWithPython("audio", dirs["audio"], pickerOptions.useDefaultPath);
+        if (selected && selected.length) {
+          const item = selected[0];
+          notice.textContent = `已选择音频：${item.name || item.path}`;
+          await refreshAudioPath(item.path);
+        } else {
+          notice.textContent = "未选择文件。";
+        }
+      } catch (err) {
+        notice.textContent = `选择文件失败：${err.message || err}`;
+      }
+    } else {
+      audioFileInput.click();
+    }
+  });
+  audioDriveFileRow.appendChild(pythonPickBtn);
+
+  audioDriveContent.appendChild(audioDriveFileRow);
+  audioDriveContent.appendChild(audioPlayer);
+  audioDriveContent.appendChild(audioCompareRow);
+  audioDrivePanel.appendChild(audioDriveContent);
+  panel.appendChild(audioDrivePanel);
+
+  if (audioDrivePath.value.trim()) {
+    refreshAudioPath(audioDrivePath.value.trim());
+  }
+
+  audioDriveToggle.onchange = () => {
+    audioDriveContent.style.display = audioDriveToggle.checked ? "flex" : "none";
+    updateAudioComparison();
+  };
 
   const list = document.createElement("div");
   list.style.cssText = "flex:1;overflow:auto;padding-right:4px";
@@ -1282,25 +1582,31 @@ function openEditor(node) {
     list.innerHTML = "";
     segments.forEach((seg, index) => {
       const row = document.createElement("div");
-      row.style.cssText = "margin:8px 0;padding:10px;background:#2b3138;border:1px solid #424b55;border-radius:6px";
-      const head = document.createElement("div"); head.style.cssText = "display:grid;grid-template-columns:36px minmax(220px,1fr) 92px 140px 210px 230px 32px;gap:8px;align-items:start";
-      const label = document.createElement("strong"); label.textContent = String(index + 1); label.style.paddingTop = "7px"; head.appendChild(label);
-      const prompt = document.createElement("textarea"); prompt.rows = 3; prompt.placeholder = "输入本片段提示词，使用 <Picture 1>/<Video 1>/<Audio 1> 标签"; prompt.value = seg.prompt; prompt.style.cssText = "width:100%;resize:vertical;background:#15191d;color:#eee;border:1px solid #59636e;padding:6px"; prompt.oninput = () => { seg.prompt = prompt.value; }; head.appendChild(prompt);
-      const duration = document.createElement("input"); duration.type = "number"; duration.min = "4"; duration.max = "15"; duration.step = "0.1"; duration.value = seg.duration; duration.title = "片段时长（秒）"; duration.style.cssText = "width:84px;background:#15191d;color:#eee;border:1px solid #59636e;padding:6px"; duration.oninput = () => { seg.duration = Number(duration.value) || 5; }; head.appendChild(duration);
-      const reset = document.createElement("label"); reset.style.cssText = "font-size:12px;display:flex;gap:5px;align-items:center;padding-top:7px"; const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.checked = seg.audio_restart; checkbox.onchange = () => { seg.audio_restart = checkbox.checked; }; reset.append(checkbox, "重新生成音频"); head.appendChild(reset);
-      const videoReset = document.createElement("label"); videoReset.style.cssText = "font-size:12px;display:flex;gap:5px;align-items:center;padding-top:7px";
+      row.style.cssText = "margin:8px 0;padding:10px;background:#2b3138;border:1px solid #424b55;border-radius:6px;box-sizing:border-box;overflow:hidden;min-width:0";
+      // Keep the prompt on its own row. Putting it beside the long Chinese
+      // switches made the old fixed grid squeeze labels into vertical text on
+      // narrow panels and on high-DPI displays.
+      const head = document.createElement("div"); head.style.cssText = "display:flex;flex-direction:column;gap:8px;width:100%;min-width:0";
+      const promptRow = document.createElement("div"); promptRow.style.cssText = "display:flex;gap:8px;align-items:flex-start;width:100%;min-width:0";
+      const label = document.createElement("strong"); label.textContent = String(index + 1); label.style.cssText = "flex:0 0 28px;padding-top:7px"; promptRow.appendChild(label);
+      const prompt = document.createElement("textarea"); prompt.rows = 3; prompt.placeholder = "输入本片段提示词，使用 <Picture 1>/<Video 1>/<Audio 1> 标签"; prompt.value = seg.prompt; prompt.style.cssText = "flex:1 1 auto;min-width:0;width:100%;resize:vertical;background:#15191d;color:#eee;border:1px solid #59636e;padding:6px;box-sizing:border-box"; prompt.oninput = () => { seg.prompt = prompt.value; }; promptRow.appendChild(prompt); head.appendChild(promptRow);
+      const controls = document.createElement("div"); controls.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;width:100%;min-width:0;padding-left:36px;box-sizing:border-box";
+      const mode = document.createElement("select"); mode.innerHTML = "<option value=\"seconds\">秒数</option><option value=\"frames\">5 帧</option>"; mode.value = seg.duration_mode || "seconds"; mode.style.cssText = "flex:0 0 72px;width:72px;background:#15191d;color:#eee;border:1px solid #59636e;padding:6px"; mode.onchange = () => { setSegmentLengthMode(seg, mode.value); render(); }; controls.appendChild(mode);
+      const duration = document.createElement("input"); duration.type = "number"; duration.min = "1"; duration.max = "15"; duration.step = "0.1"; duration.value = Number(seg.duration) >= 1 ? seg.duration : 5; duration.title = "片段时长（秒）；也可选择 5 帧"; duration.disabled = mode.value === "frames"; duration.style.cssText = "flex:0 0 84px;width:84px;background:#15191d;color:#eee;border:1px solid #59636e;padding:6px;box-sizing:border-box"; duration.oninput = () => { seg.duration = Math.max(1, Number(duration.value) || 5); }; controls.appendChild(duration);
+      const reset = document.createElement("label"); reset.style.cssText = "flex:0 1 220px;min-width:170px;max-width:320px;font-size:12px;display:flex;gap:5px;align-items:flex-start;padding-top:7px;line-height:1.4;white-space:normal;overflow-wrap:anywhere;word-break:break-word"; const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.style.cssText = "flex:0 0 auto;margin-top:2px"; checkbox.checked = seg.audio_restart; checkbox.onchange = () => { seg.audio_restart = checkbox.checked; }; const resetText = document.createElement("span"); resetText.textContent = "重新生成音频"; reset.append(checkbox, resetText); controls.appendChild(reset);
+      const videoReset = document.createElement("label"); videoReset.style.cssText = "flex:0 1 260px;min-width:190px;max-width:360px;font-size:12px;display:flex;gap:5px;align-items:flex-start;padding-top:7px;line-height:1.4;white-space:normal;overflow-wrap:anywhere;word-break:break-word";
       const videoResetCheckbox = document.createElement("input"); videoResetCheckbox.type = "checkbox"; videoResetCheckbox.checked = index > 0 && seg.continue_video === false; videoResetCheckbox.disabled = index === 0;
       videoResetCheckbox.onchange = () => { seg.continue_video = !videoResetCheckbox.checked; if (videoResetCheckbox.checked) { previousCheckbox.checked = false; seg.use_previous_video_reference = false; } };
-      videoReset.append(videoResetCheckbox, "重新生成视频（关闭视频上下文）"); head.appendChild(videoReset);
-      const previous = document.createElement("label"); previous.style.cssText = "font-size:12px;display:flex;gap:5px;align-items:center;padding-top:7px";
+      const videoResetText = document.createElement("span"); videoResetText.textContent = "重新生成视频（关闭视频上下文）"; videoReset.append(videoResetCheckbox, videoResetText); controls.appendChild(videoReset);
+      const previous = document.createElement("label"); previous.style.cssText = "flex:0 1 300px;min-width:210px;max-width:400px;font-size:12px;display:flex;gap:5px;align-items:flex-start;padding-top:7px;line-height:1.4;white-space:normal;overflow-wrap:anywhere;word-break:break-word";
       const previousCheckbox = document.createElement("input"); previousCheckbox.type = "checkbox"; previousCheckbox.checked = index > 0 && !!seg.use_previous_video_reference; previousCheckbox.disabled = index === 0;
       previousCheckbox.onchange = () => { seg.use_previous_video_reference = previousCheckbox.checked; if (previousCheckbox.checked) { seg.continue_video = false; videoResetCheckbox.checked = true; } };
-      previous.append(previousCheckbox, "使用上片段视频作为参考素材接续"); head.appendChild(previous);
-      head.appendChild(makeButton("×", () => {
+      const previousText = document.createElement("span"); previousText.textContent = "使用上片段视频作为参考素材接续"; previous.append(previousCheckbox, previousText); controls.appendChild(previous);
+      controls.appendChild(makeButton("×", () => {
         if (segments.length <= 1) return;
         if (!confirmSegmentReduction(segments, segments.length - 1, [seg])) { notice.textContent = "已取消删除片段。"; return; }
         segments.splice(index, 1); render();
-      }, "删除片段")); row.appendChild(head);
+      }, "删除片段")); head.appendChild(controls); row.appendChild(head);
 
       const details = document.createElement("details"); details.open = seg._references_open === true || (seg._references_open === undefined && (seg.references || []).length > 0); details.ontoggle = () => { seg._references_open = details.open; }; details.style.cssText = "margin-top:8px;background:#20252b;border:1px solid #59636e;border-radius:5px;padding:6px 8px";
       const summary = document.createElement("summary"); summary.textContent = `多模态参考素材（${totalRefs(seg)}/${MAX_TOTAL_REFS} / 图片${countRefs(seg, "image")}/9，视频${countRefs(seg, "video")}/3，音频${countRefs(seg, "audio")}/3）`; summary.style.cursor = "pointer"; details.appendChild(summary);
@@ -1371,10 +1677,11 @@ function openEditor(node) {
       });
       renderRefs(); details.appendChild(refList); row.appendChild(details); list.appendChild(row);
     });
+    updateAudioComparison();
   };
   render();
 
-  const actions = document.createElement("div"); actions.style.cssText = "display:flex;gap:8px;justify-content:flex-end;margin-top:12px";
+  const actions = document.createElement("div"); actions.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;margin-top:12px;min-width:0";
   actions.appendChild(makeButton("+ 添加片段", () => { segments.push({ prompt: "", duration: 5, audio_restart: false, continue_video: true, use_previous_video_reference: false, references: [] }); render(); }));
   actions.appendChild(makeButton("将第 1 段参考素材应用到全部", () => { const refs = JSON.parse(JSON.stringify(segments[0].references || [])); segments.forEach((seg) => { seg.references = JSON.parse(JSON.stringify(refs)); }); render(); }));
   actions.appendChild(makeButton("取消", () => shade.remove()));
@@ -1388,16 +1695,55 @@ function openEditor(node) {
     }
     const insertInvalid = segments.findIndex((seg) => (seg.references || []).some((ref) => Number(ref.insert_seconds) < 0 || Number(ref.insert_frames) < 0));
     if (insertInvalid >= 0) { notice.textContent = `第 ${insertInvalid + 1} 段存在无效的素材插入时间。`; return; }
-    writeSegments(node, segments);
-    if (cropWidget) {
-      cropWidget.value = Math.max(0, Math.min(4096, Math.floor(Number(cropFrames.value) || 0)));
-      cropWidget.callback?.(cropWidget.value);
+
+    const performSave = () => {
+      writeSegments(node, segments);
+      if (cropWidget) {
+        cropWidget.value = Math.max(0, Math.min(4096, Math.floor(Number(cropFrames.value) || 0)));
+        cropWidget.callback?.(cropWidget.value);
+      }
+      if (deferredWidget) {
+        deferredWidget.value = deferredDecode.checked;
+        deferredWidget.callback?.(deferredDecode.checked);
+      }
+      if (audioDriveWidget) {
+        audioDriveWidget.value = audioDriveToggle.checked;
+        audioDriveWidget.callback?.(audioDriveWidget.value);
+      }
+      if (audioDriveFileWidget) {
+        audioDriveFileWidget.value = audioDrivePath.value.trim();
+        audioDriveFileWidget.callback?.(audioDriveFileWidget.value);
+      }
+      syncSerializedWidgets(node);
+      node.setDirtyCanvas?.(true, true);
+      node.graph?.setDirtyCanvas?.(true, true);
+      shade.remove();
+    };
+
+    if (audioDriveToggle.checked && audioDrivePath.value.trim()) {
+      const cropVal = Math.max(0, Math.floor(Number(cropFrames.value) || 0));
+      const totalAudioNeeded = segments.reduce((sum, seg, i) => sum + getSegmentAudioAndEffectiveDuration(seg, i, cropVal).audioDuration, 0);
+      const audioSec = currentAudioDuration;
+      if (audioSec > 0 && audioSec < totalAudioNeeded - 0.05) {
+        showAudioShortageDialog({
+          audioDuration: audioSec,
+          totalVideoDuration: totalAudioNeeded,
+          onModifyVideoDuration: () => {
+            adjustSegmentsToAudioDuration(segments, audioSec, cropVal);
+            directInput.value = JSON.stringify(segments, null, 2);
+            segmentCountInput.value = String(segments.length);
+            render();
+            notice.textContent = `已自动将视频总时长调整为 ${audioSec.toFixed(2)} 秒（已适配接续上下文扣除）。请确认无误后再次点击保存。`;
+          },
+          onSaveDirectly: () => {
+            performSave();
+          },
+        });
+        return;
+      }
     }
-    if (deferredWidget) {
-      deferredWidget.value = deferredDecode.checked;
-      deferredWidget.callback?.(deferredDecode.checked);
-    }
-    shade.remove();
+
+    performSave();
   }));
   panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade);
 }

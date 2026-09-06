@@ -1,15 +1,16 @@
 ---
 name: h3-auto-director-json
-description: Generate strict JSON segment plans for the MiniMax H3 Auto Director ComfyUI plugin. Use when a user asks for H3 multi-segment prompts, durations, continuation settings, audio restart points, or multimodal reference assignments. Default to no references and output only a valid JSON array.
+description: Generate multi-segment plans for MiniMax H3 and ComfyUI Auto Director. Cooperates with h3-prompt-writing: for single-segment requests, output prompt text only without JSON; for multi-segment requests, output a strict JSON array where every segment prompt strictly follows h3-prompt-writing format.
 ---
 
 # H3 Auto Director JSON
 
-Generate the `segments_json` value consumed by `H3AutoDirectorPlan` or
-`H3AutoDirectorTTSPlan`. Follow the MiniMax H3 official full-reference prompt
-format, but return only the JSON
-array. Do not add Markdown fences, explanations, headings, or comments outside
-the JSON.
+## Invocation Strategy & Coordination with h3-prompt-writing
+
+Always coordinate with `h3-prompt-writing`:
+- **Single-Segment Request (单段)**: Output the prompt text directly following `h3-prompt-writing` standards. Do NOT wrap in a JSON array or director schema.
+- **Multi-Segment Request (多段)**: Output a strict JSON array conforming to `H3AutoDirectorPlan` or `H3AutoDirectorTTSPlan`. Every segment's `prompt` field MUST be strictly written according to `h3-prompt-writing` format rules (Ref2VA six-section structure or Base multimodal structure with full shot, camera, and sound design). Return only the valid JSON array without Markdown fences or extra commentary.
+
 
 ## Output Contract
 
@@ -20,7 +21,7 @@ field:
 ```json
 {
   "prompt": "subject_definitions:\n...\n\nsummary:\n...\n\nretention_analysis:\n...\n\ndetailed_description:\n...\n\noverall_soundscape:\n...\n\nnon_diegetic_music:\n...",
-  "duration": 4,
+  "duration": 5,
   "audio_restart": false,
   "continue_audio": true,
   "continue_video": false,
@@ -36,7 +37,7 @@ timeline rather than a visual action sequence.
 
 Use these defaults:
 
-- `duration`: `5` unless the user gives a duration. Keep every value between `4` and `15` seconds.
+- `duration`: `5` unless the user gives a duration. Keep every value between `1` and `15` seconds. For the H3 minimum timeline, use `duration_mode: "frames"` and `frame_count: 5` rather than encoding five frames as five seconds.
 - `audio_restart`: `false`; set `true` only at a user-requested or clearly justified audio reset point.
 - `continue_audio`: `true` by default; set `false` on a specific segment when the user asks to close audio context continuation for that segment. This is independent of video continuation and global audio settings.
 - `continue_video`: `false` for the first segment; `true` for later segments unless the user requests independent scenes or disables continuation.
@@ -120,16 +121,21 @@ without one, the injected clip is `<Video 1>`; with one, it is `<Video 2>`.
 
 ## Prompt Requirements
 
-Write every `prompt` in English except dialogue, lyrics, and visible scene text,
-which must stay in their original language. Use the six sections in this exact
-order:
+Every segment's `prompt` MUST strictly adhere to the `h3-prompt-writing` format standards.
+Write every `prompt` in English except dialogue, lyrics, and visible scene text, which must stay in their original language.
 
+For full-reference mode (Ref2VA), use the six sections in this exact order:
 1. `subject_definitions`
 2. `summary`
 3. `retention_analysis`
 4. `detailed_description`
 5. `overall_soundscape`
 6. `non_diegetic_music`
+
+For base text/keyframe modes (T2VA/I2VA/FL2VA/L2VA), use the three sections:
+1. `integrated_multimodal_description`
+2. `overall_soundscape`
+3. `non_diegetic_music`
 
 Use the official Ref2VA relationship markers in `retention_analysis`:
 `fully_preserved`, `partially_preserved`, `attribute_transfer`, or

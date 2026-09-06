@@ -10,7 +10,7 @@ WEB_DIRECTORY = "./web"
 try:
     from aiohttp import web
     from server import PromptServer
-    from .upload import probe_video_file, select_and_import_files, select_directory
+    from .upload import probe_audio_file, probe_video_file, select_and_import_files, select_directory
 
     @PromptServer.instance.routes.post("/h3_auto_director/select_files")
     async def h3_auto_director_select_files(request):
@@ -47,6 +47,18 @@ try:
             return web.json_response({"error": str(exc)}, status=400)
         except Exception as exc:
             logging.getLogger("h3_auto_director").exception("Video reference probe failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    @PromptServer.instance.routes.post("/h3_auto_director/audio_info")
+    async def h3_auto_director_audio_info(request):
+        try:
+            payload = await request.json()
+            info = await asyncio.to_thread(probe_audio_file, payload.get("path", ""))
+            return web.json_response(info)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logging.getLogger("h3_auto_director").exception("Audio reference probe failed")
             return web.json_response({"error": str(exc)}, status=500)
 except Exception as exc:
     logging.getLogger("h3_auto_director").warning("Native reference picker unavailable: %s", exc)

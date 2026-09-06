@@ -75,19 +75,29 @@ def _video_has_audio(path):
         return False
 
 
-def _resolve_input_file(value):
+def _resolve_input_file(value, file_label="参考素材"):
     clean = str(value or "").strip().strip('"').replace("\\", "/")
     if clean.startswith("input/"):
         clean = clean[6:]
+    try:
+        if Path(value).is_file():
+            return Path(value).resolve()
+    except Exception:
+        pass
     path = (Path(folder_paths.get_input_directory()) / clean).resolve()
     root = Path(folder_paths.get_input_directory()).resolve()
-    if root not in path.parents or not path.is_file():
-        raise ValueError("视频参考素材必须位于 ComfyUI/input 目录内")
-    return path
+    if root in path.parents and path.is_file():
+        return path
+    try:
+        if Path(clean).is_file():
+            return Path(clean).resolve()
+    except Exception:
+        pass
+    raise ValueError(f"{file_label}必须位于 ComfyUI/input 目录或可访问路径内")
 
 
 def probe_video_file(path):
-    resolved = _resolve_input_file(path)
+    resolved = _resolve_input_file(path, "视频参考素材")
     result = {"has_audio": _video_has_audio(resolved)}
     ffprobe = _find_ffprobe()
     if ffprobe:
@@ -111,6 +121,47 @@ def probe_video_file(path):
                 "duration": duration,
                 "fps": source_fps,
                 "frame_count_24": int(round(duration * 24.0)),
+            })
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+            pass
+    return result
+
+
+def probe_audio_file(path):
+    resolved = _resolve_input_file(path, "音频驱动素材")
+    result = {"duration": 0.0, "sample_rate": 0, "channels": 0}
+    try:
+        import torchaudio
+        info = torchaudio.info(str(resolved))
+        if info and info.sample_rate > 0:
+            duration = float(info.num_frames) / float(info.sample_rate)
+            result.update({
+                "duration": duration,
+                "sample_rate": int(info.sample_rate),
+                "channels": int(info.num_channels),
+            })
+            return result
+    except Exception:
+        pass
+
+    ffprobe = _find_ffprobe()
+    if ffprobe:
+        try:
+            probe = subprocess.run([
+                ffprobe, "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=sample_rate,channels,duration:format=duration",
+                "-of", "json", str(resolved),
+            ], capture_output=True, text=True, timeout=30)
+            import json
+            data = json.loads(probe.stdout or "{}")
+            stream = (data.get("streams") or [{}])[0]
+            duration = float(stream.get("duration") or (data.get("format") or {}).get("duration") or 0.0)
+            sr = int(stream.get("sample_rate") or 0)
+            channels = int(stream.get("channels") or 0)
+            result.update({
+                "duration": duration,
+                "sample_rate": sr,
+                "channels": channels,
             })
         except (OSError, ValueError, TypeError, subprocess.SubprocessError):
             pass

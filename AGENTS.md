@@ -1,7 +1,8 @@
 # H3 Auto Director Project Context
 
 - This is the MiniMax H3 ComfyUI automation plugin. Its upstream repository is https://github.com/kongbai-0421/ComfyUI-H3-Auto-Director.
-- The reusable JSON prompt skill is installed at `%USERPROFILE%\.codex\skills\h3-auto-director-json` and is also bundled under `skills/h3-auto-director-json`.
+- The reusable JSON prompt skill is installed at `%USERPROFILE%\.codex\skills\h3-auto-director-json` (and `~/.gemini/config/skills/`, `~/.agents/skills/`) and is also bundled under `skills/h3-auto-director-json`.
+- Skill invocation strategy: `h3-prompt-writing` and `h3-auto-director-json` are coordinated together. For single-segment briefs, output prompt text only without JSON; for multi-segment briefs, output a strict JSON array where every segment's `prompt` strictly follows `h3-prompt-writing` format.
 - In the one-shot prompt embedding cache, encode all segment reference assets with the VAE first, then encode every segment's text continuously, and unload the CLIP text encoder only after the full batch completes.
 - Keep ordinary per-segment encoding behavior unchanged unless the task explicitly changes it.
 - H3 prompt JSON must leave `references` empty unless the user supplies an exact local asset file path. Never invent paths, URLs, filenames, or labels.

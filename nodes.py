@@ -55,6 +55,11 @@ except ImportError:
     _H3AddGuide = None
 
 try:
+    from .upload import _resolve_input_file
+except ImportError:
+    _resolve_input_file = None
+
+try:
     from . import latent_upscaler as _h3_latent_upscaler
 except ImportError:
     _h3_latent_upscaler = None
@@ -1110,6 +1115,12 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
                                       seed=int(seed))
     result = dict(latent)
     result["samples"] = samples
+    # Keep the layout-refreshed model clone alive until the caller consumes the
+    # result.  Without this reference the clone is GC'd as soon as _dual_sample
+    # returns, and ComfyUI's cleanup_models_gc misidentifies the still-shared
+    # underlying nn.Module as a memory leak (the LoadedModel weakref dies while
+    # the real model weights remain alive for the next stage / VAE decode).
+    result["_h3_sampling_model_ref"] = model
     return result
 
 
@@ -2264,6 +2275,9 @@ class H3AutoDirectorDualSampling:
                 # that branch explicitly instead of using the final branch.
                 first["_h3_stage1_audio"] = stage1_audio_override
                 first_output["_h3_stage1_audio"] = stage1_audio_override
+        if bool(first.get("_h3_audio_driven", False)):
+            if first.get("_h3_stage1_audio") is not None:
+                first_output["_h3_stage1_audio"] = first["_h3_stage1_audio"]
         if not bool(enable_stage2):
             # Preserve the output contract without paying for decode/upscale.
             # The empty IMAGE is deliberately inert; the final AV latent is
@@ -2348,6 +2362,19 @@ class H3AutoDirectorDualSampling:
         # reapply its prefix mask at a different spatial resolution.
         refined.pop("noise_mask", None)
         refined.pop("h3_auto_director_sampled_context", None)
+        if bool(first.get("_h3_audio_driven", False)):
+            refined_video = encoded_video
+            refined_audio = first_audio
+            ref_v_mask = torch.ones(
+                (refined_video.shape[0], 1, refined_video.shape[2], refined_video.shape[3], refined_video.shape[4]),
+                dtype=refined_video.dtype, device=refined_video.device
+            )
+            ref_a_mask = torch.zeros(
+                (refined_audio.shape[0], 1, refined_audio.shape[2], refined_audio.shape[3]),
+                dtype=refined_audio.dtype, device=refined_audio.device
+            )
+            refined["noise_mask"] = _h3_av_container(ref_v_mask, ref_a_mask)
+            refined["_h3_audio_driven"] = True
         # Retain text and user references, but remove the project continuation
         # injected for stage one unless the user explicitly asks to apply it
         # again during refinement. This also applies to a separately connected
@@ -2397,6 +2424,11 @@ class H3AutoDirectorDualSampling:
                 raise RuntimeError("一采音频已启用，但未生成音频覆盖数据")
             final["_h3_stage1_audio"] = stage1_audio_override
             LOG.info("H3 Auto Director: 已启用最终仅使用一采音频，二采仅输出画面")
+        if bool(first.get("_h3_audio_driven", False)):
+            final = dict(final)
+            if first.get("_h3_stage1_audio") is not None:
+                final["_h3_stage1_audio"] = first["_h3_stage1_audio"]
+            final["_h3_audio_driven"] = True
         final_output = dict(final)
         final_output["_h3_stage1_context"] = first
         return (final_output, first, preview, decoded)
@@ -2527,6 +2559,8 @@ class H3AutoDirectorPlan:
             "global_assets_json": ("STRING", {"default": "[]", "multiline": True}),
             "auto_context_crop_frames": ("INT", {"default": 0, "min": 0, "max": 4096,
                 "tooltip": "自动裁剪上下文时使用的帧数；0 表示按上下文长度自动计算；大于 0 时自动启用裁剪。"}),
+            "enable_audio_drive": ("BOOLEAN", {"default": False, "tooltip": "启用音频驱动：自动根据片段秒数切分上传的音频并强制替换音频潜空间"}),
+            "audio_drive_file": ("STRING", {"default": "", "tooltip": "音频驱动文件路径（支持 input/ 相对路径或绝对路径）"}),
         }, "hidden": {"project_dir": "STRING"}}
 
     RETURN_TYPES = ("H3_AUTO_PLAN",)
@@ -2534,7 +2568,7 @@ class H3AutoDirectorPlan:
     FUNCTION = "create"
     CATEGORY = "H3 自动导演"
 
-    def create(self, project_id, segments_json, duration, global_reference_set, auto_run, continuation_mode=True, cache_prompt_embeddings=False, decode_after_all_segments=False, output_root="h3_projects", cache_prompt_embeddings_to_disk=False, global_assets_json="[]", auto_context_crop_frames=0, project_dir="", **_legacy_inputs):
+    def create(self, project_id, segments_json, duration, global_reference_set, auto_run, continuation_mode=True, cache_prompt_embeddings=False, decode_after_all_segments=False, output_root="h3_projects", cache_prompt_embeddings_to_disk=False, global_assets_json="[]", auto_context_crop_frames=0, enable_audio_drive=False, audio_drive_file="", project_dir="", **_legacy_inputs):
         try:
             segments = json.loads(segments_json)
             assets = json.loads(global_assets_json or "[]")
@@ -2615,6 +2649,8 @@ class H3AutoDirectorPlan:
                 "decode_after_all_segments": bool(decode_after_all_segments),
                 "cache_prompt_embeddings_to_disk": bool(cache_prompt_embeddings_to_disk),
                 "auto_context_crop_frames": int(auto_context_crop_frames),
+                "enable_audio_drive": bool(enable_audio_drive),
+                "audio_drive_file": str(audio_drive_file or "").strip(),
                 "global_assets": assets, "segments": normalized,
                 "project_dir": str(project_dir)}
         if legacy_project_dir is not None:
@@ -4756,7 +4792,8 @@ class H3AutoDirectorSegment:
         # Previous-video reference mode only disables pixel/video context. Keep
         # the audio-context decision independent so an audio-only policy can
         # still be represented by the segment output.
-        use_audio = (bool(plan.get("continuation_mode", True)) and bool(seg.get("continue_audio", True))
+        audio_driven = bool(plan.get("enable_audio_drive", False))
+        use_audio = (not audio_driven and bool(plan.get("continuation_mode", True)) and bool(seg.get("continue_audio", True))
                      and not restart and context_index > 0)
         target = round(float(seg["duration"]) * FPS)
         # Guide rows anchor the beginning of the denoised timeline. Reserve
@@ -5241,6 +5278,223 @@ def _refresh_cached_conditioning_latent(value, width, height, length):
     return [conditioning, expected_latent, *value[2:]]
 
 
+
+
+def _slice_audio_for_segment(audio_path, start_sec, duration_sec, target_sample_rate=32000):
+    """Slice audio from audio_path for the requested start_sec and duration_sec.
+
+    If the audio file duration < start_sec + duration_sec, the remainder is padded with silence.
+    If the audio file duration > requested duration, excess audio is discarded.
+    """
+    if _resolve_input_file is not None:
+        resolved = _resolve_input_file(audio_path, "音频驱动素材")
+    else:
+        resolved = Path(audio_path).expanduser().resolve()
+        if not resolved.is_file():
+            resolved = (_input_root() / str(audio_path).replace("\\", "/").lstrip("/")).resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"音频驱动文件不存在：{audio_path}（检查路径：{resolved}）")
+
+    waveform = None
+    sr = None
+    try:
+        import torchaudio
+        waveform, sr = torchaudio.load(str(resolved))
+    except Exception as exc:
+        LOG.warning("H3 Auto Director: torchaudio 加载音频驱动文件失败，尝试 soundfile: %s", exc)
+        try:
+            import soundfile as sf
+            data, sr = sf.read(str(resolved), dtype="float32")
+            waveform = torch.from_numpy(data)
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+            elif waveform.ndim == 2:
+                waveform = waveform.t()
+        except Exception as exc2:
+            raise RuntimeError(f"无法读取音频驱动文件 {audio_path}: {exc2}") from exc2
+
+    if waveform is None or sr is None:
+        raise RuntimeError(f"无法解析音频驱动文件: {audio_path}")
+
+    if waveform.ndim == 2:
+        waveform = waveform.unsqueeze(0)
+    elif waveform.ndim == 1:
+        waveform = waveform.unsqueeze(0).unsqueeze(0)
+
+    if waveform.shape[1] == 1:
+        waveform = waveform.repeat(1, 2, 1)
+    elif waveform.shape[1] > 2:
+        waveform = waveform[:, :2, :]
+
+    target_sr = int(target_sample_rate or 32000)
+    if sr != target_sr:
+        import torchaudio.functional as F
+        waveform = F.resample(waveform, sr, target_sr)
+        sr = target_sr
+
+    start_sample = max(0, int(round(start_sec * sr)))
+    duration_samples = max(1, int(round(duration_sec * sr)))
+    total_samples = waveform.shape[-1]
+
+    if start_sample >= total_samples:
+        sliced = torch.zeros((1, 2, duration_samples), dtype=torch.float32)
+    else:
+        sliced = waveform[:, :, start_sample:start_sample + duration_samples]
+        if sliced.shape[-1] < duration_samples:
+            pad_len = duration_samples - sliced.shape[-1]
+            sliced = torch.nn.functional.pad(sliced, (0, pad_len))
+
+    return sliced.to(dtype=torch.float32), sr
+
+
+def _get_segment_context_frames(plan, generation_index, context_length=FRAME_CONTEXT_DEFAULT):
+    """Determine the continuation context frames for a given segment index.
+
+    Returns 0 for the first segment (or when continuation/video context is disabled).
+    For segment >= 2 with continuation enabled:
+    Returns configured auto_context_crop_frames if > 0, else _h3_context_run(context_length).
+    """
+    index = int(generation_index)
+    if index <= 1 or not isinstance(plan, dict):
+        return 0
+    if not bool(plan.get("continuation_mode", True)):
+        return 0
+    if not _video_context_enabled(plan):
+        return 0
+    segment = _segment(plan, index)
+    if not bool(segment.get("continue_video", True)):
+        return 0
+    if _use_previous_video_reference(plan, index):
+        return 0
+    configured = max(0, int(plan.get("auto_context_crop_frames", 0) or 0))
+    if configured > 0:
+        return configured
+    return _h3_context_run(plan.get("_runtime_context_length", context_length or FRAME_CONTEXT_DEFAULT))
+
+
+def _apply_audio_drive_if_enabled(plan, generation_index, audio_vae, length, res, context_length=FRAME_CONTEXT_DEFAULT):
+    """If audio drive is enabled in plan, replace the audio latent and attach audio override."""
+    if not isinstance(plan, dict) or not bool(plan.get("enable_audio_drive", False)):
+        return res
+    audio_path = str(plan.get("audio_drive_file", "")).strip()
+    if not audio_path:
+        return res
+    if not isinstance(res, (tuple, list)) or len(res) < 2:
+        return res
+
+    conditioning = res[0]
+    latent = dict(res[1])
+    segments = plan.get("segments", [])
+    plan_duration = float(plan.get("duration", 5.0))
+    gen_idx = max(1, int(generation_index))
+
+    # Accumulate audio duration consumed by preceding segments
+    start_sec = 0.0
+    for i in range(1, gen_idx):
+        seg_i = segments[i - 1] if i <= len(segments) else {}
+        dur_i = float(seg_i.get("duration", plan_duration))
+        ctx_f_i = _get_segment_context_frames(plan, i, context_length)
+        eff_audio_dur_i = max(0.1, dur_i - (ctx_f_i / FPS))
+        start_sec += eff_audio_dur_i
+
+    cur_seg = segments[gen_idx - 1] if gen_idx <= len(segments) else {}
+    cur_dur = float(cur_seg.get("duration", plan_duration))
+    cur_ctx_frames = _get_segment_context_frames(plan, gen_idx, context_length)
+    cur_ctx_sec = cur_ctx_frames / FPS
+    # Effective audio duration for this segment: set duration minus context duration
+    cur_audio_dur = max(0.1, cur_dur - cur_ctx_sec)
+
+    target_sr = getattr(audio_vae, "audio_sample_rate", 32000)
+
+    # Slice the driving audio for this segment
+    sliced_waveform, sr = _slice_audio_for_segment(
+        audio_path, start_sec, cur_audio_dur, target_sample_rate=target_sr
+    )
+
+    # Assemble stage1 audio: if this segment has continuation context, prepend the context audio from
+    # the audio file (preceding start_sec) so when SaveSegment trims the prefix, the remaining waveform matches exactly!
+    if cur_ctx_frames > 0 and cur_ctx_sec > 0:
+        prefix_start_sec = max(0.0, start_sec - cur_ctx_sec)
+        prefix_waveform, _ = _slice_audio_for_segment(
+            audio_path, prefix_start_sec, cur_ctx_sec, target_sample_rate=target_sr
+        )
+        full_stage1_waveform = torch.cat([prefix_waveform, sliced_waveform], dim=-1)
+    else:
+        full_stage1_waveform = sliced_waveform
+
+    audio_dict = {"waveform": full_stage1_waveform, "sample_rate": sr}
+
+    # Encode the new driven audio slice with audio_vae
+    driven_audio_z, _ = _encode_ref_audio(audio_vae, {"waveform": sliced_waveform, "sample_rate": sr})
+
+    if _minimax_h3 is not None:
+        frame_count, latent_t, audio_t = _minimax_h3.temporal_shape(int(length))
+    else:
+        audio_t = round((int(length) / FPS) * 40)
+
+    # Calculate audio latent context steps to skip (H3 audio latent runs at 40Hz)
+    if cur_ctx_frames > 0:
+        context_audio_steps = max(1, int(round((cur_ctx_frames / FPS) * 40.0)))
+    else:
+        context_audio_steps = 0
+
+    needed_driven_steps = max(1, audio_t - context_audio_steps)
+    if driven_audio_z.shape[-1] < needed_driven_steps:
+        driven_audio_z = torch.nn.functional.pad(driven_audio_z, (0, needed_driven_steps - driven_audio_z.shape[-1]))
+    elif driven_audio_z.shape[-1] > needed_driven_steps:
+        driven_audio_z = driven_audio_z[..., :needed_driven_steps]
+
+    latent_parts = _av_latent_parts(latent)
+    if latent_parts is None:
+        raise ValueError("H3 潜空间不是联合 AV latent，无法进行音频潜空间强制替换")
+    video_latent, orig_audio_z = latent_parts[0], latent_parts[1]
+
+    final_audio_z = orig_audio_z.clone().to(device=video_latent.device, dtype=video_latent.dtype)
+    if final_audio_z.shape[-1] < audio_t:
+        final_audio_z = torch.nn.functional.pad(final_audio_z, (0, audio_t - final_audio_z.shape[-1]))
+    elif final_audio_z.shape[-1] > audio_t:
+        final_audio_z = final_audio_z[..., :audio_t]
+
+    if context_audio_steps > 0 and cur_ctx_frames > 0 and cur_ctx_sec > 0:
+        try:
+            prefix_audio_z, _ = _encode_ref_audio(audio_vae, {"waveform": prefix_waveform, "sample_rate": sr})
+            if prefix_audio_z.shape[-1] < context_audio_steps:
+                prefix_audio_z = torch.nn.functional.pad(prefix_audio_z, (context_audio_steps - prefix_audio_z.shape[-1], 0))
+            elif prefix_audio_z.shape[-1] > context_audio_steps:
+                prefix_audio_z = prefix_audio_z[..., -context_audio_steps:]
+            final_audio_z[..., :context_audio_steps] = prefix_audio_z.to(device=final_audio_z.device, dtype=final_audio_z.dtype)
+        except Exception as exc:
+            LOG.warning("H3 Auto Director: 编码前导上下文音频潜空间失败，保留原始音频潜空间: %s", exc)
+
+    # Skip the context region (0:context_audio_steps), replace the driven region
+    final_audio_z[..., context_audio_steps:context_audio_steps + needed_driven_steps] = driven_audio_z.to(
+        device=final_audio_z.device, dtype=final_audio_z.dtype
+    )
+
+    latent["samples"] = _h3_av_container(video_latent, final_audio_z)
+
+    video_mask = torch.ones(
+        (video_latent.shape[0], 1, video_latent.shape[2], video_latent.shape[3], video_latent.shape[4]),
+        dtype=video_latent.dtype, device=video_latent.device
+    )
+    audio_mask = torch.zeros(
+        (final_audio_z.shape[0], 1, final_audio_z.shape[2], final_audio_z.shape[3]),
+        dtype=final_audio_z.dtype, device=final_audio_z.device
+    )
+    latent["noise_mask"] = _h3_av_container(video_mask, audio_mask)
+    latent["_h3_audio_driven"] = True
+    latent["_h3_stage1_audio"] = audio_dict
+    latent["_h3_audio_context_steps"] = context_audio_steps
+
+    LOG.info(
+        "H3 Auto Director: 第 %d 段音频驱动潜空间处理完成：文件=%s，起始=%.2f秒，驱动时长=%.2f秒（已扣除上下文%d帧=%.2f秒），总audio_t=%d，跳过上下文=%d步",
+        gen_idx, audio_path, start_sec, cur_audio_dur, cur_ctx_frames, cur_ctx_sec, audio_t, context_audio_steps
+    )
+    if isinstance(res, tuple):
+        return (conditioning, latent, *res[2:])
+    return [conditioning, latent, *res[2:]]
+
+
 class H3AutoDirectorCachedReferenceToVideo:
     """Reference-to-video node with optional one-shot per-project conditioning cache."""
 
@@ -5580,16 +5834,18 @@ class H3AutoDirectorCachedReferenceToVideo:
         if not cache_all_enabled:
             effective_refs = _cache_segment_references(plan, generation_index) if refs is None else refs
             if disk_enabled:
-                return cls._encode_current_with_disk_cache(
+                res = cls._encode_current_with_disk_cache(
                     plan, clip, vae, audio_vae, prompt, width, height, length,
                     ref_image_size, context_length, generation_index, effective_refs,
                     use_manual_ref_short_edge=manual_enabled,
                     ref_short_edge=ref_short_edge,
                 )
-            return cls._encode_one(clip, vae, audio_vae, prompt, width, height, length,
+            else:
+                res = cls._encode_one(clip, vae, audio_vae, prompt, width, height, length,
                                    ref_image_size, effective_refs,
                                    plan=plan, use_manual_ref_short_edge=manual_enabled,
                                    ref_short_edge=ref_short_edge)
+            return _apply_audio_drive_if_enabled(plan, generation_index, audio_vae, length, res, context_length=context_length)
         effective_ref_mode = "manual" if manual_enabled else ref_image_size
         key = _prompt_cache_key(plan, clip, vae, audio_vae, width, height,
                                 effective_ref_mode, context_length, ref_short_edge)
@@ -5644,7 +5900,7 @@ class H3AutoDirectorCachedReferenceToVideo:
         cache[generation_index] = _refresh_cached_conditioning_latent(
             cache[generation_index], width, height, length
         )
-        return cache[generation_index]
+        return _apply_audio_drive_if_enabled(plan, generation_index, audio_vae, length, cache[generation_index], context_length=context_length)
 
 
 def _transfer_segment_ref(plan, generation_index):
@@ -6166,6 +6422,8 @@ class H3AutoDirectorMotionContext:
             if not legacy_h3_motion.ensure_legacy_h3_motion_context():
                 raise RuntimeError("当前旧版 ComfyUI 无法启用内置 H3 Motion Context 兼容层")
             legacy = legacy_h3_motion
+        if bool(latent.get("_h3_audio_driven", False)) and context_latent is None:
+            use_audio_context = False
         if not use_video_context:
             if not use_audio_context:
                 return conditioning, 0, latent
@@ -6227,11 +6485,30 @@ class H3AutoDirectorMotionContext:
             video_mask[:, :, :steps] = 0.0
             for range_start, range_end, strength in sampled_token_ranges:
                 video_mask[:, :, range_start:range_end] = strength
-            source_audio = target_parts[1]
-            audio_mask = torch.ones(
-                (source_audio.shape[0], 1, source_audio.shape[2], source_audio.shape[3]),
-                dtype=source_audio.dtype, device=source_audio.device,
-            )
+            source_audio = target_parts[1].clone()
+            if bool(latent.get("_h3_audio_driven", False)) and use_audio_context and context_latent is not None:
+                try:
+                    audio_tail, audio_steps, _overhang = _h3_audio_tail_from_latent(context_latent, run)
+                    audio_tail = audio_tail.to(device=source_audio.device, dtype=source_audio.dtype)
+                    actual_copy = min(audio_steps, int(source_audio.shape[-1]))
+                    source_audio[..., :actual_copy] = audio_tail[..., :actual_copy]
+                    LOG.info("H3 Auto Director: 已将音频上下文尾部 %d 步填入音频潜空间跳过区", int(actual_copy))
+                except Exception as exc:
+                    LOG.warning("H3 Auto Director: 填入音频上下文尾部失败: %s", exc)
+            if "noise_mask" in latent:
+                existing_parts = _av_latent_parts({"samples": latent["noise_mask"]})
+                if existing_parts is not None and len(existing_parts) > 1 and torch.is_tensor(existing_parts[1]):
+                    audio_mask = existing_parts[1].to(device=source_audio.device, dtype=source_audio.dtype)
+                else:
+                    audio_mask = torch.ones(
+                        (source_audio.shape[0], 1, source_audio.shape[2], source_audio.shape[3]),
+                        dtype=source_audio.dtype, device=source_audio.device,
+                    )
+            else:
+                audio_mask = torch.ones(
+                    (source_audio.shape[0], 1, source_audio.shape[2], source_audio.shape[3]),
+                    dtype=source_audio.dtype, device=source_audio.device,
+                )
             sampled_latent = dict(latent)
             sampled_latent["samples"] = _h3_av_container(sampled_video, source_audio)
             sampled_latent["noise_mask"] = _h3_av_container(video_mask, audio_mask)
@@ -6254,6 +6531,18 @@ class H3AutoDirectorMotionContext:
                 int(start_tokens), start_strength, int(end_tokens), end_strength,
                 int(fixed_tokens), float(video_mask.amin().item()), float(video_mask.amax().item()),
             )
+        elif bool(latent.get("_h3_audio_driven", False)) and use_audio_context and context_latent is not None:
+            try:
+                audio_tail, audio_steps, _overhang = _h3_audio_tail_from_latent(context_latent, run)
+                source_audio = target_parts[1].clone()
+                audio_tail = audio_tail.to(device=source_audio.device, dtype=source_audio.dtype)
+                actual_copy = min(audio_steps, int(source_audio.shape[-1]))
+                source_audio[..., :actual_copy] = audio_tail[..., :actual_copy]
+                sampled_latent = dict(latent)
+                sampled_latent["samples"] = _h3_av_container(target_video, source_audio)
+                LOG.info("H3 Auto Director: 已将音频上下文尾部 %d 步填入音频潜空间跳过区（无重绘 token）", int(actual_copy))
+            except Exception as exc:
+                LOG.warning("H3 Auto Director: 填入音频上下文尾部失败: %s", exc)
         if native_guides:
             # Native MiniMaxH3AddGuide represents a guide clip as one
             # keyframe containing its full temporal latent.  Splitting this
@@ -6359,9 +6648,17 @@ class H3AutoDirectorMotionContext:
                       "h3_auto_director_context_run": int(run)}
             if bool(use_audio_context) and context_latent is not None:
                 try:
-                    audio_tail, _audio_steps, _overhang = _h3_audio_tail_from_latent(context_latent, run)
+                    audio_tail, audio_steps, _overhang = _h3_audio_tail_from_latent(context_latent, run)
                     keyframes[0]["audio_latent"] = audio_tail.to(
                         device=target_video.device, dtype=target_video.dtype)
+                    if bool(latent.get("_h3_audio_driven", False)):
+                        source_audio = target_parts[1].clone()
+                        audio_tail_cast = audio_tail.to(device=source_audio.device, dtype=source_audio.dtype)
+                        actual_copy = min(audio_steps, int(source_audio.shape[-1]))
+                        source_audio[..., :actual_copy] = audio_tail_cast[..., :actual_copy]
+                        sampled_latent = dict(latent)
+                        sampled_latent["samples"] = _h3_av_container(target_video, source_audio)
+                        LOG.info("H3 Auto Director: 帧 Guide 已将音频上下文尾部 %d 步填入音频潜空间跳过区", int(actual_copy))
                 except (ValueError, RuntimeError) as exc:
                     LOG.warning("H3 Auto Director: 帧 Guide 音频上下文不可用，保留画面上下文：%s", exc)
             LOG.info("H3 Auto Director: 使用新版原生 Guide VAE 回退上下文：视频 keyframe=%d，音频上下文不可用", len(keyframes))
