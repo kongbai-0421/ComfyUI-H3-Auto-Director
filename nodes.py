@@ -159,6 +159,8 @@ FRAME_CONTEXT_DEFAULT = 22
 PROMPT_CACHE_MAX_PROJECTS = 2
 PROMPT_DISK_CACHE_SCHEMA = 1
 _PROMPT_CONDITIONING_CACHE = OrderedDict()
+REFERENCE_LATENT_CACHE_MAX = 4
+_REFERENCE_LATENT_CACHE = OrderedDict()
 MAX_REFERENCE_IMAGES = 9
 MAX_REFERENCE_VIDEOS = 3
 MAX_REFERENCE_AUDIOS = 3
@@ -5514,6 +5516,64 @@ def _prompt_cache_key(plan, clip, vae, audio_vae, width, height, ref_image_size,
             json.dumps(plan_data, ensure_ascii=False, sort_keys=True, default=str))
 
 
+def _copy_ref_items(items):
+    return [dict(it) for it in (items or [])]
+
+
+def _copy_ref_blocks(blocks):
+    return [dict(b) for b in (blocks or [])]
+
+
+def _reference_latent_cache_key(vae, audio_vae, width, height, frame_count, ref_image_size,
+                                ref_short_edge, refs, plan):
+    has_videos = any(
+        isinstance(r, dict) and str(r.get("type", "")).lower() in ("video", "transfer_video_segment")
+        for r in (refs or [])
+    )
+    ref_mode = str(ref_image_size or "match").lower()
+    width, height = _h3_canvas_dimensions(width, height)
+    resolution = (int(width), int(height)) if ref_mode not in {"manual", "max"} else None
+    markers = [_reference_file_marker(plan, r) for r in (refs or [])]
+    markers_digest = _stable_digest(markers)
+    skip = bool(plan.get("skip_reference_encoding", False)) if isinstance(plan, dict) else False
+    return (
+        id(vae),
+        id(audio_vae),
+        resolution,
+        ref_mode,
+        _nearest_multiple(ref_short_edge) if ref_mode == "manual" else None,
+        int(frame_count) if has_videos else None,
+        skip,
+        markers_digest,
+    )
+
+
+def _canonical_combine_refs(static_items, static_blocks, dyn_items, dyn_blocks):
+    if not dyn_items and not dyn_blocks:
+        return static_items, static_blocks
+    if not static_items and not static_blocks:
+        return dyn_items, dyn_blocks
+
+    combined_blocks = (
+        [b for b in static_blocks if b.get("kind") == "image"]
+        + [b for b in dyn_blocks if b.get("kind") == "image"]
+        + [b for b in static_blocks if b.get("kind") in ("video", "video_audio")]
+        + [b for b in dyn_blocks if b.get("kind") in ("video", "video_audio")]
+        + [b for b in static_blocks if b.get("kind") == "audio"]
+        + [b for b in dyn_blocks if b.get("kind") == "audio"]
+    )
+
+    num_standalone_audio_blocks = sum(1 for b in static_blocks if b.get("kind") == "audio")
+    if num_standalone_audio_blocks > 0:
+        static_non_standalone = static_items[:-num_standalone_audio_blocks]
+        static_standalone = static_items[-num_standalone_audio_blocks:]
+        combined_items = static_non_standalone + dyn_items + static_standalone
+    else:
+        combined_items = static_items + dyn_items
+
+    return combined_items, combined_blocks
+
+
 def _refresh_cached_conditioning_latent(value, width, height, length):
     """Replace the generation latent carried by a cached conditioning.
 
@@ -5803,8 +5863,8 @@ class H3AutoDirectorCachedReferenceToVideo:
     FUNCTION = "encode"
     CATEGORY = "H3 自动导演"
 
-    @staticmethod
-    def _encode_one(clip, vae, audio_vae, prompt, width, height, length, ref_image_size, refs,
+    @classmethod
+    def _encode_one(cls, clip, vae, audio_vae, prompt, width, height, length, ref_image_size, refs,
                     plan=None, use_manual_ref_short_edge=False, ref_short_edge=2048):
         if _H3ReferenceToVideo is None:
             raise RuntimeError("当前 ComfyUI 未提供 MiniMaxH3ReferenceToVideo 核心节点")
@@ -5824,40 +5884,18 @@ class H3AutoDirectorCachedReferenceToVideo:
         LOG.info("H3 Auto Director: 参考编码画布=%dx%d（%.3f MP），参考尺寸模式=%s",
                  width, height, width * height / 1_000_000,
                  "manual" if use_manual_ref_short_edge else ref_image_size)
-        if bool(use_manual_ref_short_edge):
-            prepared = H3AutoDirectorCachedReferenceToVideo._prepare_references(
-                vae, audio_vae, width, height, length, "manual", refs, plan=plan,
-                ref_short_edge=ref_short_edge)
-            cond = H3AutoDirectorCachedReferenceToVideo._encode_prepared_prompt(
-                clip, prompt, *prepared)
-            cond = _apply_reference_insert_guides(cond, prepared[0], refs, vae, audio_vae)
-            return cond, prepared[0]
-        ref_groups = _resolve_reference_groups(refs, plan=plan)
-        result = _H3ReferenceToVideo.execute(
-            clip, vae, audio_vae, prompt, int(width), int(height), int(length), str(ref_image_size),
-            ref_images=ref_groups[0], ref_videos=ref_groups[1],
-            ref_video_audios=ref_groups[2], ref_audios=ref_groups[3])
-        cond = _apply_reference_insert_guides(result[0], result[1], refs, vae, audio_vae)
-        return cond, result[1]
+        ref_mode = "manual" if bool(use_manual_ref_short_edge) else ref_image_size
+        prepared = cls._prepare_references(
+            vae, audio_vae, width, height, length, ref_mode, refs, plan=plan,
+            ref_short_edge=ref_short_edge)
+        cond = cls._encode_prepared_prompt(clip, prompt, *prepared)
+        cond = _apply_reference_insert_guides(cond, prepared[0], refs, vae, audio_vae)
+        return cond, prepared[0]
 
-    @staticmethod
-    def _prepare_references(vae, audio_vae, width, height, length, ref_image_size, refs,
-                            plan=None, ref_short_edge=2048):
-        """Encode all Ref2VA assets before the batch text-encoder session."""
-        if _H3ReferenceToVideo is None or _minimax_h3 is None:
-            raise RuntimeError("当前 ComfyUI 未提供 MiniMaxH3ReferenceToVideo 核心节点")
-        width, height = _h3_canvas_dimensions(width, height)
-        latent, frame_count = _minimax_h3._empty_av_latent(int(width), int(height), int(length))
-
-        skip = bool(plan.get("skip_reference_encoding", False)) if isinstance(plan, dict) else False
-        has_insertion = any(_reference_insert_frame(ref) is not None for ref in (refs or []))
-        if has_insertion and skip:
-            skip = False
-            LOG.info("H3 Auto Director: 检测到存在素材插入（引导帧）设置，强制开启素材编码覆盖用户设置")
-        elif skip:
-            LOG.info("H3 Auto Director: 项目计划已设置不编码素材，跳过当前参考素材预编码")
-            return latent, [], []
-
+    @classmethod
+    def _encode_references_payload(cls, vae, audio_vae, width, height, frame_count, ref_image_size, refs,
+                                  plan=None, ref_short_edge=2048):
+        """Encode given references into ref_items and ref_blocks."""
         ref_groups = _resolve_reference_groups(refs, plan=plan)
         ref_items = []
         ref_blocks = []
@@ -5933,7 +5971,64 @@ class H3AutoDirectorCachedReferenceToVideo:
             ref_items.append({"type": "audio"})
             ref_blocks.append({"kind": "audio", "ref_audio_t": audio_length,
                                "audio_latent": audio_latent})
-        return latent, ref_items, ref_blocks
+        return ref_items, ref_blocks
+
+    @classmethod
+    def _prepare_references(cls, vae, audio_vae, width, height, length, ref_image_size, refs,
+                            plan=None, ref_short_edge=2048):
+        """Encode all Ref2VA assets before the batch text-encoder session, reusing cached latents when possible."""
+        if _H3ReferenceToVideo is None or _minimax_h3 is None:
+            raise RuntimeError("当前 ComfyUI 未提供 MiniMaxH3ReferenceToVideo 核心节点")
+        width, height = _h3_canvas_dimensions(width, height)
+        latent, frame_count = _minimax_h3._empty_av_latent(int(width), int(height), int(length))
+
+        skip = bool(plan.get("skip_reference_encoding", False)) if isinstance(plan, dict) else False
+        has_insertion = any(_reference_insert_frame(ref) is not None for ref in (refs or []))
+        if has_insertion and skip:
+            skip = False
+            LOG.info("H3 Auto Director: 检测到存在素材插入（引导帧）设置，强制开启素材编码覆盖用户设置")
+        elif skip:
+            LOG.info("H3 Auto Director: 项目计划已设置不编码素材，跳过当前参考素材预编码")
+            return latent, [], []
+
+        # Partition references into static assets (reusable across segments) and dynamic ones (e.g. previous segment video)
+        static_refs = [r for r in (refs or []) if not (isinstance(r, dict) and r.get("type") == "previous_segment_video")]
+        dynamic_refs = [r for r in (refs or []) if isinstance(r, dict) and r.get("type") == "previous_segment_video"]
+
+        static_items, static_blocks = [], []
+        if static_refs:
+            cache_key = _reference_latent_cache_key(
+                vae, audio_vae, width, height, frame_count, ref_image_size, ref_short_edge, static_refs, plan
+            )
+            cached = _REFERENCE_LATENT_CACHE.get(cache_key)
+            if cached is not None:
+                static_items = _copy_ref_items(cached[0])
+                static_blocks = _copy_ref_blocks(cached[1])
+                _REFERENCE_LATENT_CACHE.move_to_end(cache_key)
+                LOG.info("H3 Auto Director: 命中统一参考素材潜空间缓存（跳过 VAE 重复编码，素材数=%d）", len(static_refs))
+            else:
+                static_items, static_blocks = cls._encode_references_payload(
+                    vae, audio_vae, width, height, frame_count, ref_image_size, static_refs,
+                    plan=plan, ref_short_edge=ref_short_edge
+                )
+                _REFERENCE_LATENT_CACHE[cache_key] = (
+                    _copy_ref_items(static_items),
+                    _copy_ref_blocks(static_blocks),
+                )
+                _REFERENCE_LATENT_CACHE.move_to_end(cache_key)
+                while len(_REFERENCE_LATENT_CACHE) > REFERENCE_LATENT_CACHE_MAX:
+                    _REFERENCE_LATENT_CACHE.popitem(last=False)
+
+        if not dynamic_refs:
+            return latent, static_items, static_blocks
+
+        # Dynamic references (such as previous segment video): encode only the dynamic portion
+        dyn_items, dyn_blocks = cls._encode_references_payload(
+            vae, audio_vae, width, height, frame_count, ref_image_size, dynamic_refs,
+            plan=plan, ref_short_edge=ref_short_edge
+        )
+        combined_items, combined_blocks = _canonical_combine_refs(static_items, static_blocks, dyn_items, dyn_blocks)
+        return latent, combined_items, combined_blocks
 
     @staticmethod
     def _encode_prepared_prompt(clip, prompt, latent, ref_items, ref_blocks):
