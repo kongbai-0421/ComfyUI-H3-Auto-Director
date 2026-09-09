@@ -2007,6 +2007,13 @@ app.registerExtension({
           if (values[10] === "覆盖已有文件" || values[10] === "true") {
             values[10] = false;
           }
+          if (typeof values[12] === "boolean") {
+            const keepVal = values.splice(12, 1)[0];
+            values[17] = keepVal;
+          }
+          if (typeof values[12] !== "string" || !values[12].trim().startsWith("[")) {
+            values[12] = "[]";
+          }
           if (values.length > 13 && (Number.isNaN(Number(values[13])) || typeof values[13] !== "number")) {
             values[13] = 0;
           }

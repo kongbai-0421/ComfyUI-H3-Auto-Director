@@ -2798,8 +2798,6 @@ class H3AutoDirectorPlan:
             "overwrite_existing": ("BOOLEAN", {"default": False, "label_on": "覆盖已有文件", "label_off": "不覆盖（子文件夹/文件自动编号）",
                 "tooltip": "关闭时若中间片段已有同名批次，自动创建递增编号子文件夹（如 _1, _2），读取时默认加载最大后缀的子文件夹；最终视频已有同名时在文件名后追加编号。"}),
             "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": True, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
-            "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "模型常驻显存", "label_off": "自动卸载模型",
-                "tooltip": "采样完成后保持模型在显存中常驻，避免片段切换时重复经历模型初始化的显存装载与 LoRA 补丁计算"}),
         }, "optional": {
             "global_assets_json": ("STRING", {"default": "[]", "multiline": True}),
             "auto_context_crop_frames": ("INT", {"default": 0, "min": 0, "max": 4096,
@@ -2808,6 +2806,8 @@ class H3AutoDirectorPlan:
                 "tooltip": "不编码参考素材（跳过素材的 VAE 潜空间预编码，大幅节省显存并提升速度）；若某素材设置了插入时间或帧，将自动强制开启编码以完成画面引导。"}),
             "enable_audio_drive": ("BOOLEAN", {"default": False, "tooltip": "启用音频驱动：自动根据片段秒数切分上传的音频并强制替换音频潜空间"}),
             "audio_drive_file": ("STRING", {"default": "", "tooltip": "音频驱动文件路径（支持 input/ 相对路径或绝对路径）"}),
+            "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "模型常驻显存", "label_off": "自动卸载模型",
+                "tooltip": "采样完成后保持模型在显存中常驻，避免片段切换时重复经历模型初始化的显存装载与 LoRA 补丁计算"}),
         }, "hidden": {"project_dir": "STRING"}}
 
     RETURN_TYPES = ("H3_AUTO_PLAN",)
@@ -2822,14 +2822,33 @@ class H3AutoDirectorPlan:
             output_filename = str(output_filename or "").strip()
         overwrite_existing = _bool_setting(overwrite_existing, False)
         try:
-            segments = json.loads(segments_json)
-            assets = json.loads(global_assets_json or "[]")
-        except json.JSONDecodeError as exc:
-            raise ValueError("segments_json/global_assets_json must be valid JSON: %s" % exc) from exc
+            segments = json.loads(segments_json) if isinstance(segments_json, str) else segments_json
+        except Exception as exc:
+            raise ValueError("segments_json 格式无效: %s" % exc) from exc
         if not isinstance(segments, list) or not segments:
             raise ValueError("At least one H3 segment is required")
-        if not isinstance(assets, list):
-            raise ValueError("global_assets_json must be a JSON list")
+
+        # Safely parse global_assets_json - resilient against non-list, dict, boolean, or corrupted inputs
+        assets = []
+        if isinstance(global_assets_json, list):
+            assets = global_assets_json
+        elif isinstance(global_assets_json, dict):
+            if "references" in global_assets_json and isinstance(global_assets_json["references"], list):
+                assets = global_assets_json["references"]
+            else:
+                assets = list(global_assets_json.values())
+        elif isinstance(global_assets_json, str) and global_assets_json.strip():
+            try:
+                parsed = json.loads(global_assets_json)
+                if isinstance(parsed, list):
+                    assets = parsed
+                elif isinstance(parsed, dict):
+                    if "references" in parsed and isinstance(parsed["references"], list):
+                        assets = parsed["references"]
+                    else:
+                        assets = list(parsed.values())
+            except Exception:
+                assets = []
         try:
             if isinstance(auto_context_crop_frames, (int, float, str)):
                 val = float(auto_context_crop_frames)
@@ -3106,11 +3125,11 @@ class H3AutoDirectorVideoTransferPlan:
             "output_filename": ("STRING", {"default": "", "tooltip": "中间片段与最终视频的统一输出文件名/批次名，不含扩展名；留空使用默认名称 H3。"}),
             "overwrite_existing": ("BOOLEAN", {"default": False, "label_on": "覆盖已有文件", "label_off": "不覆盖（子文件夹/文件自动编号）"}),
             "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": True, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
-            "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "模型常驻显存", "label_off": "自动卸载模型",
-                "tooltip": "采样完成后保持模型在显存中常驻，避免片段切换时重复经历模型初始化的显存装载与 LoRA 补丁计算"}),
         }, "optional": {
             "use_reference_video_material": ("BOOLEAN", {"default": True,
                 "tooltip": "开启：上传视频同时作为每段的 Video 参考素材；关闭：视频仅用于计算片段数和姿态/深度预处理。"}),
+            "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "模型常驻显存", "label_off": "自动卸载模型",
+                "tooltip": "采样完成后保持模型在显存中常驻，避免片段切换时重复经历模型初始化的显存装载与 LoRA 补丁计算"}),
         }, "hidden": {"project_dir": "STRING"}}
 
     RETURN_TYPES = ("H3_AUTO_PLAN",)
@@ -3131,10 +3150,23 @@ class H3AutoDirectorVideoTransferPlan:
             output_filename = str(output_filename or "").strip()
         overwrite_existing = _bool_setting(overwrite_existing, False)
         try:
-            video = json.loads(reference_video_json or "{}")
-            assets = json.loads(reference_assets_json or "[]")
-        except json.JSONDecodeError as exc:
-            raise ValueError("视频迁移素材 JSON 无效: %s" % exc) from exc
+            video = json.loads(reference_video_json or "{}") if isinstance(reference_video_json, str) else (reference_video_json or {})
+            if not isinstance(video, dict):
+                video = {}
+        except Exception:
+            video = {}
+        try:
+            if isinstance(reference_assets_json, list):
+                assets = reference_assets_json
+            elif isinstance(reference_assets_json, dict):
+                assets = list(reference_assets_json.values())
+            elif isinstance(reference_assets_json, str) and reference_assets_json.strip():
+                parsed = json.loads(reference_assets_json)
+                assets = parsed if isinstance(parsed, list) else (list(parsed.values()) if isinstance(parsed, dict) else [])
+            else:
+                assets = []
+        except Exception:
+            assets = []
         if not isinstance(video, dict) or not (video.get("path") or video.get("name")):
             raise ValueError("请在“编辑视频迁移素材”中上传一个参考视频")
         requested_video_name = video.get("path") or video.get("name")
