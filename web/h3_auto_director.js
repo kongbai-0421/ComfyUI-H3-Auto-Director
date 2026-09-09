@@ -449,6 +449,7 @@ function applyChineseLabels(node) {
     context_method: "上下文方案",
     enable_audio_drive: "启用音频驱动", audio_drive_file: "音频驱动文件",
     cache_prompt_embeddings: "一次性缓存提示词向量", cache_prompt_embeddings_to_disk: "缓存提示词向量到硬盘", global_assets_json: "统一参考素材",
+    keep_model_loaded: "模型常驻显存（防反复装卸）",
     segment_index: nodeClass === SEGMENT_NODE || nodeClass === CONTEXT_NODE || nodeClass === RESUME_NODE ? "上下文片段序号" : "片段序号",
     context_length: "上下文长度", prompt: "提示词", references_json: "参考素材 JSON",
     clip: "文本编码器", vae: "视频 VAE", audio_vae: "音频 VAE", width: "宽度", height: "高度", length: "帧数",
@@ -585,6 +586,7 @@ function decorateNode(node) {
     skip_reference_encoding: "不编码参考素材",
     cache_prompt_embeddings: "一次性缓存提示词向量",
     cache_prompt_embeddings_to_disk: "缓存提示词向量到硬盘",
+    keep_model_loaded: "模型常驻显存（防反复装卸）",
     global_assets_json: "统一参考素材",
     output_root: nodeClass === SAVE_NODE ? "输出文件名（中间片段，留空使用 H3）" : nodeClass === CONTROLLER_NODE ? "输出文件名（最终视频，留空使用 H3）" : "项目文件夹名称（保存于 output/h3_project 下）",
     output_filename: "统一输出文件名（留空使用 H3）",
@@ -893,7 +895,8 @@ function openTTSPlanEditor(node) {
   const concat = checkbox("拼接最终长音频", "concat_final_audio", true);
   const continuation = checkbox("开启音频上下文接续", "enable_audio_continuation", true);
   const cache = checkbox("一次性缓存提示词向量", "cache_prompt_embeddings", true);
-  const diskCache = checkbox("缓存提示词向量到硬盘（关闭一次性缓存时仅处理当前片段）", "cache_prompt_embeddings_to_disk", false);
+  const diskCache = checkbox("缓存提示词向量到硬盘（关闭一次性缓存时仅处理当前片段）", "cache_prompt_embeddings_to_disk", true);
+  const keepModel = checkbox("片段间模型常驻显存（防止反复装卸）", "keep_model_loaded", true);
   const list = document.createElement("div"); list.style.cssText = "display:flex;flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;flex-direction:column;gap:10px;padding:0 6px 10px 0"; panel.appendChild(list);
   const refName = (ref) => ref.originalName || ref.name || ref.path || "未命名素材";
   const refLabel = (ref, type, refs) => { const ordinal = refs.filter((x) => x.type === type).indexOf(ref) + 1; return `${type === "image" ? "图片" : type === "video" ? "视频" : "音频"}${ordinal}：${refName(ref)}`; };
@@ -954,7 +957,7 @@ function openTTSPlanEditor(node) {
   const editableOrNotice = (flag, index, fn, message) => { if (flag.checked && index > 0) { message.textContent = "统一参考集已开启，请编辑第 1 段或关闭统一参考集。"; return; } Promise.resolve(fn()).catch((error) => { message.textContent = error.message || String(error); }); };
   unified.onchange = render;
   const actions = document.createElement("div"); actions.style.cssText = "flex:0 0 auto;display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;min-width:0;margin:14px -18px -18px;padding:12px 18px;background:rgba(32,37,43,.98);border-top:1px solid #59636e";
-  actions.append(makeButton("+ 添加片段", () => { segments.push({ prompt: "", duration: 5, duration_mode: "seconds", audio_filename: "", audio_restart: false, continue_audio: continuation.checked, references: [], _media_references_open: false, _audio_references_open: true }); render(); }), makeButton("将第 1 段参考素材应用到全部", () => { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); unified.checked = true; render(); }), makeButton("取消", () => shade.remove()), makeButton("保存", () => { const names = new Set(); for (const seg of segments) { if (!segmentLengthValid(seg)) { notice.textContent = "每段时长最低 1 秒，或选择有效的 5 帧模式。"; return; } const name = String(seg.audio_filename || "").trim(); if (name && !name.toLowerCase().endsWith(".wav")) { notice.textContent = "音频文件名必须使用 .wav 扩展名。"; return; } if (name && names.has(name.toLowerCase())) { notice.textContent = `音频文件名重复：${name}`; return; } if (name) names.add(name.toLowerCase()); } if (unified.checked) { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); } const savedSegments = segments.map((seg) => { const copy = { ...seg }; delete copy._media_references_open; delete copy._audio_references_open; return copy; }); set("segments_json", JSON.stringify(savedSegments, null, 2)); set("global_reference_set", unified.checked); set("cache_prompt_embeddings", cache.checked); set("cache_prompt_embeddings_to_disk", diskCache.checked); set("enable_audio_continuation", continuation.checked); set("concat_final_audio", concat.checked); node.setDirtyCanvas(true, true); shade.remove(); }));
+  actions.append(makeButton("+ 添加片段", () => { segments.push({ prompt: "", duration: 5, duration_mode: "seconds", audio_filename: "", audio_restart: false, continue_audio: continuation.checked, references: [], _media_references_open: false, _audio_references_open: true }); render(); }), makeButton("将第 1 段参考素材应用到全部", () => { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); unified.checked = true; render(); }), makeButton("取消", () => shade.remove()), makeButton("保存", () => { const names = new Set(); for (const seg of segments) { if (!segmentLengthValid(seg)) { notice.textContent = "每段时长最低 1 秒，或选择有效的 5 帧模式。"; return; } const name = String(seg.audio_filename || "").trim(); if (name && !name.toLowerCase().endsWith(".wav")) { notice.textContent = "音频文件名必须使用 .wav 扩展名。"; return; } if (name && names.has(name.toLowerCase())) { notice.textContent = `音频文件名重复：${name}`; return; } if (name) names.add(name.toLowerCase()); } if (unified.checked) { const refs = (segments[0].references || []).map((ref) => ({ ...ref })); segments.forEach((seg) => { seg.references = refs.map((ref) => ({ ...ref })); }); } const savedSegments = segments.map((seg) => { const copy = { ...seg }; delete copy._media_references_open; delete copy._audio_references_open; return copy; }); set("segments_json", JSON.stringify(savedSegments, null, 2)); set("global_reference_set", unified.checked); set("cache_prompt_embeddings", cache.checked); set("cache_prompt_embeddings_to_disk", diskCache.checked); set("keep_model_loaded", keepModel.checked); set("enable_audio_continuation", continuation.checked); set("concat_final_audio", concat.checked); node.setDirtyCanvas(true, true); shade.remove(); }));
   panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade); render();
 }
 
@@ -1001,7 +1004,8 @@ function openTransferEditor(node) {
   const passAudio = checkbox("传递参考视频音频", "pass_reference_video_audio", false);
   const audioCont = checkbox("开启音频上下文接续", "enable_audio_continuation", true);
   const cachePrompts = checkbox("一次性缓存全部片段的提示词向量", "cache_prompt_embeddings", true);
-  const diskCachePrompts = checkbox("缓存提示词向量到硬盘（关闭一次性缓存时仅处理当前片段）", "cache_prompt_embeddings_to_disk", false);
+  const diskCachePrompts = checkbox("缓存提示词向量到硬盘（关闭一次性缓存时仅处理当前片段）", "cache_prompt_embeddings_to_disk", true);
+  const keepModel = checkbox("片段间模型常驻显存（防止反复装卸）", "keep_model_loaded", true);
   const autoRun = checkbox("自动连续生成并在最后拼接", "auto_run", true);
   const skipDecode = checkbox("仅不解码 H3 音频（仍联合采样）", "skip_h3_audio_decode", false);
   const audioMode = document.createElement("select"); audioMode.innerHTML = "<option>H3 生成音频</option><option>参考视频音频</option>"; audioMode.value = get("final_audio_source", "H3 生成音频"); row("最终视频音频来源", audioMode);
@@ -1103,7 +1107,7 @@ function openTransferEditor(node) {
   const actions = document.createElement("div"); actions.style.cssText = "display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;min-width:0;margin-top:16px";
   actions.append(makeButton("取消", () => shade.remove()), makeButton("保存", () => {
     if (!video.path) { notice.textContent = "请先上传参考视频。"; return; }
-    set("prompt", prompt.value); set("segment_seconds", Number(seconds.value) || 5); set("segment_length_mode", lengthMode.value === "frames" ? "5帧" : "秒数"); set("use_reference_video_material", useVideoMaterial.checked); set("pass_reference_video_audio", passAudio.checked); set("enable_audio_continuation", audioCont.checked); set("cache_prompt_embeddings", cachePrompts.checked); set("cache_prompt_embeddings_to_disk", diskCachePrompts.checked); set("auto_run", autoRun.checked); set("skip_h3_audio_decode", skipDecode.checked); set("final_audio_source", audioMode.value); set("audio_restart_segments", restart.value); set("previous_video_reference_segments", previous.value); set("reference_video_json", JSON.stringify(video, null, 2)); set("reference_assets_json", JSON.stringify(assets, null, 2)); syncSerializedWidgets(node); node.setDirtyCanvas(true, true); node.graph?.setDirtyCanvas?.(true, true); shade.remove();
+    set("prompt", prompt.value); set("segment_seconds", Number(seconds.value) || 5); set("segment_length_mode", lengthMode.value === "frames" ? "5帧" : "秒数"); set("use_reference_video_material", useVideoMaterial.checked); set("pass_reference_video_audio", passAudio.checked); set("enable_audio_continuation", audioCont.checked); set("cache_prompt_embeddings", cachePrompts.checked); set("cache_prompt_embeddings_to_disk", diskCachePrompts.checked); set("keep_model_loaded", keepModel.checked); set("auto_run", autoRun.checked); set("skip_h3_audio_decode", skipDecode.checked); set("final_audio_source", audioMode.value); set("audio_restart_segments", restart.value); set("previous_video_reference_segments", previous.value); set("reference_video_json", JSON.stringify(video, null, 2)); set("reference_assets_json", JSON.stringify(assets, null, 2)); syncSerializedWidgets(node); node.setDirtyCanvas(true, true); node.graph?.setDirtyCanvas?.(true, true); shade.remove();
   }));
   panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade); renderAssets(); renderVideoCard(); refreshSummary();
 }
@@ -1480,6 +1484,13 @@ function openEditor(node) {
   skipRefToggle.title = "不使用 VAE 预编码参考素材（跳过图像/视频/音频参考编码，加速且省显存）；若某素材设置了插入时间或帧，将自动强制开启素材编码以完成画面插入。";
   skipRefPanel.append(skipRefToggle, "不编码参考素材（纯文本加速；若素材设置了插入时间则自动强制编码）");
   panel.appendChild(skipRefPanel);
+
+  const keepModelPanel = document.createElement("label"); keepModelPanel.style.cssText = "display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;padding:8px 10px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px;font-size:12px;line-height:1.45;min-width:0";
+  const keepModelWidget = widget(node, "keep_model_loaded");
+  const keepModelToggle = document.createElement("input"); keepModelToggle.type = "checkbox"; keepModelToggle.checked = keepModelWidget ? !!keepModelWidget.value : true;
+  keepModelToggle.title = "在多片段连续采样过程中将扩散模型保持在显存中，避免每个片段结束时被卸载和垃圾回收导致下一片段重新加载。";
+  keepModelPanel.append(keepModelToggle, "片段间模型常驻显存（防止反复装卸加速生成）");
+  panel.appendChild(keepModelPanel);
 
   // Audio Drive Panel
   const audioDriveWidget = widget(node, "enable_audio_drive");
@@ -1916,6 +1927,10 @@ function openEditor(node) {
       if (skipRefWidget) {
         skipRefWidget.value = skipRefToggle.checked;
         skipRefWidget.callback?.(skipRefToggle.checked);
+      }
+      if (keepModelWidget) {
+        keepModelWidget.value = keepModelToggle.checked;
+        keepModelWidget.callback?.(keepModelToggle.checked);
       }
       if (audioDriveWidget) {
         audioDriveWidget.value = audioDriveToggle.checked;

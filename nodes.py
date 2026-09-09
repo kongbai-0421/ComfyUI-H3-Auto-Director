@@ -161,6 +161,8 @@ PROMPT_DISK_CACHE_SCHEMA = 1
 _PROMPT_CONDITIONING_CACHE = OrderedDict()
 REFERENCE_LATENT_CACHE_MAX = 4
 _REFERENCE_LATENT_CACHE = OrderedDict()
+_RESIDENT_SAMPLING_MODELS = []
+_KEEP_MODEL_LOADED_ACTIVE = True
 MAX_REFERENCE_IMAGES = 9
 MAX_REFERENCE_VIDEOS = 3
 MAX_REFERENCE_AUDIOS = 3
@@ -260,18 +262,19 @@ def _find_ffprobe():
 
 
 def _release_video_memory():
-    """Release temporary Python/CUDA allocations between video chunks."""
+    """Release temporary Python allocations between video chunks without evicting resident model weights."""
     gc.collect()
-    try:
-        model_management.soft_empty_cache()
-    except Exception:
-        pass
-    if torch.cuda.is_available():
+    if not _KEEP_MODEL_LOADED_ACTIVE:
         try:
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+            model_management.soft_empty_cache()
         except Exception:
             pass
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
 
 
 def _safe_project_dir(project_id: str, root: str = "h3_projects") -> Path:
@@ -1258,7 +1261,8 @@ def _without_auto_director_audio_context(conditioning):
 def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, denoise, seed,
                  enable_preview=False, sigmas=None, extend_sigmas=False,
                  extend_steps=2, extend_start_at_sigma=-1.0,
-                 extend_end_at_sigma=12.0, extend_spacing="linear"):
+                 extend_end_at_sigma=12.0, extend_spacing="linear",
+                 keep_model_loaded=True):
     """Run one positive-only H3 sampling pass, matching BasicGuider semantics."""
     conditioning = _conditioning_entries(conditioning)
     if not _has_positive_conditioning(conditioning):
@@ -1340,12 +1344,14 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
                                       seed=int(seed))
     result = dict(latent)
     result["samples"] = samples
-    # Keep the layout-refreshed model clone alive until the caller consumes the
-    # result.  Without this reference the clone is GC'd as soon as _dual_sample
-    # returns, and ComfyUI's cleanup_models_gc misidentifies the still-shared
-    # underlying nn.Module as a memory leak (the LoadedModel weakref dies while
-    # the real model weights remain alive for the next stage / VAE decode).
     result["_h3_sampling_model_ref"] = model
+    if bool(keep_model_loaded):
+        global _KEEP_MODEL_LOADED_ACTIVE, _RESIDENT_SAMPLING_MODELS
+        _KEEP_MODEL_LOADED_ACTIVE = True
+        if model not in _RESIDENT_SAMPLING_MODELS:
+            _RESIDENT_SAMPLING_MODELS.append(model)
+            while len(_RESIDENT_SAMPLING_MODELS) > 4:
+                _RESIDENT_SAMPLING_MODELS.pop(0)
     return result
 
 
@@ -2414,8 +2420,10 @@ class H3AutoDirectorDualSampling:
             "stage2_start_at_sigma": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 20000.0, "step": 0.01, "round": False}),
             "stage2_end_at_sigma": ("FLOAT", {"default": 12.0, "min": 0.0, "max": 20000.0, "step": 0.01, "round": False}),
             "stage2_spacing": (["linear", "cosine", "sine"], {"default": "linear"}),
+            "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "模型常驻显存", "label_off": "自动卸载模型",
+                                  "tooltip": "采样完成后保持模型在显存中常驻，避免片段切换时重复经历模型初始化的显存装载与 LoRA 补丁计算"}),
         }, "optional": {
-            "plan": ("H3_AUTO_PLAN", {"tooltip": "可选。连接项目计划后，开启统一解码时会在所有片段采样完成前禁止任何视频/音频解码。"}),
+            "plan": ("H3_AUTO_PLAN", {"tooltip": "可选。连接项目计划后，开启统一解码时会在所有片段采样完成前禁止任何视频/音频解码；同时自动继承模型常驻显存设置。"}),
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
             "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’的采样调度信息；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
@@ -2441,8 +2449,10 @@ class H3AutoDirectorDualSampling:
                stage1_extend_sigmas=False, stage1_extend_steps=2, stage1_start_at_sigma=-1.0,
                stage1_end_at_sigma=12.0, stage1_spacing="linear", stage2_extend_sigmas=False,
                stage2_extend_steps=2, stage2_start_at_sigma=-1.0, stage2_end_at_sigma=12.0,
-               stage2_spacing="linear", control_config=None, plan=None, **_legacy_unused):
+               stage2_spacing="linear", keep_model_loaded=True, control_config=None, plan=None, **_legacy_unused):
         global _LAST_STAGE1_CONTEXT
+        if isinstance(plan, dict) and "keep_model_loaded" in plan:
+            keep_model_loaded = bool(plan["keep_model_loaded"])
         deferred_decode = bool(isinstance(plan, dict) and plan.get("decode_after_all_segments", False))
         if stage1_model is None:
             stage1_model = _legacy_unused.get("model")
@@ -2474,7 +2484,7 @@ class H3AutoDirectorDualSampling:
         first = _dual_sample(first_model, stage1_conditioning, latent, sampler_name, scheduler,
                              stage1_steps, stage1_denoise, seed, enable_preview, stage1_sigmas,
                              stage1_extend_sigmas, stage1_extend_steps, stage1_start_at_sigma,
-                             stage1_end_at_sigma, stage1_spacing)
+                             stage1_end_at_sigma, stage1_spacing, keep_model_loaded=keep_model_loaded)
         # SaveSegment consumes this immediately after the sampler.  Keeping it
         # here preserves compatibility with existing graphs that do not expose
         # the optional first-stage latent socket.
@@ -2636,7 +2646,8 @@ class H3AutoDirectorDualSampling:
         final = _dual_sample(second_model, final_conditioning, refined, sampler_name, scheduler,
                              stage2_steps, stage2_denoise, int(seed) + 1, enable_preview,
                              effective_stage2_sigmas, stage2_extend_sigmas, stage2_extend_steps,
-                             stage2_start_at_sigma, stage2_end_at_sigma, stage2_spacing)
+                             stage2_start_at_sigma, stage2_end_at_sigma, stage2_spacing,
+                             keep_model_loaded=keep_model_loaded)
         if bool(use_stage1_audio_only):
             final_parts = _av_latent_parts(final)
             if final_parts is None:
@@ -2700,7 +2711,10 @@ class H3AutoDirectorDualSamplingModel:
             "stage2_start_at_sigma": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 20000.0, "step": 0.01, "round": False}),
             "stage2_end_at_sigma": ("FLOAT", {"default": 12.0, "min": 0.0, "max": 20000.0, "step": 0.01, "round": False}),
             "stage2_spacing": (["linear", "cosine", "sine"], {"default": "linear"}),
+            "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "模型常驻显存", "label_off": "自动卸载模型",
+                                  "tooltip": "采样完成后保持模型在显存中常驻，避免片段切换时重复经历模型初始化的显存装载与 LoRA 补丁计算"}),
         }, "optional": {
+            "plan": ("H3_AUTO_PLAN", {"tooltip": "可选。连接项目计划以自动继承模型常驻与统一解码等全局设置。"}),
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
             "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’的采样调度信息；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
@@ -2727,9 +2741,9 @@ class H3AutoDirectorDualSamplingModel:
                stage1_extend_sigmas=False, stage1_extend_steps=2, stage1_start_at_sigma=-1.0,
                stage1_end_at_sigma=12.0, stage1_spacing="linear", stage2_extend_sigmas=False,
                stage2_extend_steps=2, stage2_start_at_sigma=-1.0, stage2_end_at_sigma=12.0,
-               stage2_spacing="linear", control_config=None, **_legacy_unused):
+               stage2_spacing="linear", keep_model_loaded=True, control_config=None, plan=None, **_legacy_unused):
         return H3AutoDirectorDualSampling().sample(
-        stage1_model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
+            stage1_model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
             stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
             target_width, target_height, enable_stage2, stage2_use_context, upscale_model, seed,
             stage2_conditioning, stage2_context_latent, use_stage1_audio_only,
@@ -2737,7 +2751,8 @@ class H3AutoDirectorDualSamplingModel:
             latent_upscale_precision, stage2_model, audio_sampling, stage1_sigmas, stage2_sigmas,
             stage1_extend_sigmas, stage1_extend_steps, stage1_start_at_sigma, stage1_end_at_sigma,
             stage1_spacing, stage2_extend_sigmas, stage2_extend_steps, stage2_start_at_sigma,
-            stage2_end_at_sigma, stage2_spacing, control_config=control_config)
+            stage2_end_at_sigma, stage2_spacing, keep_model_loaded=keep_model_loaded,
+            control_config=control_config, plan=plan)
 
 
 def _validate_reference_limits(refs, label="参考素材"):
@@ -2775,14 +2790,16 @@ class H3AutoDirectorPlan:
             "global_reference_set": ("BOOLEAN", {"default": True}),
             "auto_run": ("BOOLEAN", {"default": True}),
             "continuation_mode": ("BOOLEAN", {"default": True, "tooltip": "默认允许后续片段使用视频上下文；每段可单独关闭"}),
-            "cache_prompt_embeddings": ("BOOLEAN", {"default": False, "tooltip": "首次执行时一次性编码并缓存全部片段的多模态提示词向量"}),
+            "cache_prompt_embeddings": ("BOOLEAN", {"default": True, "tooltip": "首次执行时一次性编码并缓存全部片段的多模态提示词向量"}),
             "decode_after_all_segments": ("BOOLEAN", {"default": False,
                 "tooltip": "开启后先缓存每段最终 AV latent，全部采样完成后统一解码、裁剪并拼接；视频上下文会自动改为缓存潜空间直取。"}),
             "output_root": ("STRING", {"default": "h3_projects", "tooltip": "项目文件夹名称；新路径为 output/h3_project/<此名称>"}),
             "output_filename": ("STRING", {"default": "", "tooltip": "中间片段与最终视频的统一基础文件名/批次名，不含扩展名；留空使用默认名称 H3。"}),
             "overwrite_existing": ("BOOLEAN", {"default": False, "label_on": "覆盖已有文件", "label_off": "不覆盖（子文件夹/文件自动编号）",
                 "tooltip": "关闭时若中间片段已有同名批次，自动创建递增编号子文件夹（如 _1, _2），读取时默认加载最大后缀的子文件夹；最终视频已有同名时在文件名后追加编号。"}),
-            "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": False, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
+            "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": True, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
+            "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "模型常驻显存", "label_off": "自动卸载模型",
+                "tooltip": "采样完成后保持模型在显存中常驻，避免片段切换时重复经历模型初始化的显存装载与 LoRA 补丁计算"}),
         }, "optional": {
             "global_assets_json": ("STRING", {"default": "[]", "multiline": True}),
             "auto_context_crop_frames": ("INT", {"default": 0, "min": 0, "max": 4096,
@@ -2798,7 +2815,7 @@ class H3AutoDirectorPlan:
     FUNCTION = "create"
     CATEGORY = "H3 自动导演"
 
-    def create(self, project_id, segments_json, duration, global_reference_set, auto_run, continuation_mode=True, cache_prompt_embeddings=False, decode_after_all_segments=False, output_root="h3_projects", output_filename="", overwrite_existing=False, cache_prompt_embeddings_to_disk=False, global_assets_json="[]", auto_context_crop_frames=0, skip_reference_encoding=False, enable_audio_drive=False, audio_drive_file="", project_dir="", **_legacy_inputs):
+    def create(self, project_id, segments_json, duration, global_reference_set, auto_run, continuation_mode=True, cache_prompt_embeddings=True, decode_after_all_segments=False, output_root="h3_projects", output_filename="", overwrite_existing=False, cache_prompt_embeddings_to_disk=True, global_assets_json="[]", auto_context_crop_frames=0, skip_reference_encoding=False, enable_audio_drive=False, audio_drive_file="", keep_model_loaded=True, project_dir="", **_legacy_inputs):
         if isinstance(output_filename, bool):
             output_filename = ""
         else:
@@ -2889,6 +2906,7 @@ class H3AutoDirectorPlan:
                 "cache_prompt_embeddings": bool(cache_prompt_embeddings),
                 "decode_after_all_segments": bool(decode_after_all_segments),
                 "cache_prompt_embeddings_to_disk": bool(cache_prompt_embeddings_to_disk),
+                "keep_model_loaded": bool(keep_model_loaded),
                 "auto_context_crop_frames": int(auto_context_crop_frames),
                 "skip_reference_encoding": _bool_setting(skip_reference_encoding, False),
                 "enable_audio_drive": bool(enable_audio_drive),
@@ -2926,7 +2944,8 @@ class H3AutoDirectorTTSPlan:
             "output_filename": ("STRING", {"default": "", "tooltip": "统一基础文件名/批次名，不含扩展名；留空使用默认名称 H3。"}),
             "overwrite_existing": ("BOOLEAN", {"default": False, "label_on": "覆盖已有文件", "label_off": "不覆盖（自动递增编号）"}),
             "global_reference_set": ("BOOLEAN", {"default": False, "tooltip": "开启后所有片段使用第 1 段的图片、视频和音频参考素材"}),
-            "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": False, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
+            "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": True, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
+            "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": "在多片段连续采样过程中将扩散模型保持在显存中，避免每个片段结束时被卸载和垃圾回收导致下一片段重新加载"}),
         }, "hidden": {
             "project_dir": "STRING",
             # Legacy fields are accepted by create() when loading old plans,
@@ -2943,7 +2962,8 @@ class H3AutoDirectorTTSPlan:
     def create(self, project_id, segments_json, auto_run=True, cache_prompt_embeddings=True,
                enable_audio_continuation=True, concat_final_audio=True,
                output_root="h3_tts_project", output_filename="", overwrite_existing=False,
-               global_reference_set=False, cache_prompt_embeddings_to_disk=False,
+               global_reference_set=False, cache_prompt_embeddings_to_disk=True,
+               keep_model_loaded=True,
                project_dir="", reference_video_json="{}", reference_assets_json="[]",
                pass_reference_video_audio=False, audio_restart_segments="", **_legacy_inputs):
         if isinstance(output_filename, bool):
@@ -3044,6 +3064,7 @@ class H3AutoDirectorTTSPlan:
             "auto_run": bool(auto_run), "continuation_mode": bool(enable_audio_continuation),
             "video_continuation": False, "cache_prompt_embeddings": bool(cache_prompt_embeddings),
             "cache_prompt_embeddings_to_disk": bool(cache_prompt_embeddings_to_disk),
+            "keep_model_loaded": bool(keep_model_loaded),
             "segments": normalized, "project_dir": str(directory),
             "concat_final_audio": bool(concat_final_audio),
             "reference_video": reference_video,
@@ -3084,7 +3105,9 @@ class H3AutoDirectorVideoTransferPlan:
             "output_root": ("STRING", {"default": "h3_video_transfer"}),
             "output_filename": ("STRING", {"default": "", "tooltip": "中间片段与最终视频的统一输出文件名/批次名，不含扩展名；留空使用默认名称 H3。"}),
             "overwrite_existing": ("BOOLEAN", {"default": False, "label_on": "覆盖已有文件", "label_off": "不覆盖（子文件夹/文件自动编号）"}),
-            "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": False, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
+            "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": True, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
+            "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "模型常驻显存", "label_off": "自动卸载模型",
+                "tooltip": "采样完成后保持模型在显存中常驻，避免片段切换时重复经历模型初始化的显存装载与 LoRA 补丁计算"}),
         }, "optional": {
             "use_reference_video_material": ("BOOLEAN", {"default": True,
                 "tooltip": "开启：上传视频同时作为每段的 Video 参考素材；关闭：视频仅用于计算片段数和姿态/深度预处理。"}),
@@ -3101,7 +3124,7 @@ class H3AutoDirectorVideoTransferPlan:
                previous_video_reference_segments="", cache_prompt_embeddings=True,
                skip_h3_audio_decode=False, final_audio_source="H3 生成音频",
                auto_run=True, output_root="h3_video_transfer", output_filename="", overwrite_existing=False,
-               cache_prompt_embeddings_to_disk=False, project_dir=""):
+               cache_prompt_embeddings_to_disk=True, keep_model_loaded=True, project_dir=""):
         if isinstance(output_filename, bool):
             output_filename = ""
         else:
@@ -3233,6 +3256,7 @@ class H3AutoDirectorVideoTransferPlan:
             "video_continuation": True,
             "cache_prompt_embeddings": bool(cache_prompt_embeddings),
             "cache_prompt_embeddings_to_disk": bool(cache_prompt_embeddings_to_disk),
+            "keep_model_loaded": bool(keep_model_loaded),
             "skip_h3_audio_decode": bool(skip_h3_audio_decode),
             "final_audio_source": str(final_audio_source),
             "reference_video": dict(video), "segments": normalized,
@@ -5507,11 +5531,13 @@ def _prompt_cache_key(plan, clip, vae, audio_vae, width, height, ref_image_size,
                       ref_short_edge=2048):
     # The seed belongs to RandomNoise/sampling downstream.  It is deliberately
     # absent here so changing the seed reuses the deterministic H3 conditioning.
-    plan_data = {k: plan.get(k) for k in ("project_id", "global_reference_set", "global_assets", "segments", "continuation_mode", "skip_reference_encoding")}
+    plan_data = {k: plan.get(k) for k in ("project_id", "project_dir", "global_reference_set", "global_assets", "segments", "continuation_mode", "skip_reference_encoding")}
     mode = str(ref_image_size or "match").lower()
     width, height = _h3_canvas_dimensions(width, height)
     resolution = (int(width), int(height)) if mode not in {"manual", "max"} else None
-    return (id(clip), id(vae), id(audio_vae), resolution, mode,
+    model_digest = _stable_digest(_cache_model_identity(clip, vae, audio_vae))
+    project_key = str(plan.get("project_dir") or plan.get("project_id") or "h3_project")
+    return (project_key, model_digest, resolution, mode,
             int(context_length), _nearest_multiple(ref_short_edge),
             json.dumps(plan_data, ensure_ascii=False, sort_keys=True, default=str))
 
@@ -5536,9 +5562,9 @@ def _reference_latent_cache_key(vae, audio_vae, width, height, frame_count, ref_
     markers = [_reference_file_marker(plan, r) for r in (refs or [])]
     markers_digest = _stable_digest(markers)
     skip = bool(plan.get("skip_reference_encoding", False)) if isinstance(plan, dict) else False
+    vae_digest = _stable_digest(_cache_model_identity(vae, audio_vae))
     return (
-        id(vae),
-        id(audio_vae),
+        vae_digest,
         resolution,
         ref_mode,
         _nearest_multiple(ref_short_edge) if ref_mode == "manual" else None,
@@ -6135,7 +6161,13 @@ class H3AutoDirectorCachedReferenceToVideo:
             LOG.info("H3 Auto Director: %d 段等待上片段视频生成，暂不卸载文本编码器；生成后按段补齐向量", len(pending))
         else:
             model_management.unload_model_and_clones(clip.patcher, unload_additional_models=False, all_devices=True)
-            LOG.info("H3 Auto Director: 全部文本向量缓存完成，已卸载文本编码器")
+            gc.collect()
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            LOG.info("H3 Auto Director: 全部文本向量缓存完成，已卸载文本编码器并释放显存")
         return cache
 
     @classmethod
@@ -6246,6 +6278,33 @@ class H3AutoDirectorCachedReferenceToVideo:
         key = _prompt_cache_key(plan, clip, vae, audio_vae, width, height,
                                 effective_ref_mode, context_length, ref_short_edge)
         cache = _PROMPT_CONDITIONING_CACHE.get(key)
+        if cache is not None and generation_index in cache:
+            LOG.info("H3 Auto Director: 内存缓存命中（第 %d 段），跳过文本编码器装载", generation_index)
+            res = _refresh_cached_conditioning_latent(cache[generation_index], width, height, length)
+            return _apply_audio_drive_if_enabled(plan, generation_index, audio_vae, length, res, context_length=context_length)
+
+        if disk_enabled:
+            model_identity = _cache_model_identity(clip, vae, audio_vae)
+            fingerprint, details = _prompt_disk_fingerprint(
+                plan, generation_index, width, height, effective_ref_mode,
+                context_length, ref_short_edge, model_identity)
+            manifest = _load_prompt_disk_manifest(plan)
+            entry = (manifest.get("segments") or {}).get(str(generation_index), {})
+            cache_root, _ = _prompt_disk_paths(plan)
+            cache_file = cache_root / str(entry.get("file", ""))
+            if entry.get("fingerprint") == fingerprint and cache_file.is_file():
+                try:
+                    loaded_seg = _load_torch_cache(cache_file)
+                    LOG.info("H3 Auto Director: 磁盘缓存命中（第 %d 段），跳过文本编码器装载", generation_index)
+                    if cache is None:
+                        cache = {}
+                        _PROMPT_CONDITIONING_CACHE[key] = cache
+                    cache[generation_index] = loaded_seg
+                    res = _refresh_cached_conditioning_latent(loaded_seg, width, height, length)
+                    return _apply_audio_drive_if_enabled(plan, generation_index, audio_vae, length, res, context_length=context_length)
+                except Exception as exc:
+                    LOG.warning("H3 Auto Director: 第 %d 段磁盘向量读取失败，将重新构建缓存：%s", generation_index, exc)
+
         if cache is None:
             cache = cls._build_cache(plan, clip, vae, audio_vae, width, height, ref_image_size, context_length,
                                      use_manual_ref_short_edge=manual_enabled,
@@ -7326,10 +7385,11 @@ def _quality_args(codec, device, quality):
     return ["-crf", ("18", "22", "28", "36")[rank], "-cpu-used", str(min(rank, 3))]
 
 
-def _run_ffmpeg_raw(ffmpeg, output, arr, fps, video_format, codec, encoder, device, quality):
-    if arr.ndim != 4 or arr.shape[0] < 1 or arr.shape[-1] < 3:
-        raise ValueError("保存视频需要 [帧,高,宽,RGB] 图像序列，实际形状：%s" % (tuple(arr.shape),))
-    h, w = int(arr.shape[1]), int(arr.shape[2])
+def _stream_ffmpeg_raw(ffmpeg, output, images, fps, video_format, codec, encoder, device, quality, chunk_size=16):
+    if not torch.is_tensor(images) or images.ndim != 4 or images.shape[0] < 1 or images.shape[-1] < 3:
+        raise ValueError("保存视频需要 [帧,高,宽,RGB] 图像序列，实际形状：%s" % (tuple(images.shape) if torch.is_tensor(images) else type(images)))
+    total_frames = int(images.shape[0])
+    h, w = int(images.shape[1]), int(images.shape[2])
     muxer = VIDEO_FORMATS.get(video_format, "mp4")
     command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
@@ -7339,15 +7399,52 @@ def _run_ffmpeg_raw(ffmpeg, output, arr, fps, video_format, codec, encoder, devi
     if muxer in {"mp4", "mov"}:
         command.extend(["-movflags", "+faststart"])
     command.extend(["-f", muxer, str(output)])
+
+    proc = None
+    stderr_bytes = b""
     try:
-        result = subprocess.run(command, input=arr.tobytes(), capture_output=True, timeout=180)
-    except (OSError, subprocess.SubprocessError) as exc:
+        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        for start_idx in range(0, total_frames, chunk_size):
+            chunk = images[start_idx:start_idx + chunk_size]
+            if chunk.is_cuda:
+                chunk_u8 = chunk.detach().clamp(0, 1).mul(255).to(dtype=torch.uint8)[..., :3].cpu().contiguous()
+            else:
+                chunk_u8 = chunk.detach().clamp(0, 1).mul(255).to(dtype=torch.uint8)[..., :3].contiguous()
+            chunk_bytes = chunk_u8.numpy().tobytes()
+            del chunk, chunk_u8
+            try:
+                proc.stdin.write(chunk_bytes)
+            except (BrokenPipeError, OSError):
+                break
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
+        except Exception:
+            pass
+        stderr_bytes = proc.stderr.read()
+        proc.wait(timeout=180)
+    except Exception as exc:
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         output.unlink(missing_ok=True)
         raise RuntimeError(str(exc)) from exc
-    if result.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
-        detail = (result.stderr or b"").decode(errors="replace")[-1200:]
+
+    if proc.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
+        detail = (stderr_bytes or b"").decode(errors="replace")[-1200:]
         output.unlink(missing_ok=True)
-        raise RuntimeError(detail or f"ffmpeg encoder {encoder} failed")
+        raise RuntimeError(detail or f"ffmpeg encoder {encoder} failed (code {proc.returncode})")
+
+
+def _run_ffmpeg_raw(ffmpeg, output, arr, fps, video_format, codec, encoder, device, quality):
+    """Backwards compatibility wrapper that converts a numpy array into a torch tensor and streams it."""
+    if not torch.is_tensor(arr):
+        tensor_images = torch.from_numpy(arr).float() / 255.0
+    else:
+        tensor_images = arr
+    return _stream_ffmpeg_raw(ffmpeg, output, tensor_images, fps, video_format, codec, encoder, device, quality)
 
 
 def _verify_video_stream(path: Path):
@@ -7372,7 +7469,7 @@ def _verify_video_stream(path: Path):
 
 
 def _encode_video_with_fallback(path: Path, images, fps, video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量"):
-    """Encode once per candidate, with a finite GPU-to-CPU fallback."""
+    """Encode once per candidate using chunk-by-chunk streaming, with a finite GPU-to-CPU fallback."""
     ffmpeg = _find_ffmpeg()
     if not ffmpeg:
         raise RuntimeError("未找到 ffmpeg，无法保存视频。请重启 ComfyUI，或设置环境变量 FFMPEG_PATH 指向 ffmpeg.exe。")
@@ -7383,7 +7480,6 @@ def _encode_video_with_fallback(path: Path, images, fps, video_format="mp4", vid
     if codec not in VIDEO_CODECS:
         codec = "h264"
     device = "gpu" if str(encoder_device or "CPU").upper() == "GPU" else "cpu"
-    arr = images.detach().cpu().clamp(0, 1).mul(255).byte().numpy()[..., :3]
     advertised = _ffmpeg_encoders(ffmpeg)
     candidates = []
     if device == "gpu":
@@ -7396,7 +7492,7 @@ def _encode_video_with_fallback(path: Path, images, fps, video_format="mp4", vid
     for encoder in unique:
         path.unlink(missing_ok=True)
         try:
-            _run_ffmpeg_raw(ffmpeg, path, arr, fps, fmt, codec, encoder, device if encoder != VIDEO_CODECS[codec]["cpu"] else "cpu", quality)
+            _stream_ffmpeg_raw(ffmpeg, path, images, fps, fmt, codec, encoder, device if encoder != VIDEO_CODECS[codec]["cpu"] else "cpu", quality)
             return encoder
         except RuntimeError as exc:
             errors.append(f"{encoder}: {exc}")
@@ -7408,6 +7504,24 @@ def _encode_concat_with_fallback(ffmpeg, list_path, output, video_format, video_
     fmt = str(video_format or "mp4").lower().lstrip(".")
     codec = str(video_codec or "h264").lower()
     device = "gpu" if str(encoder_device or "CPU").upper() == "GPU" else "cpu"
+
+    # Fast path: try stream copy first (0 CPU/GPU load and 0 extra memory allocation)
+    if fmt != "webm":
+        output.unlink(missing_ok=True)
+        copy_cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+                    "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy"]
+        if fmt in {"mp4", "mov"}:
+            copy_cmd.extend(["-movflags", "+faststart"])
+        copy_cmd.extend(["-f", VIDEO_FORMATS.get(fmt, "mp4"), str(output)])
+        try:
+            res = subprocess.run(copy_cmd, capture_output=True, text=True, timeout=120)
+            if res.returncode == 0 and output.is_file() and output.stat().st_size > 0:
+                LOG.info("H3 Auto Director: 最终视频已通过流拷贝（Stream Copy -c copy）极速无损拼接完成")
+                return "copy"
+        except Exception:
+            pass
+        output.unlink(missing_ok=True)
+
     advertised = _ffmpeg_encoders(ffmpeg)
     candidates = []
     if device == "gpu":
@@ -7784,6 +7898,12 @@ class H3AutoDirectorController:
     @staticmethod
     def _cleanup_after_final():
         """Release model and CUDA allocations only after final output is durable."""
+        global _KEEP_MODEL_LOADED_ACTIVE, _RESIDENT_SAMPLING_MODELS
+        try:
+            _RESIDENT_SAMPLING_MODELS.clear()
+            _KEEP_MODEL_LOADED_ACTIVE = False
+        except Exception:
+            pass
         try:
             model_management.unload_all_models()
         except Exception:

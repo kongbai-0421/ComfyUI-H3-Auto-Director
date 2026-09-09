@@ -282,6 +282,22 @@ def _new_model_sampling(model, sampling_type, shift_video, shift_audio):
 def apply_h3_sampling(model, mode, shift_video, shift_audio):
     """Clone and patch an H3 model for either native or legacy sampling."""
     mode = _MODE_ALIASES.get(str(mode), str(mode))
+
+    # Fast path: check if model already has the target wrapper and identical shift settings
+    wrapper_type = getattr(getattr(comfy, "patcher_extension", None), "WrappersMP", None)
+    if wrapper_type is not None:
+        target_key = NATIVE_LAYOUT_PATCH_KEY if mode == NATIVE_MODE else PATCH_KEY
+        wrappers = getattr(model, "wrappers", None)
+        if isinstance(wrappers, dict):
+            type_wraps = wrappers.get(wrapper_type.DIFFUSION_MODEL, {})
+            if isinstance(type_wraps, dict) and target_key in type_wraps and type_wraps[target_key]:
+                t_opts = (getattr(model, "model_options", None) or {}).get("transformer_options", {})
+                if (
+                    t_opts.get("minimax_h3_sigma_shift_video") == float(shift_video)
+                    and t_opts.get("minimax_h3_sigma_shift_audio") == float(shift_audio)
+                ):
+                    return model
+
     patched = model.clone()
     diffusion_model = patched.get_model_object("diffusion_model")
     if not _is_h3_model(diffusion_model):
@@ -348,6 +364,15 @@ def ensure_h3_layout_refresh(model):
         return model
     if not _is_h3_model(diffusion_model):
         return model
+
+    # If the layout refresh wrapper is already present on the model, avoid a redundant clone
+    wrapper_type = comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL
+    wrappers = getattr(model, "wrappers", None)
+    if isinstance(wrappers, dict):
+        type_wraps = wrappers.get(wrapper_type, {})
+        if isinstance(type_wraps, dict) and NATIVE_LAYOUT_PATCH_KEY in type_wraps and type_wraps[NATIVE_LAYOUT_PATCH_KEY]:
+            return model
+
     patched = model.clone()
     patched.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, NATIVE_LAYOUT_PATCH_KEY)
     patched.add_wrapper_with_key(
