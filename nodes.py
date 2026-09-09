@@ -99,7 +99,57 @@ try:
 except ImportError:
     st_safe_open = None
 
-LOG = logging.getLogger("h3_auto_director")
+def _flush_logs():
+    """Flush stdout, stderr, and all root/logger handlers immediately."""
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+    except Exception:
+        pass
+
+
+class _FlushingLogger:
+    """Wrapper around logging.Logger that immediately flushes all streams on emit."""
+    def __init__(self, logger):
+        self._logger = logger
+
+    def info(self, msg, *args, **kwargs):
+        self._logger.info(msg, *args, **kwargs)
+        _flush_logs()
+
+    def warning(self, msg, *args, **kwargs):
+        self._logger.warning(msg, *args, **kwargs)
+        _flush_logs()
+
+    def error(self, msg, *args, **kwargs):
+        self._logger.error(msg, *args, **kwargs)
+        _flush_logs()
+
+    def debug(self, msg, *args, **kwargs):
+        self._logger.debug(msg, *args, **kwargs)
+        _flush_logs()
+
+    def exception(self, msg, *args, **kwargs):
+        self._logger.exception(msg, *args, **kwargs)
+        _flush_logs()
+
+    def log(self, level, msg, *args, **kwargs):
+        self._logger.log(level, msg, *args, **kwargs)
+        _flush_logs()
+
+    def __getattr__(self, name):
+        return getattr(self._logger, name)
+
+
+LOG = _FlushingLogger(logging.getLogger("h3_auto_director"))
 FPS = 24.0
 # Diagnostic mode: keep the complete generated timeline while investigating
 # continuation joins. Set the environment variable to ``1`` to restore the
@@ -368,6 +418,7 @@ def _prompt_disk_fingerprint(plan, generation_index, width, height, ref_image_si
         "context_length": int(context_length),
         "ref_short_edge": _nearest_multiple(ref_short_edge),
         "models": model_identity,
+        "skip_reference_encoding": _bool_setting(plan.get("skip_reference_encoding", False), False),
         "core": getattr(_minimax_h3, "__file__", None),
     }
     return _stable_digest(value), value
@@ -451,12 +502,10 @@ def _bool_setting(value, default=False):
         return bool(default)
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)):
-        return bool(value)
     text = str(value).strip().lower()
-    if text in {"", "0", "false", "off", "no", "关闭", "否"}:
+    if text in {"", "0", "false", "off", "no", "关闭", "否", "不覆盖"}:
         return False
-    if text in {"1", "true", "on", "yes", "开启", "是"}:
+    if text in {"1", "true", "on", "yes", "开启", "是", "覆盖", "覆盖已有文件"}:
         return True
     return bool(default)
 
@@ -487,6 +536,7 @@ def _prompt_disk_global_details(plan, width, height, ref_image_size, context_len
         "context_length": int(context_length),
         "ref_short_edge": _nearest_multiple(ref_short_edge),
         "models": model_identity,
+        "skip_reference_encoding": _bool_setting(plan.get("skip_reference_encoding", False), False),
     }
 
 
@@ -684,39 +734,212 @@ def _indexed_file(directory: Path, index: int, suffix, output_name=""):
     return preferred
 
 
+def _find_sub_batch_dirs(parent: Path, base_stem: str):
+    """Find all subdirectories matching base_stem or base_stem_{n}, sorted by n descending.
+
+    If folders have numeric suffixes, largest suffix comes first.
+    E.g. [ (2, 'H3_2', Path(...)), (1, 'H3_1', Path(...)), (-1, 'H3', Path(...)) ]
+    """
+    if not parent.is_dir():
+        return []
+    pattern = re.compile(rf"^{re.escape(base_stem)}(?:_(\d+))?$", re.IGNORECASE)
+    matches = []
+    try:
+        for item in parent.iterdir():
+            if item.is_dir():
+                m = pattern.match(item.name)
+                if m:
+                    num = int(m.group(1)) if m.group(1) is not None else -1
+                    matches.append((num, item.name, item))
+    except OSError:
+        return []
+    matches.sort(key=lambda x: x[0], reverse=True)
+    return matches
+
+
+def _resolve_sub_batch_dir(base_dir: Path, sub_type: str, base_stem: str, index: int,
+                            for_write: bool, overwrite: bool, plan: dict | None = None) -> Path:
+    """Resolve the nested sub-batch folder for intermediate files.
+
+    Subdirectories are isolated per batch, e.g. clips/H3, clips/H3_1, clips/H3_2.
+    When overwrite is False, writes increment to next unused suffix (on index 1)
+    and preserve across subsequent segments in state.json.
+    When reading, defaults to loading the subdirectory with the largest suffix number.
+    """
+    parent = base_dir / sub_type
+
+    if for_write:
+        if overwrite:
+            sub_name = base_stem
+        else:
+            state = _load_json(_state_path(plan), {}) if plan else {}
+            active = plan.get("current_sub_batch") if plan else None
+            if not active and state and int(index) > 1:
+                active = state.get("current_sub_batch")
+
+            if not active:
+                clips_dirs = _find_sub_batch_dirs(base_dir / "clips", base_stem)
+                cache_dirs = _find_sub_batch_dirs(base_dir / "cache", base_stem)
+                existing_nums = set()
+                for num, name, path in clips_dirs + cache_dirs:
+                    try:
+                        if path.is_dir() and any(path.iterdir()):
+                            existing_nums.add(num)
+                    except OSError:
+                        pass
+                if not existing_nums:
+                    sub_name = base_stem
+                else:
+                    max_n = max(existing_nums)
+                    next_n = (max_n + 1) if max_n >= 1 else 1
+                    while ((base_dir / "clips" / f"{base_stem}_{next_n}").exists()
+                           or (base_dir / "cache" / f"{base_stem}_{next_n}").exists()):
+                        next_n += 1
+                    sub_name = f"{base_stem}_{next_n}"
+
+                if plan is not None:
+                    plan["current_sub_batch"] = sub_name
+                if plan:
+                    state_p = _state_path(plan)
+                    current_state = _load_json(state_p, {"version": 3, "segments": {}})
+                    current_state["current_sub_batch"] = sub_name
+                    _atomic_json(state_p, current_state)
+            else:
+                sub_name = str(active)
+        target = parent / sub_name
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    else:
+        # for_write is False (Reading)
+        state = _load_json(_state_path(plan), {}) if plan else {}
+        active = (state.get("current_sub_batch") or (plan.get("current_sub_batch") if plan else None))
+        if active and (parent / str(active)).is_dir():
+            return parent / str(active)
+
+        matches = _find_sub_batch_dirs(parent, base_stem)
+        for num, name, path in matches:
+            if path.is_dir():
+                return path
+
+        for sibling_type in ("clips", "cache"):
+            if sibling_type != sub_type:
+                sibling_matches = _find_sub_batch_dirs(base_dir / sibling_type, base_stem)
+                if sibling_matches:
+                    candidate = parent / sibling_matches[0][1]
+                    if candidate.is_dir():
+                        return candidate
+
+        if (parent / base_stem).is_dir():
+            return parent / base_stem
+        return parent
+
+
 def _paths(plan, index: int, output_name="", video_format="mp4", for_write=False,
            for_context=False, context_stage=2):
     base = Path(plan["project_dir"])
-    clips = base / ((CONTEXT_STAGE1_DIR_NAME if int(context_stage) == 1 else CONTEXT_DIR_NAME)
-                    if for_context else "clips")
-    cache = base / ("cache_stage1" if for_context and int(context_stage) == 1 else "cache")
+    effective_output_name = output_name or (plan.get("output_filename") if isinstance(plan, dict) else "") or "H3"
+    stem = _output_filename(effective_output_name)
+    overwrite = _bool_setting(plan.get("overwrite_existing", False), False) if isinstance(plan, dict) else False
+
+    clip_folder_name = ((CONTEXT_STAGE1_DIR_NAME if int(context_stage) == 1 else CONTEXT_DIR_NAME)
+                        if for_context else "clips")
+    cache_folder_name = ("cache_stage1" if for_context and int(context_stage) == 1 else "cache")
+
+    clips = _resolve_sub_batch_dir(base, clip_folder_name, stem, index, for_write, overwrite, plan)
+    cache = _resolve_sub_batch_dir(base, cache_folder_name, stem, index, for_write, overwrite, plan)
+
     if for_write:
-        stem = _output_filename(output_name)
         ext = "." + str(video_format or "mp4").lower().lstrip(".")
         if ext not in VIDEO_EXTENSIONS:
             ext = ".mp4"
         return clips / ("%s_%05d%s" % (stem, index, ext)), cache / ("%s_%05d.safetensors" % (stem, index))
-    video = _indexed_file(clips, index, VIDEO_EXTENSIONS, output_name)
-    if for_context and not video.exists():
+
+    video = _indexed_file(clips, index, VIDEO_EXTENSIONS, stem)
+    if not video.is_file() and clips != base / clip_folder_name:
+        legacy_video = _indexed_file(base / clip_folder_name, index, VIDEO_EXTENSIONS, stem)
+        if legacy_video.is_file():
+            video = legacy_video
+    if not video.is_file():
+        for _, _, sibling_dir in _find_sub_batch_dirs(base / clip_folder_name, stem):
+            if sibling_dir != clips:
+                candidate = _indexed_file(sibling_dir, index, VIDEO_EXTENSIONS, stem)
+                if candidate.is_file():
+                    video = candidate
+                    break
+    if for_context and not video.is_file():
         # Projects written before the context/clip split remain resumable.
-        video = _indexed_file(base / "clips", index, VIDEO_EXTENSIONS, output_name)
-    latent = _indexed_file(cache, index, ".safetensors", output_name)
-    if not latent.exists():
-        latent = _indexed_file(base / "latents", index, ".safetensors", output_name)
+        clips_sub = _resolve_sub_batch_dir(base, "clips", stem, index, False, overwrite, plan)
+        video = _indexed_file(clips_sub, index, VIDEO_EXTENSIONS, stem)
+        if not video.is_file():
+            video = _indexed_file(base / "clips", index, VIDEO_EXTENSIONS, stem)
+
+    default_latent = cache / ("%s_%05d.safetensors" % (stem, index))
+    latent = _indexed_file(cache, index, ".safetensors", stem)
+    if not latent.is_file() and cache != base / cache_folder_name:
+        legacy_latent = _indexed_file(base / cache_folder_name, index, ".safetensors", stem)
+        if legacy_latent.is_file():
+            latent = legacy_latent
+    if not latent.is_file():
+        for _, _, sibling_dir in _find_sub_batch_dirs(base / cache_folder_name, stem):
+            if sibling_dir != cache:
+                candidate = _indexed_file(sibling_dir, index, ".safetensors", stem)
+                if candidate.is_file():
+                    latent = candidate
+                    break
+    if not latent.is_file() and for_context:
+        # Cross-stage fallback: if context_stage=1 (cache_stage1), also check cache;
+        # if context_stage=2 (cache), also check cache_stage1.
+        alt_folder = "cache" if cache_folder_name == "cache_stage1" else "cache_stage1"
+        alt_cache = _resolve_sub_batch_dir(base, alt_folder, stem, index, False, overwrite, plan)
+        candidate = _indexed_file(alt_cache, index, ".safetensors", stem)
+        if candidate.is_file():
+            latent = candidate
+        elif (base / alt_folder).is_dir():
+            candidate = _indexed_file(base / alt_folder, index, ".safetensors", stem)
+            if candidate.is_file():
+                latent = candidate
+            else:
+                for _, _, sibling_dir in _find_sub_batch_dirs(base / alt_folder, stem):
+                    candidate = _indexed_file(sibling_dir, index, ".safetensors", stem)
+                    if candidate.is_file():
+                        latent = candidate
+                        break
+    if not latent.is_file() and (base / "latents").is_dir():
+        legacy_cand = _indexed_file(base / "latents", index, ".safetensors", stem)
+        if legacy_cand.is_file():
+            latent = legacy_cand
+
     # A project created before the h3_project/<folder> layout may still hold
     # the previous clip/cache pair. Read it only as a continuation fallback;
     # all new writes stay in the current project directory.
     legacy_dir = str(plan.get("legacy_project_dir") or "").strip()
-    if legacy_dir and (not video.exists() or not latent.exists()):
+    deferred_decode = bool(plan.get("decode_after_all_segments", False)) if isinstance(plan, dict) else False
+    if legacy_dir:
         old_base = Path(legacy_dir)
-        old_video = _indexed_file(old_base / "clips", index, VIDEO_EXTENSIONS, output_name)
-        old_latent = _indexed_file(old_base / "cache", index, ".safetensors", output_name)
-        if not old_latent.exists():
-            old_latent = _indexed_file(old_base / "latents", index, ".safetensors", output_name)
-        if not video.exists() and old_video.exists():
-            video = old_video
-        if not latent.exists() and old_latent.exists():
-            latent = old_latent
+        if not video.exists() and not deferred_decode:
+            old_video = _indexed_file(old_base / "clips", index, VIDEO_EXTENSIONS, stem)
+            if old_video.exists():
+                video = old_video
+        if not latent.is_file():
+            for folder_candidate in ("cache", "cache_stage1"):
+                cand = _indexed_file(old_base / folder_candidate, index, ".safetensors", stem)
+                if cand.is_file():
+                    latent = cand
+                    break
+                for _, _, sibling in _find_sub_batch_dirs(old_base / folder_candidate, stem):
+                    cand = _indexed_file(sibling, index, ".safetensors", stem)
+                    if cand.is_file():
+                        latent = cand
+                        break
+                if latent.is_file():
+                    break
+            if not latent.is_file() and (old_base / "latents").is_dir():
+                cand = _indexed_file(old_base / "latents", index, ".safetensors", stem)
+                if cand.is_file():
+                    latent = cand
+
+    if not latent.is_file():
+        latent = default_latent
     return video, latent
 
 
@@ -2163,8 +2386,8 @@ class H3AutoDirectorDualSampling:
             "stage1_denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             "enable_stage2": ("BOOLEAN", {"default": True, "label_on": "启用二采", "label_off": "关闭二采",
                                "tooltip": "关闭后仅执行第一阶段采样，跳过放大、视频 VAE 重编码和第二阶段采样。"}),
-            "stage2_use_context": ("BOOLEAN", {"default": False, "label_on": "二采使用上下文（实验性）", "label_off": "二采不使用上下文",
-                                    "tooltip": "实验性功能，当前效果不可用，默认应关闭。开启后会尝试将上一段最终二采视频/音频上下文适配到二采尺寸后传入。"}),
+            "stage2_use_context": ("BOOLEAN", {"default": True, "label_on": "开启二采上下文接续", "label_off": "关闭二采上下文接续",
+                                    "tooltip": "开启后将上一段二采最终潜空间适配到二采尺寸后作为二采的接续上下文。"}),
             "stage2_steps": ("INT", {"default": 8, "min": 1, "max": 100}),
             "stage2_denoise": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.0, "step": 0.01}),
             "upscale_mode": (DUAL_UPSCALE_CHOICES, {"default": "普通插值"}),
@@ -2208,7 +2431,7 @@ class H3AutoDirectorDualSampling:
 
     def sample(self, stage1_model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
                stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
-               target_width, target_height, enable_stage2=True, stage2_use_context=False,
+               target_width, target_height, enable_stage2=True, stage2_use_context=True,
                upscale_model=None, seed=0, stage2_conditioning=None, stage2_context_latent=None,
                use_stage1_audio_only=False, enable_preview=False, latent_upscale_model=None,
                latent_upscale_device="cuda", latent_upscale_precision="fp32",
@@ -2449,8 +2672,8 @@ class H3AutoDirectorDualSamplingModel:
             "stage1_denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             "enable_stage2": ("BOOLEAN", {"default": True, "label_on": "启用二采", "label_off": "关闭二采",
                                "tooltip": "关闭后仅执行第一阶段采样。"}),
-            "stage2_use_context": ("BOOLEAN", {"default": False, "label_on": "二采使用上下文（实验性）", "label_off": "二采不使用上下文",
-                                    "tooltip": "实验性功能，当前效果不可用，默认应关闭。开启后会尝试将上一段最终二采视频/音频上下文适配到二采尺寸后传入。"}),
+            "stage2_use_context": ("BOOLEAN", {"default": True, "label_on": "开启二采上下文接续", "label_off": "关闭二采上下文接续",
+                                    "tooltip": "开启后将上一段二采最终潜空间适配到二采尺寸后作为二采的接续上下文。"}),
             "stage2_steps": ("INT", {"default": 8, "min": 1, "max": 100}),
             "stage2_denoise": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.0, "step": 0.01}),
             "upscale_mode": (DUAL_UPSCALE_CHOICES, {"default": "普通插值"}),
@@ -2494,7 +2717,7 @@ class H3AutoDirectorDualSamplingModel:
 
     def sample(self, stage1_model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
                stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
-               target_width, target_height, enable_stage2=True, stage2_use_context=False,
+               target_width, target_height, enable_stage2=True, stage2_use_context=True,
                seed=0, upscale_model=None, stage2_conditioning=None, stage2_context_latent=None,
                use_stage1_audio_only=False, enable_preview=False, latent_upscale_model=None,
                latent_upscale_device="cuda", latent_upscale_precision="fp32",
@@ -2554,11 +2777,16 @@ class H3AutoDirectorPlan:
             "decode_after_all_segments": ("BOOLEAN", {"default": False,
                 "tooltip": "开启后先缓存每段最终 AV latent，全部采样完成后统一解码、裁剪并拼接；视频上下文会自动改为缓存潜空间直取。"}),
             "output_root": ("STRING", {"default": "h3_projects", "tooltip": "项目文件夹名称；新路径为 output/h3_project/<此名称>"}),
+            "output_filename": ("STRING", {"default": "", "tooltip": "中间片段与最终视频的统一基础文件名/批次名，不含扩展名；留空使用默认名称 H3。"}),
+            "overwrite_existing": ("BOOLEAN", {"default": False, "label_on": "覆盖已有文件", "label_off": "不覆盖（子文件夹/文件自动编号）",
+                "tooltip": "关闭时若中间片段已有同名批次，自动创建递增编号子文件夹（如 _1, _2），读取时默认加载最大后缀的子文件夹；最终视频已有同名时在文件名后追加编号。"}),
             "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": False, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
         }, "optional": {
             "global_assets_json": ("STRING", {"default": "[]", "multiline": True}),
             "auto_context_crop_frames": ("INT", {"default": 0, "min": 0, "max": 4096,
                 "tooltip": "自动裁剪上下文时使用的帧数；0 表示按上下文长度自动计算；大于 0 时自动启用裁剪。"}),
+            "skip_reference_encoding": ("BOOLEAN", {"default": False,
+                "tooltip": "不编码参考素材（跳过素材的 VAE 潜空间预编码，大幅节省显存并提升速度）；若某素材设置了插入时间或帧，将自动强制开启编码以完成画面引导。"}),
             "enable_audio_drive": ("BOOLEAN", {"default": False, "tooltip": "启用音频驱动：自动根据片段秒数切分上传的音频并强制替换音频潜空间"}),
             "audio_drive_file": ("STRING", {"default": "", "tooltip": "音频驱动文件路径（支持 input/ 相对路径或绝对路径）"}),
         }, "hidden": {"project_dir": "STRING"}}
@@ -2568,7 +2796,12 @@ class H3AutoDirectorPlan:
     FUNCTION = "create"
     CATEGORY = "H3 自动导演"
 
-    def create(self, project_id, segments_json, duration, global_reference_set, auto_run, continuation_mode=True, cache_prompt_embeddings=False, decode_after_all_segments=False, output_root="h3_projects", cache_prompt_embeddings_to_disk=False, global_assets_json="[]", auto_context_crop_frames=0, enable_audio_drive=False, audio_drive_file="", project_dir="", **_legacy_inputs):
+    def create(self, project_id, segments_json, duration, global_reference_set, auto_run, continuation_mode=True, cache_prompt_embeddings=False, decode_after_all_segments=False, output_root="h3_projects", output_filename="", overwrite_existing=False, cache_prompt_embeddings_to_disk=False, global_assets_json="[]", auto_context_crop_frames=0, skip_reference_encoding=False, enable_audio_drive=False, audio_drive_file="", project_dir="", **_legacy_inputs):
+        if isinstance(output_filename, bool):
+            output_filename = ""
+        else:
+            output_filename = str(output_filename or "").strip()
+        overwrite_existing = _bool_setting(overwrite_existing, False)
         try:
             segments = json.loads(segments_json)
             assets = json.loads(global_assets_json or "[]")
@@ -2579,9 +2812,13 @@ class H3AutoDirectorPlan:
         if not isinstance(assets, list):
             raise ValueError("global_assets_json must be a JSON list")
         try:
-            auto_context_crop_frames = max(0, min(4096, int(auto_context_crop_frames or 0)))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("自动裁剪上下文帧数必须是 0 到 4096 的整数") from exc
+            if isinstance(auto_context_crop_frames, (int, float, str)):
+                val = float(auto_context_crop_frames)
+                auto_context_crop_frames = 0 if (val != val) else max(0, min(4096, int(val)))
+            else:
+                auto_context_crop_frames = 0
+        except Exception:
+            auto_context_crop_frames = 0
         normalized = []
         for item in segments:
             if not isinstance(item, dict):
@@ -2643,12 +2880,15 @@ class H3AutoDirectorPlan:
         # clips are written into the new layout.
         legacy_project_dir = _find_legacy_project(project_id, output_root, project_dir)
         plan = {"version": 2, "project_id": project_id, "output_root": output_root,
+                "output_filename": _output_filename(output_filename),
+                "overwrite_existing": bool(overwrite_existing),
                 "duration": float(duration), "global_reference_set": bool(global_reference_set),
                 "auto_run": bool(auto_run), "continuation_mode": bool(continuation_mode),
                 "cache_prompt_embeddings": bool(cache_prompt_embeddings),
                 "decode_after_all_segments": bool(decode_after_all_segments),
                 "cache_prompt_embeddings_to_disk": bool(cache_prompt_embeddings_to_disk),
                 "auto_context_crop_frames": int(auto_context_crop_frames),
+                "skip_reference_encoding": _bool_setting(skip_reference_encoding, False),
                 "enable_audio_drive": bool(enable_audio_drive),
                 "audio_drive_file": str(audio_drive_file or "").strip(),
                 "global_assets": assets, "segments": normalized,
@@ -2681,6 +2921,8 @@ class H3AutoDirectorTTSPlan:
             "enable_audio_continuation": ("BOOLEAN", {"default": True}),
             "concat_final_audio": ("BOOLEAN", {"default": True, "tooltip": "完成全部片段后额外拼接一个长 WAV；关闭则只保留分段音频"}),
             "output_root": ("STRING", {"default": "h3_tts_project"}),
+            "output_filename": ("STRING", {"default": "", "tooltip": "统一基础文件名/批次名，不含扩展名；留空使用默认名称 H3。"}),
+            "overwrite_existing": ("BOOLEAN", {"default": False, "label_on": "覆盖已有文件", "label_off": "不覆盖（自动递增编号）"}),
             "global_reference_set": ("BOOLEAN", {"default": False, "tooltip": "开启后所有片段使用第 1 段的图片、视频和音频参考素材"}),
             "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": False, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
         }, "hidden": {
@@ -2698,10 +2940,15 @@ class H3AutoDirectorTTSPlan:
 
     def create(self, project_id, segments_json, auto_run=True, cache_prompt_embeddings=True,
                enable_audio_continuation=True, concat_final_audio=True,
-               output_root="h3_tts_project", global_reference_set=False,
-               cache_prompt_embeddings_to_disk=False,
+               output_root="h3_tts_project", output_filename="", overwrite_existing=False,
+               global_reference_set=False, cache_prompt_embeddings_to_disk=False,
                project_dir="", reference_video_json="{}", reference_assets_json="[]",
                pass_reference_video_audio=False, audio_restart_segments="", **_legacy_inputs):
+        if isinstance(output_filename, bool):
+            output_filename = ""
+        else:
+            output_filename = str(output_filename or "").strip()
+        overwrite_existing = _bool_setting(overwrite_existing, False)
         try:
             rows = json.loads(segments_json or "[]")
         except json.JSONDecodeError as exc:
@@ -2789,7 +3036,8 @@ class H3AutoDirectorTTSPlan:
             (directory / name).mkdir(parents=True, exist_ok=True)
         plan = {
             "version": 3, "mode": "tts", "project_id": str(project_id),
-            "output_root": str(output_root), "duration": 5.0,
+            "output_root": str(output_root), "output_filename": _output_filename(output_filename),
+            "overwrite_existing": bool(overwrite_existing), "duration": 5.0,
             "global_reference_set": bool(global_reference_set), "global_assets": unified_references,
             "auto_run": bool(auto_run), "continuation_mode": bool(enable_audio_continuation),
             "video_continuation": False, "cache_prompt_embeddings": bool(cache_prompt_embeddings),
@@ -2832,6 +3080,8 @@ class H3AutoDirectorVideoTransferPlan:
             "final_audio_source": (["H3 生成音频", "参考视频音频"], {"default": "H3 生成音频"}),
             "auto_run": ("BOOLEAN", {"default": True}),
             "output_root": ("STRING", {"default": "h3_video_transfer"}),
+            "output_filename": ("STRING", {"default": "", "tooltip": "中间片段与最终视频的统一输出文件名/批次名，不含扩展名；留空使用默认名称 H3。"}),
+            "overwrite_existing": ("BOOLEAN", {"default": False, "label_on": "覆盖已有文件", "label_off": "不覆盖（子文件夹/文件自动编号）"}),
             "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": False, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
         }, "optional": {
             "use_reference_video_material": ("BOOLEAN", {"default": True,
@@ -2848,8 +3098,13 @@ class H3AutoDirectorVideoTransferPlan:
                enable_audio_continuation=True, audio_restart_segments="",
                previous_video_reference_segments="", cache_prompt_embeddings=True,
                skip_h3_audio_decode=False, final_audio_source="H3 生成音频",
-               auto_run=True, output_root="h3_video_transfer", cache_prompt_embeddings_to_disk=False,
-               project_dir=""):
+               auto_run=True, output_root="h3_video_transfer", output_filename="", overwrite_existing=False,
+               cache_prompt_embeddings_to_disk=False, project_dir=""):
+        if isinstance(output_filename, bool):
+            output_filename = ""
+        else:
+            output_filename = str(output_filename or "").strip()
+        overwrite_existing = _bool_setting(overwrite_existing, False)
         try:
             video = json.loads(reference_video_json or "{}")
             assets = json.loads(reference_assets_json or "[]")
@@ -2964,7 +3219,8 @@ class H3AutoDirectorVideoTransferPlan:
         (directory / CONTROL_DIR_NAME / PREPROCESSED_DIR_NAME).mkdir(parents=True, exist_ok=True)
         plan = {
             "version": 3, "mode": "video_transfer", "project_id": project_id,
-            "output_root": output_root, "duration": seconds,
+            "output_root": output_root, "output_filename": _output_filename(output_filename),
+            "overwrite_existing": bool(overwrite_existing), "duration": seconds,
             "global_reference_set": False, "global_assets": [],
             "auto_run": bool(auto_run),
             # Audio and video context policies are intentionally separate.
@@ -4811,6 +5067,16 @@ class H3AutoDirectorSegment:
             "开启" if _video_context_enabled(plan) else "关闭",
             "开启" if bool(seg.get("continue_video", context_index > 0)) else "关闭",
         )
+        if (use_video or use_audio) and context_index > 0:
+            _, s1_cand = _paths(plan, context_index, for_context=True, context_stage=1)
+            _, s2_cand = _paths(plan, context_index, for_context=True, context_stage=2)
+            if not s1_cand.is_file() and not s2_cand.is_file():
+                LOG.warning(
+                    "H3 Auto Director: [提示] 当前设置准备生成【第 %d 段】（接续上下文序号=%d），"
+                    "但在工程缓存目录下未找到第 %d 段的潜空间文件（候选路径：%s）。"
+                    "若你是重新生成整个项目，请将本节点的【上下文片段序号】重置为 0；若为断点续跑，请确认第 %d 段已成功完成。",
+                    generation_index, context_index, context_index, s2_cand, context_index
+                )
         return (_previous_video_prompt(seg.get("prompt", ""), refs), physical, use_video, use_audio,
                 json.dumps(refs, ensure_ascii=False), generation_index,
                 "restart" if restart else "continue", str(unique_id or ""), context_index)
@@ -5239,7 +5505,7 @@ def _prompt_cache_key(plan, clip, vae, audio_vae, width, height, ref_image_size,
                       ref_short_edge=2048):
     # The seed belongs to RandomNoise/sampling downstream.  It is deliberately
     # absent here so changing the seed reuses the deterministic H3 conditioning.
-    plan_data = {k: plan.get(k) for k in ("project_id", "global_reference_set", "global_assets", "segments", "continuation_mode")}
+    plan_data = {k: plan.get(k) for k in ("project_id", "global_reference_set", "global_assets", "segments", "continuation_mode", "skip_reference_encoding")}
     mode = str(ref_image_size or "match").lower()
     width, height = _h3_canvas_dimensions(width, height)
     resolution = (int(width), int(height)) if mode not in {"manual", "max"} else None
@@ -5543,6 +5809,18 @@ class H3AutoDirectorCachedReferenceToVideo:
         if _H3ReferenceToVideo is None:
             raise RuntimeError("当前 ComfyUI 未提供 MiniMaxH3ReferenceToVideo 核心节点")
         width, height = _h3_canvas_dimensions(width, height)
+        skip = bool(plan.get("skip_reference_encoding", False)) if isinstance(plan, dict) else False
+        has_insertion = any(_reference_insert_frame(ref) is not None for ref in (refs or []))
+        if has_insertion and skip:
+            skip = False
+            LOG.info("H3 Auto Director: 检测到存在素材插入（引导帧）设置，强制开启素材编码覆盖用户设置")
+        elif skip:
+            LOG.info("H3 Auto Director: 项目计划已设置不编码素材，使用纯提示词文本编码")
+            tokens = clip.tokenize(prompt, minimax_ref_items=[])
+            cond = clip.encode_from_tokens_scheduled(tokens)
+            latent, _ = _minimax_h3._empty_av_latent(int(width), int(height), int(length))
+            return cond, latent
+
         LOG.info("H3 Auto Director: 参考编码画布=%dx%d（%.3f MP），参考尺寸模式=%s",
                  width, height, width * height / 1_000_000,
                  "manual" if use_manual_ref_short_edge else ref_image_size)
@@ -5570,11 +5848,28 @@ class H3AutoDirectorCachedReferenceToVideo:
             raise RuntimeError("当前 ComfyUI 未提供 MiniMaxH3ReferenceToVideo 核心节点")
         width, height = _h3_canvas_dimensions(width, height)
         latent, frame_count = _minimax_h3._empty_av_latent(int(width), int(height), int(length))
+
+        skip = bool(plan.get("skip_reference_encoding", False)) if isinstance(plan, dict) else False
+        has_insertion = any(_reference_insert_frame(ref) is not None for ref in (refs or []))
+        if has_insertion and skip:
+            skip = False
+            LOG.info("H3 Auto Director: 检测到存在素材插入（引导帧）设置，强制开启素材编码覆盖用户设置")
+        elif skip:
+            LOG.info("H3 Auto Director: 项目计划已设置不编码素材，跳过当前参考素材预编码")
+            return latent, [], []
+
         ref_groups = _resolve_reference_groups(refs, plan=plan)
         ref_items = []
         ref_blocks = []
 
-        for image in ref_groups[0].values():
+        total_images = sum(1 for img in ref_groups[0].values() if img is not None)
+        total_videos = sum(1 for v in ref_groups[1].values() if v is not None)
+        total_audios = sum(1 for a in ref_groups[3].values() if a is not None)
+        if total_images or total_videos or total_audios:
+            LOG.info("H3 Auto Director: 开始编码参考素材（图片=%d, 视频=%d, 音频=%d）...",
+                     total_images, total_videos, total_audios)
+
+        for img_idx, image in enumerate(ref_groups[0].values(), 1):
             if image is None:
                 continue
             source_height, source_width = image.shape[1], image.shape[2]
@@ -5591,11 +5886,12 @@ class H3AutoDirectorCachedReferenceToVideo:
                                 round(source_height * scale / _minimax_h3.CANVAS_MULTIPLE) * _minimax_h3.CANVAS_MULTIPLE)
             resized = _minimax_h3._resize(image[:1], target_width, target_height, "disabled")
             ref_items.append({"type": "image", "data": resized})
+            LOG.info("H3 Auto Director: 正在编码参考图片 %d/%d (尺寸=%dx%d)...", img_idx, total_images, target_width, target_height)
             ref_blocks.append({"kind": "image", "latent_h": target_height // 16,
                                "latent_w": target_width // 16, "latent": vae.encode(resized)})
 
         video_audios = ref_groups[2]
-        for name, video_frames in ref_groups[1].items():
+        for v_idx, (name, video_frames) in enumerate(ref_groups[1].items(), 1):
             if video_frames is None:
                 continue
             source_height, source_width = video_frames.shape[1], video_frames.shape[2]
@@ -5614,6 +5910,7 @@ class H3AutoDirectorCachedReferenceToVideo:
             while frame_total % 17 != 5:
                 frame_total -= 1
             frames = frames[:frame_total]
+            LOG.info("H3 Auto Director: 正在编码参考视频 %d/%d (帧数=%d, 画布=%dx%d)...", v_idx, total_videos, frame_total, canvas_width, canvas_height)
             video_latent = vae.encode(frames)
             audio_latent, audio_length = (None, 0)
             soundtrack = video_audios.get("ref_video_audio_" + name.rsplit("_", 1)[-1])
@@ -5628,9 +5925,10 @@ class H3AutoDirectorCachedReferenceToVideo:
                                "latent_w": canvas_width // 16, "ref_audio_t": audio_length,
                                "latent": video_latent, "audio_latent": audio_latent})
 
-        for audio in ref_groups[3].values():
+        for a_idx, audio in enumerate(ref_groups[3].values(), 1):
             if audio is None:
                 continue
+            LOG.info("H3 Auto Director: 正在编码参考音频 %d/%d...", a_idx, total_audios)
             audio_latent, audio_length = _encode_ref_audio(audio_vae, audio)
             ref_items.append({"type": "audio"})
             ref_blocks.append({"kind": "audio", "ref_audio_t": audio_length,
@@ -5708,15 +6006,18 @@ class H3AutoDirectorCachedReferenceToVideo:
             if not cls._references_ready(plan, refs):
                 pending.append(generation_index)
                 continue
+            LOG.info("H3 Auto Director: 正在预编码第 %d/%d 段参考素材...", generation_index, segment_count)
             prepared[generation_index] = cls._prepare_references(
                 vae, audio_vae, width, height, length,
                 "manual" if use_manual_ref_short_edge else ref_image_size,
                 refs, plan=plan, ref_short_edge=ref_short_edge)
+            LOG.info("H3 Auto Director: 第 %d/%d 段参考素材预编码完成", generation_index, segment_count)
 
         LOG.info("H3 Auto Director: 参考素材预编码完成，开始连续缓存 %d 段文本向量", len(prepared))
         for generation_index, prepared_segment in prepared.items():
             seg = _segment(plan, generation_index)
             refs = _cache_segment_references(plan, generation_index)
+            LOG.info("H3 Auto Director: 正在生成第 %d/%d 段提示词向量...", generation_index, segment_count)
             encoded = cls._encode_prepared_prompt(
                 clip, _previous_video_prompt(seg.get("prompt", ""), refs), *prepared_segment)
             cache[generation_index] = (
@@ -5963,10 +6264,9 @@ class H3AutoDirectorAVDecode:
         if parts is None:
             raise ValueError("H3 AV 解码需要联合视频/音频 latent")
         if isinstance(plan, dict) and bool(plan.get("decode_after_all_segments", False)):
-            # SaveSegment persists the latent; Controller decodes one segment
-            # at a time during final assembly. Keep the output contract so old
-            # links remain valid without allocating a decoded clip here.
+            LOG.info("H3 Auto Director: 统一解码模式已开启，跳过当前片段级 VAE 解码（将在全部完成后统一逐段解码）")
             return (torch.empty((0, 1, 1, 3), dtype=torch.float32), None)
+        LOG.info("H3 Auto Director: 正在解码当前片段 AV 潜变量...")
         images = _decode_h3_video(video_vae, parts[0])
         waveform, sample_rate = _decode_h3_audio(audio_vae, parts[1])
         # Native H3 Guide has no prepended context frames. Its audio latent
@@ -5975,6 +6275,7 @@ class H3AutoDirectorAVDecode:
         expected_samples = int(round(int(images.shape[0]) / FPS * sample_rate))
         if waveform.shape[-1] > expected_samples:
             waveform = waveform[..., :expected_samples]
+        LOG.info("H3 Auto Director: 当前片段 AV 潜变量解码完成（画面=%d 帧）", int(images.shape[0]))
         return (images, {"waveform": waveform, "sample_rate": sample_rate})
 
 
@@ -6056,6 +6357,10 @@ class H3AutoDirectorDecodeSaveVideo:
                 "tooltip": "最终视频文件名；留空使用 H3"}),
             "auto_crop_frames": ("INT", {"default": 22, "min": 0, "max": 4096,
                 "tooltip": "从第 2 段开始裁剪的上下文帧数；0 表示不裁剪"}),
+            "video_format": (list(VIDEO_FORMATS), {"default": "mp4"}),
+            "video_codec": (list(VIDEO_CODECS), {"default": "h264"}),
+            "encoder_device": (list(ENCODER_DEVICES), {"default": "CPU"}),
+            "quality": (list(QUALITY_CHOICES), {"default": "最高质量"}),
         }}
 
     RETURN_TYPES = ("STRING", "STRING")
@@ -6079,9 +6384,18 @@ class H3AutoDirectorDecodeSaveVideo:
             return path, path / "cache"
         if (path / "cache_stage1").is_dir():
             return path, path / "cache_stage1"
-        # A direct directory containing safetensors is also accepted.  This
+        if path.parent.name.lower() in {"cache", "cache_stage1", "latents"}:
+            return path.parent.parent, path
+        if path.parent.parent.name.lower() in {"cache", "cache_stage1", "latents"}:
+            return path.parent.parent.parent, path
+        # A direct directory containing safetensors is also accepted. This
         # keeps old projects and manually copied caches resumable.
         if path.is_dir() and any(path.glob("*.safetensors")):
+            curr = path.parent
+            while curr != curr.parent:
+                if (curr / "json" / "project.json").is_file() or (curr / "final").is_dir():
+                    return curr, path
+                curr = curr.parent
             return path.parent, path
         raise FileNotFoundError("无法识别潜空间目录（应为项目目录或 cache/）：%s" % path)
 
@@ -6103,7 +6417,9 @@ class H3AutoDirectorDecodeSaveVideo:
 
     def decode_save(self, latent_directory, video_vae, audio_vae,
                     output_intermediate=True, intermediate_filename="H3",
-                    final_filename="H3", auto_crop_frames=22):
+                    final_filename="H3", auto_crop_frames=22,
+                    video_format="mp4", video_codec="h264",
+                    encoder_device="CPU", quality="最高质量"):
         project_dir, cache_dir = self._project_and_cache(latent_directory)
         entries = self._entries(cache_dir)
         if not entries:
@@ -6111,6 +6427,11 @@ class H3AutoDirectorDecodeSaveVideo:
         intermediate_stem = self._safe_name(intermediate_filename, "H3")
         final_stem = self._safe_name(final_filename, "H3")
         crop = max(0, int(auto_crop_frames or 0))
+        fmt = str(video_format or "mp4").lower().lstrip(".")
+        ext = "." + fmt if fmt in VIDEO_EXTENSIONS else ".mp4"
+        codec = str(video_codec or "h264").lower()
+        dev = "GPU" if str(encoder_device or "CPU").upper() == "GPU" else "CPU"
+        qual = str(quality or "最高质量")
         clips_dir = project_dir / "clips"
         final_dir = project_dir / "final"
         temp_dir = project_dir / "json" / ".decode_segments"
@@ -6123,6 +6444,7 @@ class H3AutoDirectorDecodeSaveVideo:
         decoded_count = 0
         try:
             for ordinal, latent_path in enumerate(entries, 1):
+                LOG.info("H3 Auto Director: 正在解码第 %d/%d 段（潜变量：%s）...", ordinal, len(entries), latent_path.name)
                 latent = _load_av_latent(latent_path)
                 parts = _av_latent_parts(latent)
                 if parts is None:
@@ -6134,24 +6456,27 @@ class H3AutoDirectorDecodeSaveVideo:
                     if crop >= int(images.shape[0]):
                         raise ValueError("第 %d 段裁剪 %d 帧后没有剩余画面" % (ordinal, crop))
                     images, audio = _trim_context_prefix(images, audio, crop, FPS)
-                clip_path = target_dir / ("%s_%05d.mp4" % (intermediate_stem, ordinal))
-                _write_segment_video(clip_path, images, audio, FPS, "mp4", "h264", "CPU", "最高质量")
+                clip_path = target_dir / ("%s_%05d%s" % (intermediate_stem, ordinal, ext))
+                _write_segment_video(clip_path, images, audio, FPS, fmt, codec, dev, qual)
                 sources.append(clip_path)
                 decoded_count += 1
-                LOG.info("H3 Auto Director: 目录解码第 %d/%d 段（裁剪=%d）: %s", ordinal, len(entries), crop if ordinal >= 2 else 0, latent_path)
+                LOG.info("H3 Auto Director: 目录解码完成第 %d/%d 段（裁剪=%d 帧）: %s", ordinal, len(entries), crop if ordinal >= 2 else 0, latent_path.name)
                 del latent, parts, images, waveform, audio
                 _release_video_memory()
             list_path.write_text("\n".join("file '%s'" % str(p).replace("'", "'\\''") for p in sources) + "\n", encoding="utf-8")
             ffmpeg = _find_ffmpeg()
             if not ffmpeg:
                 raise RuntimeError("未找到 ffmpeg，无法拼接解码视频")
-            final_path = final_dir / (final_stem + ".mp4")
-            temp_final = final_path.with_name(final_path.stem + ".tmp.mp4")
-            _encode_concat_with_fallback(ffmpeg, list_path, temp_final, "mp4", "h264", "CPU", "最高质量")
+            final_path = final_dir / (final_stem + ext)
+            temp_final = final_path.with_name(final_path.stem + ".tmp" + ext)
+            _encode_concat_with_fallback(ffmpeg, list_path, temp_final, fmt, codec, dev, qual)
             if not temp_final.is_file() or temp_final.stat().st_size == 0:
                 raise RuntimeError("ffmpeg 未生成有效最终视频")
             os.replace(temp_final, final_path)
-            info = "目录=%s，读取=%d 段，裁剪=%d 帧（从第2段起），中间片段=%s，最终=%s" % (cache_dir, decoded_count, crop, "开启" if output_intermediate else "关闭", final_path)
+            info = "目录=%s，读取=%d 段，裁剪=%d 帧（从第2段起），编码=%s/%s/%s，中间片段=%s，最终=%s" % (
+                cache_dir, decoded_count, crop, fmt, codec, dev,
+                "开启" if output_intermediate else "关闭", final_path
+            )
             LOG.info("H3 Auto Director: %s", info)
             return (str(final_path), info)
         finally:
@@ -6227,94 +6552,106 @@ class H3AutoDirectorSaveAudioSegment:
 class H3AutoDirectorContext:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"plan": ("H3_AUTO_PLAN",), "segment_index": ("INT", {"default": 0, "min": 0})},
-                "optional": {"context_stage": ("INT", {"default": 1, "min": 1, "max": 2,
-                    "tooltip": "1=一采上下文，2=二采最终上下文"})}}
+        return {"required": {"plan": ("H3_AUTO_PLAN",), "segment_index": ("INT", {"default": 0, "min": 0})}}
 
-    RETURN_TYPES = ("IMAGE", "LATENT")
-    RETURN_NAMES = ("上下文画面", "上下文潜变量")
+    RETURN_TYPES = ("IMAGE", "LATENT", "LATENT")
+    RETURN_NAMES = ("上下文画面", "上下文潜变量", "二采上下文潜变量")
     FUNCTION = "load"
     CATEGORY = "H3 自动导演"
 
-    def load(self, plan, segment_index, context_stage=1):
+    def load(self, plan, segment_index, **_legacy_kwargs):
         video_enabled = _video_context_enabled(plan)
         audio_enabled = bool(plan.get("continuation_mode", True))
+        empty_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+        empty_latent = {"samples": [torch.zeros((1, 24, 2, 1, 1)), torch.zeros((1, 32, 2, 1))]}
         if int(segment_index) <= 0 or not (video_enabled or audio_enabled):
             LOG.info("H3 Auto Director: 上下文序号 %d 未启用视频/音频上下文，返回空上下文", int(segment_index))
-            return (torch.zeros((1, 1, 1, 3), dtype=torch.float32), {"samples": [torch.zeros((1, 24, 2, 1, 1)), torch.zeros((1, 32, 2, 1))]})
-        context_stage = 1 if int(context_stage) == 1 else 2
-        requested_video_path, requested_latent_path = _paths(
-            plan, int(segment_index), for_context=True, context_stage=context_stage
-        )
-        video_path, latent_path = requested_video_path, requested_latent_path
-        if context_stage == 1:
-            # Keep the first pass independent from the final second-pass
-            # output.  Feeding a soft second-pass prefix into the next first
-            # pass creates a feedback loop: the blur is then refined and
-            # propagated through every subsequent segment.  The second pass
-            # receives the explicit stage-two source below when its context
-            # option is enabled.
-            LOG.info(
-                "H3 Auto Director: 一采上下文固定读取上一段一采源：视频=%s，latent=%s",
-                video_path, latent_path,
+            return (empty_image, empty_latent, empty_latent)
+
+        # 1. Resolve Stage 1 & Stage 2 paths
+        _, stage1_latent_path = _paths(plan, int(segment_index), for_context=True, context_stage=1)
+        video_path, stage2_latent_path = _paths(plan, int(segment_index), for_context=True, context_stage=2)
+
+        # 2. Load Stage 1 Latent (一采接续潜空间)
+        if stage1_latent_path.is_file():
+            stage1_latent = _load_av_latent(stage1_latent_path)
+            LOG.info("H3 Auto Director: 一采上下文读取上一段一采潜空间：%s", stage1_latent_path)
+        elif stage2_latent_path.is_file():
+            stage1_latent = _load_av_latent(stage2_latent_path)
+            LOG.warning("H3 Auto Director: 一采缓存缺失，兼容回退到上一段二采潜空间：%s", stage2_latent_path)
+        else:
+            target_seg = int(segment_index) + 1
+            prev_seg = int(segment_index)
+            proj_dir = str(plan.get("project_dir", "") if isinstance(plan, dict) else "")
+            proj_name = str((plan.get("output_root") if isinstance(plan, dict) else "") or
+                            (plan.get("project_id") if isinstance(plan, dict) else "") or "")
+            err_details = {
+                "target_segment": target_seg,
+                "context_segment": prev_seg,
+                "project_name": proj_name,
+                "project_dir": proj_dir,
+                "stage1_path": str(stage1_latent_path),
+                "stage2_path": str(stage2_latent_path),
+            }
+            try:
+                from server import PromptServer
+                if hasattr(PromptServer, "instance") and PromptServer.instance is not None:
+                    PromptServer.instance.send_sync("h3-auto-director-context-missing", err_details)
+            except Exception as notify_err:
+                LOG.warning("H3 Auto Director: 发送上下文缺失前端弹窗失败：%s", notify_err)
+
+            err_msg = (
+                f"\n{'=' * 68}\n"
+                f"【H3 自动导演】上下文潜空间缺失报错：\n"
+                f"当前片段解析节点请求生成【第 {target_seg} 段】，该段已配置视频/音频接续，必须基于上一段（第 {prev_seg} 段）的潜空间接续生成。\n"
+                f"但在当前工程目录下未找到第 {prev_seg} 段的潜空间缓存文件！\n\n"
+                f"[排查与解决方法]：\n"
+                f"1. 【如果是重新生成或开始新工程】：\n"
+                f"   在 ComfyUI 画布中找到【H3 自动导演｜片段解析】（H3AutoDirectorSegment）节点，\n"
+                f"   点击节点上的【重置为第 1 段 (序号 0)】按钮（或手动将【上下文片段序号】改为 0），\n"
+                f"   即可从第 1 段重新开始生成整个视频。\n\n"
+                f"2. 【如果是断点接续生成】：\n"
+                f"   请确认第 {prev_seg} 段是否已成功完成并保存。若前序片段尚未生成，\n"
+                f"   请将【上下文片段序号】调整为已完成的最后一段序号，或设为 0 从头运行。\n\n"
+                f"[检索的工程路径信息]：\n"
+                f"   - 项目名称：{proj_name}\n"
+                f"   - 项目目录：{proj_dir}\n"
+                f"   - 一采潜空间候选路径：{stage1_latent_path}\n"
+                f"   - 二采/单采潜空间候选路径：{stage2_latent_path}\n"
+                f"{'=' * 68}"
             )
-            if not latent_path.is_file():
-                # Pre-isolation projects did not always save a separate
-                # first-pass cache. Keep those projects resumable, but never
-                # prefer this fallback when the dedicated cache exists.
-                final_video_path, final_latent_path = _paths(
-                    plan, int(segment_index), for_context=True, context_stage=2
-                )
-                if final_latent_path.is_file() and (not video_enabled or final_video_path.is_file()):
-                    video_path, latent_path = final_video_path, final_latent_path
-                    LOG.warning(
-                        "H3 Auto Director: 一采缓存缺失，兼容回退到上一段最终二采上下文：%s",
-                        latent_path,
-                    )
-            # The workflow-compatible frame Guide reads the saved final video
-            # even when a dedicated stage-one preview was not connected. Keep
-            # the stage-one latent above for latent consumers, but source its
-            # decoded frames from the final context directory in that case.
-            if video_enabled and not video_path.is_file():
-                final_video_path, _ = _paths(
-                    plan, int(segment_index), for_context=True, context_stage=2
-                )
-                if final_video_path.is_file():
-                    video_path = final_video_path
-                    LOG.info(
-                        "H3 Auto Director: 一采帧 Guide 未找到独立一采视频，改用上一段最终视频：%s",
-                        video_path,
-                    )
-        # Stage-one context intentionally stores the latent first.  Its video
-        # preview is optional because latent-direct Motion Context does not
-        # need a decoded frame stream; stage two keeps the normal video cache.
+            raise FileNotFoundError(err_msg)
+
+        # 3. Load Stage 2 Latent (二采接续潜空间)
+        if stage2_latent_path.is_file():
+            stage2_latent = _load_av_latent(stage2_latent_path)
+            LOG.info("H3 Auto Director: 二采上下文读取上一段二采最终潜空间：%s", stage2_latent_path)
+        elif stage1_latent_path.is_file():
+            stage2_latent = stage1_latent
+            LOG.warning("H3 Auto Director: 二采缓存缺失，回退到一采潜空间：%s", stage1_latent_path)
+        else:
+            stage2_latent = stage1_latent
+
         deferred_decode = bool(plan.get("decode_after_all_segments", False))
-        if not latent_path.exists() or (video_enabled and context_stage != 1 and not video_path.exists() and not deferred_decode):
-            raise FileNotFoundError("Missing context cache for segment %d: %s / %s" % (int(segment_index), video_path, latent_path))
-        LOG.info(
-            "H3 Auto Director: 加载上下文序号 %d（阶段%d）：视频=%s，音频=%s，视频缓存=%s，latent缓存=%s",
-            int(segment_index), context_stage, "开启" if video_enabled else "关闭",
-            "开启" if audio_enabled else "关闭", video_path, latent_path,
-        )
+        if deferred_decode:
+            stage1_latent = dict(stage1_latent)
+            stage1_latent["h3_deferred_decode"] = True
+            stage2_latent = dict(stage2_latent)
+            stage2_latent["h3_deferred_decode"] = True
+
+        # Attach stage 2 latent to stage 1 latent dict so dual sampler can extract it automatically
+        stage1_latent = dict(stage1_latent)
+        stage1_latent["h3_stage2_context_latent"] = stage2_latent
+
         frames = (_load_context_video(video_path) if video_enabled and video_path.exists() and not deferred_decode
-                  else torch.zeros((1, 1, 1, 3), dtype=torch.float32))
-        context_latent = _load_av_latent(latent_path)
-        if bool(plan.get("decode_after_all_segments", False)):
-            # Deferred decoding deliberately leaves no per-segment context
-            # video on disk. Motion Context must use this durable AV latent.
-            context_latent = dict(context_latent)
-            context_latent["h3_deferred_decode"] = True
-        # Keep the final stage-two source explicit for the second pass.  When
-        # stage one already selected that source this is a duplicate by
-        # design; the marker makes the routing unambiguous and keeps old
-        # workflows (where stage-one cache is still the primary source)
-        # compatible.
-        if context_stage == 1:
-            _, stage2_path = _paths(plan, int(segment_index), for_context=True, context_stage=2)
-            if stage2_path.is_file():
-                context_latent = dict(context_latent)
-                context_latent["h3_stage2_context_latent"] = _load_av_latent(stage2_path)
-        return (frames, context_latent)
+                  else empty_image)
+
+        LOG.info(
+            "H3 Auto Director: 加载上下文序号 %d：视频=%s，音频=%s，一采latent=%s，二采latent=%s",
+            int(segment_index), "开启" if video_enabled else "关闭",
+            "开启" if audio_enabled else "关闭", stage1_latent_path, stage2_latent_path,
+        )
+        return (frames, stage1_latent, stage2_latent)
 
 
 class H3AutoDirectorResumeContext:
@@ -6359,9 +6696,9 @@ class H3AutoDirectorMotionContext:
         }, "optional": {
             "context_latent": ("LATENT",),
             "use_video_latent": ("BOOLEAN", {"default": True, "tooltip": "优先直接使用缓存 AV latent 的视频尾部；尺寸不匹配时自动回退至画面编码。"}),
-            "context_method": (["工作流视频帧 Guide", "缓存视频 latent 直取", "自动（latent 优先）"],
-                                {"default": "工作流视频帧 Guide",
-                                 "tooltip": "工作流视频帧 Guide：从磁盘视频解码尾帧后编码并通过 H3 AddGuide 注入；缓存视频 latent 直取：复用缓存 latent；自动：有缓存时优先 latent。"}),
+            "context_method": (["潜空间直取"],
+                                {"default": "潜空间直取",
+                                 "tooltip": "直接复用上一段缓存的 AV latent 潜空间，无需反复进行 VAE 编解码，速度更快且无画质损失。"}),
             "context_sampled_start_tokens": ("INT", {"default": 0, "min": 0, "max": 11, "step": 1,
                 "tooltip": "仅用于缓存 latent 直取。让上下文首部的若干 latent token 参与本段采样；0=首部全部固定 Guide。"}),
             "context_sampled_start_strength": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -6690,12 +7027,12 @@ class H3AutoDirectorMotionContext:
 
     def apply(self, conditioning, vae, latent, context_frames, use_video_context, use_audio_context,
               context_length, context_latent=None, use_video_latent=True,
-              context_method="工作流视频帧 Guide", context_sampled_start_tokens=0,
+              context_method="潜空间直取", context_sampled_start_tokens=0,
               context_sampled_start_strength=0.25, context_sampled_tokens=2,
               context_sampled_strength=0.25, **_legacy_noise):
         global _LAST_MOTION_CONTEXT_TRIM
         stage2_context = context_latent.get("h3_stage2_context_latent") if isinstance(context_latent, dict) else None
-        method = str(context_method or "工作流视频帧 Guide")
+        method = str(context_method or "潜空间直取")
         def with_stage2(value):
             global _LAST_MOTION_CONTEXT_TRIM
             context_trim = int(value[1]) if isinstance(value, (list, tuple)) and len(value) > 1 else 0
@@ -6728,10 +7065,7 @@ class H3AutoDirectorMotionContext:
                     LOG.info("H3 Auto Director: 音频上下文直取不可用，跳过音频上下文：%s", exc)
             return with_stage2((self._attach_stage2_context(conditioning, stage2_context), 0))
         deferred_decode = bool(isinstance(context_latent, dict) and context_latent.get("h3_deferred_decode"))
-        use_direct_latent = ((bool(use_video_latent) or deferred_decode) and context_latent is not None
-                             and (method == "缓存视频 latent 直取"
-                                  or method == "自动（latent 优先）"
-                                  or deferred_decode))
+        use_direct_latent = context_latent is not None
         if deferred_decode and method != "缓存视频 latent 直取":
             LOG.info("H3 Auto Director: 已开启所有片段采样完成后统一解码，视频上下文强制使用缓存潜空间直取")
         # A stage-one cache may predate the separate context-video directory.
@@ -7142,7 +7476,6 @@ class H3AutoDirectorSaveSegment:
         return {"required": {
             "plan": ("H3_AUTO_PLAN",), "segment_index": ("INT", {"default": 1, "min": 1}),
             "latent": ("LATENT",), "images": ("IMAGE",), "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0}),
-            "output_root": ("STRING", {"default": "", "tooltip": "中间片段文件名，不含扩展名；留空使用 H3"}),
             "video_format": (list(VIDEO_FORMATS), {"default": "mp4"}),
             "video_codec": (list(VIDEO_CODECS), {"default": "h264"}),
             "encoder_device": (list(ENCODER_DEVICES), {"default": "CPU"}),
@@ -7169,7 +7502,7 @@ class H3AutoDirectorSaveSegment:
     CATEGORY = "H3 自动导演"
     OUTPUT_NODE = True
 
-    def save(self, plan, segment_index, latent, images, fps, output_root="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量", color_correction="关闭", scene_cut_protection=True, scene_cut_threshold=0.18, correction_strength=0.75, residual_strength=0.2, trim_frames=0, auto_context_crop=False, audio=None, stage1_latent=None, stage1_images=None):
+    def save(self, plan, segment_index, latent, images, fps, video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量", color_correction="关闭", scene_cut_protection=True, scene_cut_threshold=0.18, correction_strength=0.75, residual_strength=0.2, trim_frames=0, auto_context_crop=False, audio=None, stage1_latent=None, stage1_images=None, output_root="", **_legacy_kwargs):
         global _LAST_STAGE1_CONTEXT
         # The dual sampler attaches this only when "最终仅使用一采音频"
         # is enabled.  Prefer it over a separately connected AUDIO decode so
@@ -7230,8 +7563,10 @@ class H3AutoDirectorSaveSegment:
             LOG.warning("H3 Auto Director: 忽略 %.3f fps 设置，H3 视频固定以 %.0f fps 保存", requested_fps, FPS)
         fps = FPS
         plan = _runtime_plan(plan)
-        video_path, latent_path = _paths(plan, int(segment_index), output_root, video_format, for_write=True)
-        context_path = Path(plan["project_dir"]) / CONTEXT_DIR_NAME / video_path.name
+        effective_output_root = (plan.get("output_filename") if isinstance(plan, dict) and plan.get("output_filename") else "") or output_root or "H3"
+        video_path, latent_path = _paths(plan, int(segment_index), effective_output_root, video_format, for_write=True)
+        context_path, _ = _paths(plan, int(segment_index), effective_output_root, video_format,
+                                 for_write=True, for_context=True, context_stage=2)
         video_path.parent.mkdir(parents=True, exist_ok=True)
         context_path.parent.mkdir(parents=True, exist_ok=True)
         latent_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7249,7 +7584,7 @@ class H3AutoDirectorSaveSegment:
         elif correction_mode in {"匹配首段", "匹配上段"} and segment_number <= 1:
             LOG.info("H3 Auto Director: color correction skipped for first segment")
         elif correction_mode in {"匹配首段", "匹配上段"}:
-            anchor_path = _color_reference_path(plan, segment_number, correction_mode, output_root, video_format)
+            anchor_path = _color_reference_path(plan, segment_number, correction_mode, effective_output_root, video_format)
             if anchor_path is None:
                 LOG.warning("H3 Auto Director: color correction skipped; anchor for segment %d is missing", segment_number)
             else:
@@ -7287,7 +7622,7 @@ class H3AutoDirectorSaveSegment:
             stage1_parts = _av_latent_parts(stage1_latent)
             if stage1_parts is not None:
                 stage1_audio = _normalize_h3_audio_latent(stage1_parts[1], "保存前一采音频 latent")
-                _, stage1_cache = _paths(plan, int(segment_index), output_root, video_format,
+                _, stage1_cache = _paths(plan, int(segment_index), effective_output_root, video_format,
                                          for_write=True, for_context=True, context_stage=1)
                 stage1_cache_path = stage1_cache
                 stage1_cache.parent.mkdir(parents=True, exist_ok=True)
@@ -7302,7 +7637,7 @@ class H3AutoDirectorSaveSegment:
                 if (not deferred_decode and stage1_images is not None
                         and torch.is_tensor(stage1_images) and stage1_images.numel()):
                     stage1_images, _ = _trim_context_prefix(stage1_images, None, requested_trim, FPS)
-                    stage1_video, _ = _paths(plan, int(segment_index), output_root, video_format,
+                    stage1_video, _ = _paths(plan, int(segment_index), effective_output_root, video_format,
                                              for_write=True, for_context=True, context_stage=1)
                     stage1_video.parent.mkdir(parents=True, exist_ok=True)
                     _write_segment_video(stage1_video, stage1_images, audio, fps,
@@ -7336,7 +7671,6 @@ class H3AutoDirectorController:
         return {"required": {
             "plan": ("H3_AUTO_PLAN",), "segment_index": ("INT", {"default": 1, "min": 1}), "saved_video": ("STRING",),
             "segment_node_id": ("STRING", {"forceInput": True}),
-            "output_root": ("STRING", {"default": "", "tooltip": "最终视频文件名，不含扩展名；留空使用 H3"}),
             "video_format": (list(VIDEO_FORMATS), {"default": "mp4"}),
             "video_codec": (list(VIDEO_CODECS), {"default": "h264"}),
             "encoder_device": (list(ENCODER_DEVICES), {"default": "CPU"}),
@@ -7388,7 +7722,23 @@ class H3AutoDirectorController:
         codec = str(video_codec or "h264").lower()
         if codec not in VIDEO_CODECS:
             codec = "h264"
-        final_path = final_dir / ("%s.%s" % (_output_filename(output_name), fmt))
+
+        effective_output_name = (plan.get("output_filename") if isinstance(plan, dict) and plan.get("output_filename") else "") or output_name or "H3"
+        stem = _output_filename(effective_output_name)
+        overwrite = _bool_setting(plan.get("overwrite_existing", False), False) if isinstance(plan, dict) else False
+
+        if overwrite:
+            final_path = final_dir / ("%s.%s" % (stem, fmt))
+        else:
+            base_final = final_dir / ("%s.%s" % (stem, fmt))
+            if not base_final.exists():
+                final_path = base_final
+            else:
+                counter = 1
+                while (final_dir / ("%s_%d.%s" % (stem, counter, fmt))).exists():
+                    counter += 1
+                final_path = final_dir / ("%s_%d.%s" % (stem, counter, fmt))
+
         list_path = project_dir / "json" / "concat.txt"
         list_path.parent.mkdir(parents=True, exist_ok=True)
         lines = []
@@ -7400,7 +7750,7 @@ class H3AutoDirectorController:
             # has released its tensors.  Always resolve the numbered clip and
             # final AV latent from the project directory on disk; never rely
             # on an in-memory output from the last segment.
-            clip, latent_path = _paths(plan, index, output_name)
+            clip, latent_path = _paths(plan, index, effective_output_name)
             deferred_decode = bool(plan.get("decode_after_all_segments", False))
             if not deferred_decode and not clip.is_file():
                 raise FileNotFoundError("Cannot assemble; missing segment video: %s" % clip)
@@ -7415,6 +7765,7 @@ class H3AutoDirectorController:
             if deferred_decode:
                 if video_vae is None or audio_vae is None:
                     raise RuntimeError("开启“所有片段采样完成后统一解码”时，拼接节点必须连接视频 VAE 和音频 VAE")
+                LOG.info("H3 Auto Director: 统一解码正在处理第 %d/%d 段（潜变量：%s）...", index, len(plan.get("segments", [])), latent_path.name)
                 parts = _av_latent_parts(_load_av_latent(latent_path))
                 if parts is None:
                     raise ValueError("第 %d 段缓存不是 H3 联合 AV latent" % index)
@@ -7425,7 +7776,7 @@ class H3AutoDirectorController:
                     decoded_images, audio_data = _trim_context_prefix(decoded_images, audio_data, trim, FPS)
                 source = assembly_dir / ("H3_%05d%s" % (index, "." + str(video_format).lower().lstrip(".")))
                 _write_segment_video(source, decoded_images, audio_data, FPS, video_format, video_codec, encoder_device, quality)
-                LOG.info("H3 Auto Director: 统一解码逐段处理第 %d 段（裁剪 %d 帧）", index, trim)
+                LOG.info("H3 Auto Director: 统一解码完成第 %d/%d 段（裁剪 %d 帧）", index, len(plan.get("segments", [])), trim)
                 del decoded_images, decoded_audio, audio_data, parts
                 if torch.cuda.is_available():
                     try: model_management.soft_empty_cache()
@@ -7502,7 +7853,8 @@ class H3AutoDirectorController:
                     final_path = ""
                     state["final_audio"] = ""
                 else:
-                    final_path = self._assemble(runtime, output_root, video_format, video_codec, encoder_device, quality,
+                    effective_output_root = (plan.get("output_filename") if isinstance(plan, dict) and plan.get("output_filename") else "") or output_root or "H3"
+                    final_path = self._assemble(runtime, effective_output_root, video_format, video_codec, encoder_device, quality,
                                                  video_vae=video_vae, audio_vae=audio_vae)
                     final_file = Path(final_path)
                     if not final_file.is_file() or final_file.stat().st_size <= 0:
@@ -7564,7 +7916,6 @@ class H3AutoDirectorTTSController(H3AutoDirectorController):
             "plan": ("H3_AUTO_PLAN",), "segment_index": ("INT", {"default": 1, "min": 1}),
             "saved_video": ("STRING", {"forceInput": True}),
             "segment_node_id": ("STRING", {"forceInput": True}),
-            "output_root": ("STRING", {"default": "", "tooltip": "最终长 WAV 文件名；留空使用 H3"}),
         }, "optional": {
             "cleanup_after_final": ("BOOLEAN", {"default": True}),
         }, "hidden": {"prompt": "PROMPT", "client_id": "CLIENT_ID"}}
@@ -7580,7 +7931,20 @@ class H3AutoDirectorTTSController(H3AutoDirectorController):
         project_dir = Path(plan["project_dir"])
         final_dir = project_dir / "final"
         final_dir.mkdir(parents=True, exist_ok=True)
-        final_path = final_dir / ("%s.wav" % _output_filename(output_name))
+        effective_output_name = (plan.get("output_filename") if isinstance(plan, dict) and plan.get("output_filename") else "") or output_name or "H3"
+        stem = _output_filename(effective_output_name)
+        overwrite = _bool_setting(plan.get("overwrite_existing", False), False) if isinstance(plan, dict) else False
+        if overwrite:
+            final_path = final_dir / ("%s.wav" % stem)
+        else:
+            base_final = final_dir / ("%s.wav" % stem)
+            if not base_final.exists():
+                final_path = base_final
+            else:
+                counter = 1
+                while (final_dir / ("%s_%d.wav" % (stem, counter))).exists():
+                    counter += 1
+                final_path = final_dir / ("%s_%d.wav" % (stem, counter))
         list_path = project_dir / "json" / "audio_concat.txt"
         list_path.parent.mkdir(parents=True, exist_ok=True)
         lines = []

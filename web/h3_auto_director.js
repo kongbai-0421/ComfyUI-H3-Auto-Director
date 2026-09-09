@@ -444,6 +444,9 @@ function applyChineseLabels(node) {
     project: "项目计划", plan: "项目计划", project_id: "总文件夹名称", segments_json: "片段配置", duration: "默认片段时长",
     global_reference_set: "统一参考集", auto_run: "自动连续生成", continuation_mode: "接续模式", auto_context_crop_frames: "自动裁剪上下文帧数",
     decode_after_all_segments: "所有片段完成后统一解码（逐段处理）",
+    skip_reference_encoding: "不编码参考素材",
+    output_filename: "统一输出文件名（留空使用 H3）", overwrite_existing: "是否覆盖已有文件",
+    context_method: "上下文方案",
     enable_audio_drive: "启用音频驱动", audio_drive_file: "音频驱动文件",
     cache_prompt_embeddings: "一次性缓存提示词向量", cache_prompt_embeddings_to_disk: "缓存提示词向量到硬盘", global_assets_json: "统一参考素材",
     segment_index: nodeClass === SEGMENT_NODE || nodeClass === CONTEXT_NODE || nodeClass === RESUME_NODE ? "上下文片段序号" : "片段序号",
@@ -461,12 +464,12 @@ function applyChineseLabels(node) {
     stage1_megapixels: "第一阶段像素数（MP）", stage2_megapixels: "第二阶段像素数（MP）",
     resolution_preview: "当前输出分辨率",
     input_fps: "原视频帧率", interpolation_multiplier: "补帧倍率", vfi_model: "补帧模型", sr_frame_count: "超分处理帧数", sr_scale: "超分倍率（相对原视频）", sr_quality: "RTX VSR 质量", filename: "输出文件名", filename_prefix: "输出文件名前缀", preserve_audio: "保留原视频音频",
-    output_root: nodeClass === SAVE_NODE ? "输出文件名（中间片段，留空使用 H3）" : nodeClass === CONTROLLER_NODE ? "输出文件名（最终视频，留空使用 H3）" : nodeClass === "H3AutoDirectorTTSController" ? "最终长 WAV 文件名（留空使用 H3）" : "项目文件夹名称（保存于 output/h3_project 下）",
+    output_root: "项目文件夹名称（保存于 output/h3_project 下）",
     video_format: "视频格式", video_codec: "编码格式", encoder_device: "编码设备", quality: "编码质量", latent_directory: "潜空间目录（项目目录或 cache）", output_intermediate: "输出中间片段", intermediate_filename: "中间片段文件名前缀", final_filename: "最终视频文件名", auto_crop_frames: "自动裁剪帧数（从第2段开始）", color_correction: "上下文色彩校正", resolution_mode: "控制预处理分辨率", target_width: "生成画布宽度", target_height: "生成画布高度", generation_width: "第一阶段宽度", generation_height: "第一阶段高度", target_short_edge: "参考图最短边",
     scene_cut_protection: "场景切换保护", scene_cut_threshold: "场景切换阈值",
     correction_strength: "校色强度", residual_strength: "残余漂移强度",
     cleanup_after_final: "最终完成后清理显存", sampling_mode: "音频采样切换", audio_sampling: "音频采样方法", scheduler: "调度器", steps: "采样步数", denoise: "降噪",
-    stage1_steps: "第一阶段步数", stage1_denoise: "第一阶段降噪", enable_stage2: "启用第二阶段采样", stage2_use_context: "二采使用上下文接续（实验性，不可用）", stage2_steps: "第二阶段步数", stage2_denoise: "第二阶段降噪",
+    stage1_steps: "第一阶段步数", stage1_denoise: "第一阶段降噪", enable_stage2: "启用第二阶段采样", stage2_use_context: "开启二采上下文接续", stage2_steps: "第二阶段步数", stage2_denoise: "第二阶段降噪",
     stage1_sigmas: "一采 Sigmas 调度", stage2_sigmas: "二采 Sigmas 调度",
     stage1_extend_sigmas: "一采插值扩展 Sigmas", stage1_extend_steps: "一采插值步数", stage1_start_at_sigma: "一采起始 Sigma", stage1_end_at_sigma: "一采结束 Sigma", stage1_spacing: "一采间距方式",
     stage2_extend_sigmas: "二采插值扩展 Sigmas", stage2_extend_steps: "二采插值步数", stage2_start_at_sigma: "二采起始 Sigma", stage2_end_at_sigma: "二采结束 Sigma", stage2_spacing: "二采间距方式",
@@ -511,7 +514,25 @@ function decorateNode(node) {
   if (nodeClass === DUAL_STAGE_LOADER_NODE) cleanDualStageLoaderPorts(node);
   if (nodeClass === SAMPLING_SWITCH_NODE) cleanSamplingSwitchPorts(node);
   if (nodeClass === CONTROL_PREPROCESS_NODE) removeRetiredPorts(node, ["source_video_path", "视频路径（可选）"], []);
-  if (nodeClass === CONTROLLER_NODE) removeRetiredPorts(node, ["crop_context_on_assemble", "拼接前裁剪上下文"]);
+  if (nodeClass === CONTROLLER_NODE) removeRetiredPorts(node, ["crop_context_on_assemble", "拼接前裁剪上下文", "output_root", "输出文件名（最终视频，留空使用 H3）"]);
+  if (nodeClass === SAVE_NODE) removeRetiredPorts(node, ["output_root", "输出文件名（中间片段，留空使用 H3）"]);
+  if (nodeClass === CONTEXT_NODE) {
+    removeRetiredPorts(node, ["context_stage"]);
+    if (!(node.outputs || []).some((output) => output?.name === "二采上下文潜变量")) {
+      node.addOutput?.("二采上下文潜变量", "LATENT");
+    }
+    if (node.outputs?.[0]) node.outputs[0].name = "上下文画面";
+    if (node.outputs?.[1]) node.outputs[1].name = "上下文潜变量";
+    if (node.outputs?.[2]) node.outputs[2].name = "二采上下文潜变量";
+  }
+  if (nodeClass === MOTION_CONTEXT_NODE) {
+    const methodWidget = widget(node, "context_method");
+    if (methodWidget) {
+      methodWidget.options = methodWidget.options || {};
+      methodWidget.options.values = ["潜空间直取"];
+      methodWidget.value = "潜空间直取";
+    }
+  }
   if (nodeClass === NODE && !widget(node, "edit_segments")) {
     const button = node.addWidget("button", "edit_segments", "编辑片段", () => openEditor(node));
     button.label = "编辑片段";
@@ -525,6 +546,19 @@ function decorateNode(node) {
   if (nodeClass === TTS_NODE && !widget(node, "edit_tts")) {
     const button = node.addWidget("button", "edit_tts", "编辑 TTS 片段", () => openTTSPlanEditor(node));
     button.label = "编辑 TTS 片段";
+    button.serialize = false;
+  }
+  if (nodeClass === SEGMENT_NODE && !widget(node, "reset_segment_index")) {
+    const button = node.addWidget("button", "reset_segment_index", "↺ 重置为第 1 段 (序号 0)", () => {
+      const segW = widget(node, "segment_index");
+      if (segW) {
+        segW.value = 0;
+        segW.callback?.(0);
+        node.setDirtyCanvas?.(true, true);
+        node.graph?.setDirtyCanvas?.(true, true);
+      }
+    });
+    button.label = "↺ 重置为第 1 段 (序号 0)";
     button.serialize = false;
   }
   if (nodeClass === TRANSFER_NODE && !widget(node, "use_reference_video_material")) {
@@ -548,10 +582,15 @@ function decorateNode(node) {
     continuation_mode: "接续模式",
     auto_context_crop_frames: "自动裁剪上下文帧数",
     decode_after_all_segments: "所有片段完成后统一解码（逐段处理）",
+    skip_reference_encoding: "不编码参考素材",
     cache_prompt_embeddings: "一次性缓存提示词向量",
     cache_prompt_embeddings_to_disk: "缓存提示词向量到硬盘",
     global_assets_json: "统一参考素材",
     output_root: nodeClass === SAVE_NODE ? "输出文件名（中间片段，留空使用 H3）" : nodeClass === CONTROLLER_NODE ? "输出文件名（最终视频，留空使用 H3）" : "项目文件夹名称（保存于 output/h3_project 下）",
+    output_filename: "统一输出文件名（留空使用 H3）",
+    overwrite_existing: "覆盖已有文件",
+    context_method: "上下文方案",
+    stage2_use_context: "开启二采上下文接续",
     video_format: "视频格式",
     video_codec: "编码格式",
     encoder_device: "编码设备",
@@ -582,10 +621,15 @@ function decorateNode(node) {
     edit_tts: "编辑 TTS 片段",
   };
   applyChineseLabels(node);
-  if (nodeClass === SAVE_NODE) {
+  if (nodeClass === SAVE_NODE || nodeClass === CONTROLLER_NODE) {
     const output = widget(node, "output_root");
-    // Migrate the old directory default without touching the workflow file.
-    if (output && String(output.value || "").trim() === "h3_projects") { output.value = ""; output.callback?.(output.value); }
+    if (output) {
+      if (nodeClass === SAVE_NODE && String(output.value || "").trim() === "h3_projects") {
+        output.value = "";
+        output.callback?.(output.value);
+      }
+      output.label = "输出文件名（可选，留空沿用计划设置）";
+    }
   }
   normalizeSaveFps(node);
 }
@@ -659,12 +703,30 @@ function decorateCachedReference(node) {
       }
     }
     if (typeof node.computeSize === "function" && typeof node.setSize === "function") {
-      node.setSize(node.computeSize());
+      const computed = node.computeSize();
+      const currentW = Array.isArray(node.size) ? node.size[0] : 0;
+      const currentH = Array.isArray(node.size) ? node.size[1] : 0;
+      const savedW = node.properties?.h3_node_size?.[0] || 0;
+      const savedH = node.properties?.h3_node_size?.[1] || 0;
+      const targetW = Math.max(currentW, computed[0], savedW, 350);
+      const targetH = Math.max(currentH, computed[1], savedH, 310);
+      if (currentW < targetW || currentH < targetH) {
+        node.setSize([targetW, targetH]);
+      }
     }
     node.setDirtyCanvas(true, true);
   };
   if (!node.__h3CachedReferenceSizingBound) {
     node.__h3CachedReferenceSizingBound = true;
+    const origResize = node.onResize;
+    node.onResize = function (size) {
+      const res = origResize?.apply(this, arguments);
+      if (Array.isArray(size)) {
+        this.properties = this.properties || {};
+        this.properties.h3_node_size = [size[0], size[1]];
+      }
+      return res;
+    };
     const switchMode = (source, modeName, value, args, previous) => {
       // LiteGraph versions differ in when they assign widget.value. Prefer
       // the callback argument when present; it is the newly clicked state.
@@ -1155,6 +1217,100 @@ function showAudioShortageDialog({ audioDuration, totalVideoDuration, onModifyVi
   document.body.appendChild(modalShade);
 }
 
+function showContextMissingModal(data) {
+  const existing = document.getElementById("h3-context-missing-dialog");
+  if (existing) existing.remove();
+
+  const modalShade = document.createElement("div");
+  modalShade.id = "h3-context-missing-dialog";
+  modalShade.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:10002;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;font-family:system-ui,sans-serif";
+
+  const box = document.createElement("div");
+  box.style.cssText = "width:min(640px,94vw);background:#1e242c;color:#eee;border:2px solid #e06c75;border-radius:10px;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.7);display:flex;flex-direction:column;gap:14px;box-sizing:border-box";
+
+  const title = document.createElement("h3");
+  title.innerHTML = "⚠️ H3 自动导演：上下文潜空间缺失";
+  title.style.cssText = "margin:0;font-size:18px;color:#ff6b6b;display:flex;align-items:center;gap:8px;border-bottom:1px solid #3d444d;padding-bottom:10px";
+  box.appendChild(title);
+
+  const targetSeg = data.target_segment || ((data.context_segment || 0) + 1);
+  const contextSeg = data.context_segment || 0;
+
+  const desc = document.createElement("div");
+  desc.style.cssText = "font-size:13px;line-height:1.6;background:#291a1d;border:1px solid #5c262a;border-radius:6px;padding:12px;color:#f8d7da";
+  desc.innerHTML = `
+    <div style="font-weight:bold;margin-bottom:6px;font-size:14px;color:#ff8585">❌ 报错原因分析：</div>
+    <div>当前工作流正在请求生成【<b style="color:#61afef;font-size:14px">第 ${targetSeg} 段</b>】。因该段开启了视频/音频接续，必须基于上一段（<b style="color:#e5c07b;font-size:14px">第 ${contextSeg} 段</b>）生成的潜空间继续运行，但在当前工程缓存目录中<b>未找到第 ${contextSeg} 段的潜空间文件</b>。</div>
+  `;
+  box.appendChild(desc);
+
+  const sol = document.createElement("div");
+  sol.style.cssText = "font-size:13px;line-height:1.6;background:#171c23;border:1px solid #30363d;border-radius:6px;padding:12px;color:#c9d1d9";
+  sol.innerHTML = `
+    <div style="font-weight:bold;margin-bottom:8px;font-size:14px;color:#7ee787">💡 明确排查与解决方法：</div>
+    <div style="margin-bottom:10px">
+      <b style="color:#58a6ff">方案 1（新项目 / 重新生成整个视频）：</b><br>
+      如果你想从头开始生成整个视频，请点击下方绿色按钮 <b style="color:#98c379">【↺ 一键重置片段序号为 0】</b>，即可将画布中【片段解析】节点的【上下文片段序号】重置为 0（从第 1 段开始生成）。
+    </div>
+    <div>
+      <b style="color:#e5c07b">方案 2（断点接续生成）：</b><br>
+      请检查第 <b>${contextSeg}</b> 段是否已被生成并存放在项目目录。若尚未生成，请手动将【片段解析】节点的【上下文片段序号】调整为已完成的最后一段序号。
+    </div>
+  `;
+  box.appendChild(sol);
+
+  const details = document.createElement("details");
+  details.style.cssText = "background:#121519;border:1px solid #30363d;border-radius:6px;padding:8px 12px;font-size:12px;color:#8b949e";
+  details.innerHTML = `
+    <summary style="cursor:pointer;color:#aeb7c1;font-weight:bold">点击展开检查的工程路径与候选文件</summary>
+    <div style="margin-top:8px;word-break:break-all;line-height:1.5">
+      <div><b>项目名称：</b>${data.project_name || "未指定"}</div>
+      <div><b>工程目录：</b>${data.project_dir || "未找到"}</div>
+      <div style="margin-top:4px"><b>一采候选潜空间：</b>${data.stage1_path || "无"}</div>
+      <div><b>二采候选潜空间：</b>${data.stage2_path || "无"}</div>
+    </div>
+  `;
+  box.appendChild(details);
+
+  const btnRow = document.createElement("div");
+  btnRow.style.cssText = "display:flex;flex-wrap:wrap;justify-content:flex-end;gap:10px;margin-top:4px";
+
+  const resetBtn = makeButton("↺ 一键重置片段序号为 0 并关闭", () => {
+    let resetCount = 0;
+    const allNodes = app.graph?._nodes || [];
+    for (const n of allNodes) {
+      if (n.type === SEGMENT_NODE || n.comfyClass === SEGMENT_NODE) {
+        const sw = widget(n, "segment_index");
+        if (sw) {
+          sw.value = 0;
+          sw.callback?.(0);
+          n.setDirtyCanvas?.(true, true);
+          resetCount++;
+        }
+      }
+    }
+    app.graph?.setDirtyCanvas?.(true, true);
+    modalShade.remove();
+    alert(`已成功将 ${resetCount} 个【片段解析】节点的上下文片段序号重置为 0！\n现在点击【提示词加入队列】即可从第 1 段从头开始正常生成。`);
+  });
+  resetBtn.style.cssText = "padding:8px 16px;background:#238636;color:#fff;border:1px solid #2ea043;border-radius:6px;cursor:pointer;font-weight:bold;font-size:13px";
+
+  const closeBtn = makeButton("我知道了 (关闭)", () => modalShade.remove());
+  closeBtn.style.cssText = "padding:8px 16px;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;cursor:pointer;font-size:13px";
+
+  btnRow.append(resetBtn, closeBtn);
+  box.appendChild(btnRow);
+  modalShade.appendChild(box);
+  document.body.appendChild(modalShade);
+}
+
+try {
+  api.addEventListener("h3-auto-director-context-missing", (event) => {
+    const data = event?.detail || {};
+    showContextMissingModal(data);
+  });
+} catch (_) {}
+
 function openEditor(node) {
   let segments = readSegments(node);
   if (!segments.length) segments = [{ prompt: "", duration: 5, audio_restart: false, references: [] }];
@@ -1237,6 +1393,41 @@ function openEditor(node) {
       segments = next; directInput.value = JSON.stringify(segments, null, 2); segmentCountInput.value = segments.length; render(); notice.textContent = "已应用直接输入的片段配置。";
     } catch (error) { notice.textContent = `JSON 无效：${error.message || error}`; }
   }));
+  directActions.appendChild(makeButton("仅增加/替换提示词", () => {
+    try {
+      const parsed = JSON.parse(directInput.value);
+      const list = Array.isArray(parsed) ? parsed : (parsed && typeof parsed === "object" ? [parsed] : []);
+      if (!list.length) throw new Error("输入必须是包含提示词的数组或对象");
+      const incomingPrompts = list.map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object") return String(item.prompt ?? item.text ?? item.positive ?? "");
+        return String(item || "");
+      });
+      let replaced = 0;
+      let added = 0;
+      for (let i = 0; i < incomingPrompts.length; i++) {
+        const text = incomingPrompts[i];
+        if (i < segments.length) {
+          segments[i].prompt = text;
+          replaced++;
+        } else {
+          const raw = list[i];
+          const seg = (raw && typeof raw === "object") ? normalizeSegment(raw) : {
+            prompt: text, duration: 5, duration_mode: "seconds",
+            audio_restart: false, continue_audio: true, continue_video: true,
+            references: [], _references_open: false,
+          };
+          seg.prompt = text;
+          segments.push(seg);
+          added++;
+        }
+      }
+      directInput.value = JSON.stringify(segments, null, 2);
+      segmentCountInput.value = String(segments.length);
+      render();
+      notice.textContent = `已替换 ${replaced} 个片段的提示词（保留原有素材与时长设置）${added > 0 ? `，并追加了 ${added} 个新片段` : ""}。`;
+    } catch (error) { notice.textContent = `提示词应用失败：${error.message || error}`; }
+  }, "保持各分段的时长、参考素材、开关等配置不变，仅按顺序替换现有提示词；若输入提示词超出当前片段数则自动追加"));
   directActions.appendChild(makeButton("从列表更新 JSON", () => { directInput.value = JSON.stringify(segments, null, 2); }));
   directPanel.appendChild(directActions); panel.appendChild(directPanel);
 
@@ -1282,6 +1473,13 @@ function openEditor(node) {
   deferredDecode.title = "全部采样后从硬盘逐段读取 latent、逐段解码并拼接；开启时视频上下文固定使用缓存潜空间直取。";
   deferredPanel.append(deferredDecode, "所有片段采样完成后统一解码（逐段处理，不同时占用多段显存）");
   panel.appendChild(deferredPanel);
+
+  const skipRefPanel = document.createElement("label"); skipRefPanel.style.cssText = "display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;padding:8px 10px;background:#171b20;border:1px solid #424b55;border-radius:6px;margin-bottom:12px;font-size:12px;line-height:1.45;min-width:0";
+  const skipRefWidget = widget(node, "skip_reference_encoding");
+  const skipRefToggle = document.createElement("input"); skipRefToggle.type = "checkbox"; skipRefToggle.checked = !!skipRefWidget?.value;
+  skipRefToggle.title = "不使用 VAE 预编码参考素材（跳过图像/视频/音频参考编码，加速且省显存）；若某素材设置了插入时间或帧，将自动强制开启素材编码以完成画面插入。";
+  skipRefPanel.append(skipRefToggle, "不编码参考素材（纯文本加速；若素材设置了插入时间则自动强制编码）");
+  panel.appendChild(skipRefPanel);
 
   // Audio Drive Panel
   const audioDriveWidget = widget(node, "enable_audio_drive");
@@ -1681,7 +1879,16 @@ function openEditor(node) {
   };
   render();
 
-  const actions = document.createElement("div"); actions.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;margin-top:12px;min-width:0";
+  const actions = document.createElement("div"); actions.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;align-items:center;margin-top:12px;min-width:0";
+  const resetSegLabel = document.createElement("label");
+  resetSegLabel.style.cssText = "display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#cbd5e1;cursor:pointer;margin-right:auto;user-select:none";
+  const resetSegCheckbox = document.createElement("input");
+  resetSegCheckbox.type = "checkbox";
+  resetSegCheckbox.checked = true;
+  resetSegLabel.appendChild(resetSegCheckbox);
+  resetSegLabel.append("保存时重置片段序号为 0（从第 1 段从头开始生成）");
+  actions.appendChild(resetSegLabel);
+
   actions.appendChild(makeButton("+ 添加片段", () => { segments.push({ prompt: "", duration: 5, audio_restart: false, continue_video: true, use_previous_video_reference: false, references: [] }); render(); }));
   actions.appendChild(makeButton("将第 1 段参考素材应用到全部", () => { const refs = JSON.parse(JSON.stringify(segments[0].references || [])); segments.forEach((seg) => { seg.references = JSON.parse(JSON.stringify(refs)); }); render(); }));
   actions.appendChild(makeButton("取消", () => shade.remove()));
@@ -1706,6 +1913,10 @@ function openEditor(node) {
         deferredWidget.value = deferredDecode.checked;
         deferredWidget.callback?.(deferredDecode.checked);
       }
+      if (skipRefWidget) {
+        skipRefWidget.value = skipRefToggle.checked;
+        skipRefWidget.callback?.(skipRefToggle.checked);
+      }
       if (audioDriveWidget) {
         audioDriveWidget.value = audioDriveToggle.checked;
         audioDriveWidget.callback?.(audioDriveWidget.value);
@@ -1713,6 +1924,17 @@ function openEditor(node) {
       if (audioDriveFileWidget) {
         audioDriveFileWidget.value = audioDrivePath.value.trim();
         audioDriveFileWidget.callback?.(audioDriveFileWidget.value);
+      }
+      if (resetSegCheckbox.checked) {
+        const segNodes = (node.graph?._nodes || app.graph?._nodes || []).filter((n) => n.type === SEGMENT_NODE || n.comfyClass === SEGMENT_NODE);
+        for (const sn of segNodes) {
+          const sw = widget(sn, "segment_index");
+          if (sw && sw.value !== 0) {
+            sw.value = 0;
+            sw.callback?.(0);
+            sn.setDirtyCanvas?.(true, true);
+          }
+        }
       }
       syncSerializedWidgets(node);
       node.setDirtyCanvas?.(true, true);
@@ -1754,13 +1976,26 @@ app.registerExtension({
     if (nodeData.name === NODE) {
       const originalConfigure = nodeType.prototype.onConfigure;
       nodeType.prototype.onConfigure = function (info) {
-        // Older workflows serialized the removed global previous-video widget
-        // between continuation_mode and cache_prompt_embeddings. Drop only
-        // that value so all remaining widgets keep their original meaning.
         const legacy = Array.isArray(info?.inputs)
           && info.inputs.some((input) => input?.name === "use_previous_video_reference");
         if (legacy && Array.isArray(info.widgets_values) && info.widgets_values.length >= 10) {
           info = { ...info, widgets_values: info.widgets_values.slice(0, 6).concat(info.widgets_values.slice(7)) };
+        }
+        if (Array.isArray(info?.widgets_values)) {
+          let values = [...info.widgets_values];
+          if (typeof values[9] === "boolean" || values.length <= 14) {
+            values.splice(9, 0, "", false);
+          }
+          if (typeof values[9] === "boolean" || values[9] === "true" || values[9] === "false") {
+            values[9] = "";
+          }
+          if (values[10] === "覆盖已有文件" || values[10] === "true") {
+            values[10] = false;
+          }
+          if (values.length > 13 && (Number.isNaN(Number(values[13])) || typeof values[13] !== "number")) {
+            values[13] = 0;
+          }
+          info = { ...info, widgets_values: values };
         }
         return originalConfigure?.call(this, info);
       };
@@ -1775,8 +2010,6 @@ app.registerExtension({
           inputs = inputs.filter((input) => !noiseNames.has(input?.name));
           values = values ? values.slice(0, 5) : values;
         }
-        // Add the head/tail redraw controls to old serialized workflows that
-        // predate this feature. Existing context_method remains in place.
         const hasMethod = inputs.some((input) => input?.name === "context_method");
         const redrawInputs = [
           ["context_sampled_start_tokens", "首部可采样 latent token 数", "INT"],
@@ -1791,6 +2024,13 @@ app.registerExtension({
             if (values) values = values.concat([0, 0.25, 2, 0.25].slice(0, missing.length));
           }
         }
+        if (Array.isArray(values)) {
+          for (let i = 0; i < values.length; i++) {
+            if (values[i] === "缓存视频 latent 直取" || values[i] === "自动（latent 优先）" || values[i] === "帧 Guide VAE 回退") {
+              values[i] = "潜空间直取";
+            }
+          }
+        }
         if (inputs !== info?.inputs || values !== info?.widgets_values) {
           info = { ...info, inputs, widgets_values: values };
         }
@@ -1800,22 +2040,56 @@ app.registerExtension({
     if (nodeData.name === CONTROLLER_NODE) {
       const originalConfigure = nodeType.prototype.onConfigure;
       nodeType.prototype.onConfigure = function (info) {
-        const inputs = Array.isArray(info?.inputs) ? info.inputs : [];
+        let inputs = Array.isArray(info?.inputs) ? info.inputs : [];
+        let values = Array.isArray(info?.widgets_values) ? [...info.widgets_values] : info?.widgets_values;
         const cropIndex = inputs.findIndex((input) => input?.name === "crop_context_on_assemble");
         if (cropIndex >= 0) {
-          const values = Array.isArray(info?.widgets_values) ? [...info.widgets_values] : info?.widgets_values;
-          if (values && cropIndex >= 0 && values.length > 0) values.pop();
-          info = { ...info, inputs: inputs.filter((input) => input?.name !== "crop_context_on_assemble"), widgets_values: values };
+          if (values && values.length > 0) values.pop();
+          inputs = inputs.filter((input) => input?.name !== "crop_context_on_assemble");
         }
+        if (values && values.length > 0) {
+          const formats = new Set(["mp4", "mkv", "mov", "webm"]);
+          const fmtIdx = values.findIndex((v) => typeof v === "string" && formats.has(v.toLowerCase()));
+          if (fmtIdx > 0 && typeof values[fmtIdx - 1] === "string" && !formats.has(values[fmtIdx - 1].toLowerCase())) {
+            values.splice(fmtIdx - 1, 1);
+          }
+        }
+        info = { ...info, inputs: inputs.filter((input) => input?.name !== "output_root"), widgets_values: values };
+        return originalConfigure?.call(this, info);
+      };
+    }
+    if (nodeData.name === SAVE_NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        let inputs = Array.isArray(info?.inputs) ? info.inputs : [];
+        let values = Array.isArray(info?.widgets_values) ? [...info.widgets_values] : info?.widgets_values;
+        if (values && values.length > 0) {
+          const formats = new Set(["mp4", "mkv", "mov", "webm"]);
+          const fmtIdx = values.findIndex((v) => typeof v === "string" && formats.has(v.toLowerCase()));
+          if (fmtIdx > 0 && typeof values[fmtIdx - 1] === "string" && !formats.has(values[fmtIdx - 1].toLowerCase())) {
+            values.splice(fmtIdx - 1, 1);
+          }
+        }
+        info = { ...info, inputs: inputs.filter((input) => input?.name !== "output_root"), widgets_values: values };
+        return originalConfigure?.call(this, info);
+      };
+    }
+    if (nodeData.name === CONTEXT_NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        let inputs = Array.isArray(info?.inputs) ? info.inputs : [];
+        let values = Array.isArray(info?.widgets_values) ? [...info.widgets_values] : info?.widgets_values;
+        inputs = inputs.filter((input) => input?.name !== "context_stage");
+        if (values && values.length > 1) {
+          values = values.slice(0, 1);
+        }
+        info = { ...info, inputs, widgets_values: values };
         return originalConfigure?.call(this, info);
       };
     }
     if (nodeData.name === TTS_NODE) {
       const originalConfigure = nodeType.prototype.onConfigure;
       nodeType.prototype.onConfigure = function (info) {
-        // Older TTS workflows serialized global reference/audio widgets. The
-        // current node stores those values per segment, so drop the obsolete
-        // widget slots while preserving the remaining values by name.
         const inputs = Array.isArray(info?.inputs) ? info.inputs : [];
         const names = inputs.map((input) => input?.name);
         const legacyNames = ["reference_video_json", "reference_assets_json", "pass_reference_video_audio", "audio_restart_segments"];
@@ -1824,19 +2098,31 @@ app.registerExtension({
           const values = Object.fromEntries(names.map((name, index) => [name, info.widgets_values[index]]));
           info = { ...info, widgets_values: keep.map((name) => values[name]) };
         }
+        if (Array.isArray(info?.widgets_values)) {
+          let values = [...info.widgets_values];
+          if (typeof values[7] === "boolean" || values.length <= 9) {
+            values.splice(7, 0, "", false);
+          }
+          info = { ...info, widgets_values: values };
+        }
         return originalConfigure?.call(this, info);
       };
     }
     if (nodeData.name === TRANSFER_NODE) {
       const originalConfigure = nodeType.prototype.onConfigure;
       nodeType.prototype.onConfigure = function (info) {
-        // Remove the two retired freeze widgets by name so the values that
-        // follow them keep their correct input mapping in old workflows.
-        const names = Array.isArray(info?.inputs) ? info.inputs.map((input) => input?.name) : [];
+        const names = Array.isArray(info?.inputs) ? info.inputs : [];
         const retired = ["freeze_video_sampling", "freeze_audio_sampling"];
-        if (retired.some((name) => names.includes(name)) && Array.isArray(info.widgets_values)) {
-          info = { ...info, widgets_values: info.widgets_values.filter((_, index) => !retired.includes(names[index])) };
+        let values = Array.isArray(info?.widgets_values) ? [...info.widgets_values] : info?.widgets_values;
+        if (retired.some((name) => names.includes(name)) && Array.isArray(values)) {
+          values = values.filter((_, index) => !retired.includes(names[index]));
         }
+        if (Array.isArray(values)) {
+          if (typeof values[14] === "boolean" || values.length <= 16) {
+            values.splice(14, 0, "", false);
+          }
+        }
+        info = { ...info, widgets_values: values };
         return originalConfigure?.call(this, info);
       };
     }
@@ -1976,6 +2262,29 @@ app.registerExtension({
             values.stage1_megapixels ?? 0.4, values.stage2_megapixels ?? 0.98, values.multiple ?? 32] };
         }
         return originalConfigure?.call(this, info);
+      };
+    }
+    if (nodeData.name === CACHED_REFERENCE_NODE) {
+      const originalConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        if (info) {
+          const w = info.properties?.h3_node_size?.[0] || info.size?.[0] || 0;
+          const h = info.properties?.h3_node_size?.[1] || info.size?.[1] || 0;
+          info.size = [Math.max(Number(w) || 0, 350), Math.max(Number(h) || 0, 310)];
+        }
+        const res = originalConfigure?.call(this, info);
+        if (Array.isArray(this.size)) {
+          this.size[0] = Math.max(this.size[0], 350);
+          this.size[1] = Math.max(this.size[1], 310);
+        }
+        return res;
+      };
+      const originalCompute = nodeType.prototype.computeSize;
+      nodeType.prototype.computeSize = function (...args) {
+        const sz = originalCompute ? originalCompute.apply(this, args) : [350, 310];
+        const savedW = this.properties?.h3_node_size?.[0] || 0;
+        const savedH = this.properties?.h3_node_size?.[1] || 0;
+        return [Math.max(sz[0] || 0, savedW, 350), Math.max(sz[1] || 0, savedH, 310)];
       };
     }
     if (H3_NODE_CLASSES.has(nodeData.name)) {
