@@ -1262,7 +1262,7 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
                  enable_preview=False, sigmas=None, extend_sigmas=False,
                  extend_steps=2, extend_start_at_sigma=-1.0,
                  extend_end_at_sigma=12.0, extend_spacing="linear",
-                 keep_model_loaded=True):
+                 keep_model_loaded=None):
     """Run one positive-only H3 sampling pass, matching BasicGuider semantics."""
     conditioning = _conditioning_entries(conditioning)
     if not _has_positive_conditioning(conditioning):
@@ -1345,13 +1345,20 @@ def _dual_sample(model, conditioning, latent, sampler_name, scheduler, steps, de
     result = dict(latent)
     result["samples"] = samples
     result["_h3_sampling_model_ref"] = model
-    if bool(keep_model_loaded):
-        global _KEEP_MODEL_LOADED_ACTIVE, _RESIDENT_SAMPLING_MODELS
+    global _KEEP_MODEL_LOADED_ACTIVE, _RESIDENT_SAMPLING_MODELS
+    is_resident = _KEEP_MODEL_LOADED_ACTIVE if keep_model_loaded is None else bool(keep_model_loaded)
+    if is_resident:
         _KEEP_MODEL_LOADED_ACTIVE = True
         if model not in _RESIDENT_SAMPLING_MODELS:
             _RESIDENT_SAMPLING_MODELS.append(model)
             while len(_RESIDENT_SAMPLING_MODELS) > 4:
                 _RESIDENT_SAMPLING_MODELS.pop(0)
+    else:
+        if model in _RESIDENT_SAMPLING_MODELS:
+            try:
+                _RESIDENT_SAMPLING_MODELS.remove(model)
+            except ValueError:
+                pass
     return result
 
 
@@ -2420,10 +2427,8 @@ class H3AutoDirectorDualSampling:
             "stage2_start_at_sigma": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 20000.0, "step": 0.01, "round": False}),
             "stage2_end_at_sigma": ("FLOAT", {"default": 12.0, "min": 0.0, "max": 20000.0, "step": 0.01, "round": False}),
             "stage2_spacing": (["linear", "cosine", "sine"], {"default": "linear"}),
-            "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "模型常驻显存", "label_off": "自动卸载模型",
-                                  "tooltip": "采样完成后保持模型在显存中常驻，避免片段切换时重复经历模型初始化的显存装载与 LoRA 补丁计算"}),
         }, "optional": {
-            "plan": ("H3_AUTO_PLAN", {"tooltip": "可选。连接项目计划后，开启统一解码时会在所有片段采样完成前禁止任何视频/音频解码；同时自动继承模型常驻显存设置。"}),
+            "plan": ("H3_AUTO_PLAN", {"tooltip": "可选。连接项目计划后，开启统一解码时会在所有片段采样完成前禁止任何视频/音频解码；同时由项目计划统一控制模型常驻显存。"}),
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
             "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’的采样调度信息；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
@@ -2449,10 +2454,17 @@ class H3AutoDirectorDualSampling:
                stage1_extend_sigmas=False, stage1_extend_steps=2, stage1_start_at_sigma=-1.0,
                stage1_end_at_sigma=12.0, stage1_spacing="linear", stage2_extend_sigmas=False,
                stage2_extend_steps=2, stage2_start_at_sigma=-1.0, stage2_end_at_sigma=12.0,
-               stage2_spacing="linear", keep_model_loaded=True, control_config=None, plan=None, **_legacy_unused):
-        global _LAST_STAGE1_CONTEXT
+               stage2_spacing="linear", control_config=None, plan=None, keep_model_loaded=None, **_legacy_unused):
+        global _LAST_STAGE1_CONTEXT, _KEEP_MODEL_LOADED_ACTIVE
         if isinstance(plan, dict) and "keep_model_loaded" in plan:
-            keep_model_loaded = bool(plan["keep_model_loaded"])
+            _KEEP_MODEL_LOADED_ACTIVE = bool(plan["keep_model_loaded"])
+            effective_keep_model_loaded = _KEEP_MODEL_LOADED_ACTIVE
+        elif keep_model_loaded is not None:
+            effective_keep_model_loaded = bool(keep_model_loaded)
+        elif "keep_model_loaded" in _legacy_unused:
+            effective_keep_model_loaded = bool(_legacy_unused["keep_model_loaded"])
+        else:
+            effective_keep_model_loaded = bool(_KEEP_MODEL_LOADED_ACTIVE)
         deferred_decode = bool(isinstance(plan, dict) and plan.get("decode_after_all_segments", False))
         if stage1_model is None:
             stage1_model = _legacy_unused.get("model")
@@ -2484,7 +2496,7 @@ class H3AutoDirectorDualSampling:
         first = _dual_sample(first_model, stage1_conditioning, latent, sampler_name, scheduler,
                              stage1_steps, stage1_denoise, seed, enable_preview, stage1_sigmas,
                              stage1_extend_sigmas, stage1_extend_steps, stage1_start_at_sigma,
-                             stage1_end_at_sigma, stage1_spacing, keep_model_loaded=keep_model_loaded)
+                             stage1_end_at_sigma, stage1_spacing, keep_model_loaded=effective_keep_model_loaded)
         # SaveSegment consumes this immediately after the sampler.  Keeping it
         # here preserves compatibility with existing graphs that do not expose
         # the optional first-stage latent socket.
@@ -2647,7 +2659,7 @@ class H3AutoDirectorDualSampling:
                              stage2_steps, stage2_denoise, int(seed) + 1, enable_preview,
                              effective_stage2_sigmas, stage2_extend_sigmas, stage2_extend_steps,
                              stage2_start_at_sigma, stage2_end_at_sigma, stage2_spacing,
-                             keep_model_loaded=keep_model_loaded)
+                             keep_model_loaded=effective_keep_model_loaded)
         if bool(use_stage1_audio_only):
             final_parts = _av_latent_parts(final)
             if final_parts is None:
@@ -2711,10 +2723,8 @@ class H3AutoDirectorDualSamplingModel:
             "stage2_start_at_sigma": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 20000.0, "step": 0.01, "round": False}),
             "stage2_end_at_sigma": ("FLOAT", {"default": 12.0, "min": 0.0, "max": 20000.0, "step": 0.01, "round": False}),
             "stage2_spacing": (["linear", "cosine", "sine"], {"default": "linear"}),
-            "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "模型常驻显存", "label_off": "自动卸载模型",
-                                  "tooltip": "采样完成后保持模型在显存中常驻，避免片段切换时重复经历模型初始化的显存装载与 LoRA 补丁计算"}),
         }, "optional": {
-            "plan": ("H3_AUTO_PLAN", {"tooltip": "可选。连接项目计划以自动继承模型常驻与统一解码等全局设置。"}),
+            "plan": ("H3_AUTO_PLAN", {"tooltip": "可选。连接项目计划以由项目计划统一控制模型常驻与统一解码等全局设置。"}),
             "upscale_model": ("UPSCALE_MODEL",),
             "stage2_model": ("MODEL", {"tooltip": "可选。连接外部 LoRA/显存优化后的第二阶段模型；未连接时自动复用一采模型。"}),
             "audio_sampling": ("H3_AUDIO_SAMPLING", {"tooltip": "可选。连接‘音频采样切换’的采样调度信息；它只设置 H3 音频采样方法与偏移，不会覆盖两阶段的步数、降噪或调度器。"}),
@@ -2741,7 +2751,7 @@ class H3AutoDirectorDualSamplingModel:
                stage1_extend_sigmas=False, stage1_extend_steps=2, stage1_start_at_sigma=-1.0,
                stage1_end_at_sigma=12.0, stage1_spacing="linear", stage2_extend_sigmas=False,
                stage2_extend_steps=2, stage2_start_at_sigma=-1.0, stage2_end_at_sigma=12.0,
-               stage2_spacing="linear", keep_model_loaded=True, control_config=None, plan=None, **_legacy_unused):
+               stage2_spacing="linear", control_config=None, plan=None, keep_model_loaded=None, **_legacy_unused):
         return H3AutoDirectorDualSampling().sample(
             stage1_model, conditioning, latent, video_vae, audio_vae, sampler_name, scheduler,
             stage1_steps, stage1_denoise, stage2_steps, stage2_denoise, upscale_mode,
@@ -2751,8 +2761,8 @@ class H3AutoDirectorDualSamplingModel:
             latent_upscale_precision, stage2_model, audio_sampling, stage1_sigmas, stage2_sigmas,
             stage1_extend_sigmas, stage1_extend_steps, stage1_start_at_sigma, stage1_end_at_sigma,
             stage1_spacing, stage2_extend_sigmas, stage2_extend_steps, stage2_start_at_sigma,
-            stage2_end_at_sigma, stage2_spacing, keep_model_loaded=keep_model_loaded,
-            control_config=control_config, plan=plan)
+            stage2_end_at_sigma, stage2_spacing, control_config=control_config, plan=plan,
+            keep_model_loaded=keep_model_loaded, **_legacy_unused)
 
 
 def _validate_reference_limits(refs, label="参考素材"):
@@ -2932,6 +2942,8 @@ class H3AutoDirectorPlan:
                 "audio_drive_file": str(audio_drive_file or "").strip(),
                 "global_assets": assets, "segments": normalized,
                 "project_dir": str(project_dir)}
+        global _KEEP_MODEL_LOADED_ACTIVE
+        _KEEP_MODEL_LOADED_ACTIVE = bool(keep_model_loaded)
         if legacy_project_dir is not None:
             plan["legacy_project_dir"] = str(legacy_project_dir)
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -3089,6 +3101,8 @@ class H3AutoDirectorTTSPlan:
             "reference_video": reference_video,
             "reference_assets": reference_assets,
         }
+        global _KEEP_MODEL_LOADED_ACTIVE
+        _KEEP_MODEL_LOADED_ACTIVE = bool(keep_model_loaded)
         _atomic_json(directory / "json" / "project.json", {k: v for k, v in plan.items() if k != "project_dir"})
         state = _load_json(_state_path(plan), {"version": 3, "segments": {}})
         state.setdefault("segments", {})
@@ -3295,6 +3309,8 @@ class H3AutoDirectorVideoTransferPlan:
             "use_reference_video_material": bool(use_reference_video_material),
             "project_dir": str(directory),
         }
+        global _KEEP_MODEL_LOADED_ACTIVE
+        _KEEP_MODEL_LOADED_ACTIVE = bool(keep_model_loaded)
         _atomic_json(directory / "json" / "project.json", {k: v for k, v in plan.items() if k != "project_dir"})
         state = _load_json(_state_path(plan), {"version": 3, "segments": {}})
         state.setdefault("segments", {})
@@ -5091,6 +5107,9 @@ class H3AutoDirectorSegment:
     CATEGORY = "H3 自动导演"
 
     def resolve(self, plan, segment_index, context_length, unique_id=None):
+        global _KEEP_MODEL_LOADED_ACTIVE
+        if isinstance(plan, dict) and "keep_model_loaded" in plan:
+            _KEEP_MODEL_LOADED_ACTIVE = bool(plan["keep_model_loaded"])
         context_index = int(segment_index)
         generation_index = context_index + 1
         # SaveSegment can use this runtime-only value to remove the same
@@ -6259,6 +6278,9 @@ class H3AutoDirectorCachedReferenceToVideo:
                ref_image_size="match", context_length=FRAME_CONTEXT_DEFAULT, segment_index=0,
                use_auto_ref_image_size=True, use_manual_ref_short_edge=False, ref_short_edge=2048,
                references_json=None):
+        global _KEEP_MODEL_LOADED_ACTIVE
+        if isinstance(plan, dict) and "keep_model_loaded" in plan:
+            _KEEP_MODEL_LOADED_ACTIVE = bool(plan["keep_model_loaded"])
         width, height = _h3_canvas_dimensions(width, height)
         LOG.info("H3 Auto Director: 编码请求画布=%dx%d（%.3f MP），帧数=%d",
                  width, height, width * height / 1_000_000, int(length))
