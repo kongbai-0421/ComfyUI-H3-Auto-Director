@@ -163,6 +163,7 @@ REFERENCE_LATENT_CACHE_MAX = 4
 _REFERENCE_LATENT_CACHE = OrderedDict()
 _RESIDENT_SAMPLING_MODELS = []
 _KEEP_MODEL_LOADED_ACTIVE = True
+_LAST_CONTEXT_SUB_BATCH = None
 MAX_REFERENCE_IMAGES = 9
 MAX_REFERENCE_VIDEOS = 3
 MAX_REFERENCE_AUDIOS = 3
@@ -762,6 +763,39 @@ def _find_sub_batch_dirs(parent: Path, base_stem: str):
     return matches
 
 
+def _extract_sub_batch_from_path(file_path: Path | str | None, base_dir: Path | None = None, base_stem: str = "H3") -> str | None:
+    """Extract sub-batch folder name from a file path (e.g. H3, H3_1, H3_2).
+
+    If the file is inside cache/H3_1/H3_00001.safetensors -> returns 'H3_1'.
+    If the file is inside cache/H3/H3_00001.safetensors -> returns 'H3'.
+    If the file is inside cache/H3_00001.safetensors (legacy without sub-folder) -> returns base_stem ('H3').
+    """
+    if not file_path:
+        return None
+    try:
+        p = Path(file_path)
+    except Exception:
+        return None
+    stem = _output_filename(base_stem) if base_stem else "H3"
+    parent = p.parent
+    parent_name = parent.name
+    top_level_names = {
+        "clips", "cache", "cache_stage1", CONTEXT_DIR_NAME, CONTEXT_STAGE1_DIR_NAME,
+        "latents", "audio", "segments", "final", "json"
+    }
+    if parent_name in top_level_names:
+        return stem
+    if parent.parent.name in top_level_names:
+        return parent_name
+    pattern = re.compile(rf"^{re.escape(stem)}(?:_\d+)?$", re.IGNORECASE)
+    if pattern.match(parent_name):
+        return parent_name
+    generic_pattern = re.compile(r"^[A-Za-z0-9_\-]+(?:_\d+)?$")
+    if generic_pattern.match(parent_name) and parent_name not in top_level_names:
+        return parent_name
+    return None
+
+
 def _resolve_sub_batch_dir(base_dir: Path, sub_type: str, base_stem: str, index: int,
                             for_write: bool, overwrite: bool, plan: dict | None = None) -> Path:
     """Resolve the nested sub-batch folder for intermediate files.
@@ -770,6 +804,8 @@ def _resolve_sub_batch_dir(base_dir: Path, sub_type: str, base_stem: str, index:
     When overwrite is False, writes increment to next unused suffix (on index 1)
     and preserve across subsequent segments in state.json.
     When reading, defaults to loading the subdirectory with the largest suffix number.
+    When context cache is read, new segments continue in the SAME sub-batch folder
+    where the read cache is located, without allocating a new sub-batch number.
     """
     parent = base_dir / sub_type
 
@@ -778,9 +814,29 @@ def _resolve_sub_batch_dir(base_dir: Path, sub_type: str, base_stem: str, index:
             sub_name = base_stem
         else:
             state = _load_json(_state_path(plan), {}) if plan else {}
-            active = plan.get("current_sub_batch") if plan else None
+            active = None
+
+            # 1. Context read lock has highest priority: if context cache was read or specified,
+            # continue saving into that read context cache's folder.
+            if plan and isinstance(plan, dict):
+                active = plan.get("context_read_sub_batch") or plan.get("current_sub_batch")
+            if not active and _LAST_CONTEXT_SUB_BATCH:
+                active = _LAST_CONTEXT_SUB_BATCH
             if not active and state and int(index) > 1:
                 active = state.get("current_sub_batch")
+
+            # 2. Disk fallback: if index > 1 and still no active sub_batch, find where
+            # the predecessor segment (index - 1) is located on disk, and lock to that folder!
+            if not active and int(index) > 1:
+                prev_idx = int(index) - 1
+                for check_type in ("cache", "cache_stage1", "clips", CONTEXT_DIR_NAME, CONTEXT_STAGE1_DIR_NAME):
+                    check_parent = base_dir / check_type
+                    for _, folder_name, folder_path in _find_sub_batch_dirs(check_parent, base_stem):
+                        if (folder_path / f"{base_stem}_{prev_idx:05d}.safetensors").is_file() or any(folder_path.glob(f"*_{prev_idx:05d}.*")):
+                            active = folder_name
+                            break
+                    if active:
+                        break
 
             if not active:
                 clips_dirs = _find_sub_batch_dirs(base_dir / "clips", base_stem)
@@ -802,7 +858,7 @@ def _resolve_sub_batch_dir(base_dir: Path, sub_type: str, base_stem: str, index:
                         next_n += 1
                     sub_name = f"{base_stem}_{next_n}"
 
-                if plan is not None:
+                if plan is not None and isinstance(plan, dict):
                     plan["current_sub_batch"] = sub_name
                 if plan:
                     state_p = _state_path(plan)
@@ -811,13 +867,26 @@ def _resolve_sub_batch_dir(base_dir: Path, sub_type: str, base_stem: str, index:
                     _atomic_json(state_p, current_state)
             else:
                 sub_name = str(active)
+                if plan is not None and isinstance(plan, dict):
+                    plan["current_sub_batch"] = sub_name
+                if plan:
+                    state_p = _state_path(plan)
+                    current_state = _load_json(state_p, {"version": 3, "segments": {}})
+                    if current_state.get("current_sub_batch") != sub_name:
+                        current_state["current_sub_batch"] = sub_name
+                        _atomic_json(state_p, current_state)
         target = parent / sub_name
         target.mkdir(parents=True, exist_ok=True)
         return target
     else:
         # for_write is False (Reading)
         state = _load_json(_state_path(plan), {}) if plan else {}
-        active = (state.get("current_sub_batch") or (plan.get("current_sub_batch") if plan else None))
+        active = (
+            (plan.get("context_read_sub_batch") if isinstance(plan, dict) else None)
+            or (plan.get("current_sub_batch") if isinstance(plan, dict) else None)
+            or _LAST_CONTEXT_SUB_BATCH
+            or state.get("current_sub_batch")
+        )
         if active and (parent / str(active)).is_dir():
             return parent / str(active)
 
@@ -826,7 +895,7 @@ def _resolve_sub_batch_dir(base_dir: Path, sub_type: str, base_stem: str, index:
             if path.is_dir():
                 return path
 
-        for sibling_type in ("clips", "cache"):
+        for sibling_type in ("clips", "cache", "cache_stage1", CONTEXT_DIR_NAME, CONTEXT_STAGE1_DIR_NAME):
             if sibling_type != sub_type:
                 sibling_matches = _find_sub_batch_dirs(base_dir / sibling_type, base_stem)
                 if sibling_matches:
@@ -945,6 +1014,16 @@ def _paths(plan, index: int, output_name="", video_format="mp4", for_write=False
 
     if not latent.is_file():
         latent = default_latent
+    if for_context and not for_write:
+        found_target = latent if latent.is_file() else (video if video.is_file() else None)
+        if found_target is not None:
+            sb = _extract_sub_batch_from_path(found_target, base, stem)
+            if sb:
+                global _LAST_CONTEXT_SUB_BATCH
+                _LAST_CONTEXT_SUB_BATCH = sb
+                if isinstance(plan, dict):
+                    plan["current_sub_batch"] = sb
+                    plan["context_read_sub_batch"] = sb
     return video, latent
 
 
@@ -2806,7 +2885,7 @@ class H3AutoDirectorPlan:
             "output_root": ("STRING", {"default": "h3_projects", "tooltip": "项目文件夹名称；新路径为 output/h3_project/<此名称>"}),
             "output_filename": ("STRING", {"default": "", "tooltip": "中间片段与最终视频的统一基础文件名/批次名，不含扩展名；留空使用默认名称 H3。"}),
             "overwrite_existing": ("BOOLEAN", {"default": False, "label_on": "覆盖已有文件", "label_off": "不覆盖（子文件夹/文件自动编号）",
-                "tooltip": "关闭时若中间片段已有同名批次，自动创建递增编号子文件夹（如 _1, _2），读取时默认加载最大后缀的子文件夹；最终视频已有同名时在文件名后追加编号。"}),
+                "tooltip": "关闭时新批次自动创建递增编号子文件夹（如 _1, _2）；当接续读取上下文缓存时，新片段将沿用所读缓存所在的文件夹编号保存，不再新增编号独立存储；最终视频已有同名时在文件名后追加编号。"}),
             "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": True, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
         }, "optional": {
             "global_assets_json": ("STRING", {"default": "[]", "multiline": True}),
@@ -2826,6 +2905,8 @@ class H3AutoDirectorPlan:
     CATEGORY = "H3 自动导演"
 
     def create(self, project_id, segments_json, duration, global_reference_set, auto_run, continuation_mode=True, cache_prompt_embeddings=True, decode_after_all_segments=False, output_root="h3_projects", output_filename="", overwrite_existing=False, cache_prompt_embeddings_to_disk=True, global_assets_json="[]", auto_context_crop_frames=0, skip_reference_encoding=False, enable_audio_drive=False, audio_drive_file="", keep_model_loaded=True, project_dir="", **_legacy_inputs):
+        global _LAST_CONTEXT_SUB_BATCH
+        _LAST_CONTEXT_SUB_BATCH = None
         if isinstance(output_filename, bool):
             output_filename = ""
         else:
@@ -2973,7 +3054,8 @@ class H3AutoDirectorTTSPlan:
             "concat_final_audio": ("BOOLEAN", {"default": True, "tooltip": "完成全部片段后额外拼接一个长 WAV；关闭则只保留分段音频"}),
             "output_root": ("STRING", {"default": "h3_tts_project"}),
             "output_filename": ("STRING", {"default": "", "tooltip": "统一基础文件名/批次名，不含扩展名；留空使用默认名称 H3。"}),
-            "overwrite_existing": ("BOOLEAN", {"default": False, "label_on": "覆盖已有文件", "label_off": "不覆盖（自动递增编号）"}),
+            "overwrite_existing": ("BOOLEAN", {"default": False, "label_on": "覆盖已有文件", "label_off": "不覆盖（自动递增编号）",
+                "tooltip": "关闭时新批次自动创建递增编号子文件夹（如 _1, _2）；当接续读取上下文缓存时，新片段将沿用所读缓存所在的文件夹编号保存，不再新增编号独立存储；最终音频已有同名时在文件名后追加编号。"}),
             "global_reference_set": ("BOOLEAN", {"default": False, "tooltip": "开启后所有片段使用第 1 段的图片、视频和音频参考素材"}),
             "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": True, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
             "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": "在多片段连续采样过程中将扩散模型保持在显存中，避免每个片段结束时被卸载和垃圾回收导致下一片段重新加载"}),
@@ -2997,6 +3079,8 @@ class H3AutoDirectorTTSPlan:
                keep_model_loaded=True,
                project_dir="", reference_video_json="{}", reference_assets_json="[]",
                pass_reference_video_audio=False, audio_restart_segments="", **_legacy_inputs):
+        global _LAST_CONTEXT_SUB_BATCH
+        _LAST_CONTEXT_SUB_BATCH = None
         if isinstance(output_filename, bool):
             output_filename = ""
         else:
@@ -3137,7 +3221,8 @@ class H3AutoDirectorVideoTransferPlan:
             "auto_run": ("BOOLEAN", {"default": True}),
             "output_root": ("STRING", {"default": "h3_video_transfer"}),
             "output_filename": ("STRING", {"default": "", "tooltip": "中间片段与最终视频的统一输出文件名/批次名，不含扩展名；留空使用默认名称 H3。"}),
-            "overwrite_existing": ("BOOLEAN", {"default": False, "label_on": "覆盖已有文件", "label_off": "不覆盖（子文件夹/文件自动编号）"}),
+            "overwrite_existing": ("BOOLEAN", {"default": False, "label_on": "覆盖已有文件", "label_off": "不覆盖（子文件夹/文件自动编号）",
+                "tooltip": "关闭时新批次自动创建递增编号子文件夹（如 _1, _2）；当接续读取上下文缓存时，新片段将沿用所读缓存所在的文件夹编号保存，不再新增编号独立存储；最终视频已有同名时在文件名后追加编号。"}),
             "cache_prompt_embeddings_to_disk": ("BOOLEAN", {"default": True, "tooltip": "将提示词向量保存到项目 cache/prompt_embeddings；清单 JSON 会按提示词、素材和编码器配置判断是否重新编码"}),
         }, "optional": {
             "use_reference_video_material": ("BOOLEAN", {"default": True,
@@ -3158,6 +3243,8 @@ class H3AutoDirectorVideoTransferPlan:
                skip_h3_audio_decode=False, final_audio_source="H3 生成音频",
                auto_run=True, output_root="h3_video_transfer", output_filename="", overwrite_existing=False,
                cache_prompt_embeddings_to_disk=True, keep_model_loaded=True, project_dir=""):
+        global _LAST_CONTEXT_SUB_BATCH
+        _LAST_CONTEXT_SUB_BATCH = None
         if isinstance(output_filename, bool):
             output_filename = ""
         else:
@@ -5107,10 +5194,15 @@ class H3AutoDirectorSegment:
     CATEGORY = "H3 自动导演"
 
     def resolve(self, plan, segment_index, context_length, unique_id=None):
-        global _KEEP_MODEL_LOADED_ACTIVE
+        global _KEEP_MODEL_LOADED_ACTIVE, _LAST_CONTEXT_SUB_BATCH
         if isinstance(plan, dict) and "keep_model_loaded" in plan:
             _KEEP_MODEL_LOADED_ACTIVE = bool(plan["keep_model_loaded"])
         context_index = int(segment_index)
+        if context_index <= 0:
+            _LAST_CONTEXT_SUB_BATCH = None
+            if isinstance(plan, dict):
+                plan.pop("context_read_sub_batch", None)
+                plan.pop("current_sub_batch", None)
         generation_index = context_index + 1
         # SaveSegment can use this runtime-only value to remove the same
         # context prefix reserved for the current generation. It is not
@@ -5147,7 +5239,17 @@ class H3AutoDirectorSegment:
         if (use_video or use_audio) and context_index > 0:
             _, s1_cand = _paths(plan, context_index, for_context=True, context_stage=1)
             _, s2_cand = _paths(plan, context_index, for_context=True, context_stage=2)
-            if not s1_cand.is_file() and not s2_cand.is_file():
+            resolved_cand = s2_cand if s2_cand.is_file() else (s1_cand if s1_cand.is_file() else None)
+            if resolved_cand is not None:
+                base = Path(plan["project_dir"]) if isinstance(plan, dict) and "project_dir" in plan else None
+                stem = _output_filename(plan.get("output_filename", "H3")) if isinstance(plan, dict) else "H3"
+                sb = _extract_sub_batch_from_path(resolved_cand, base, stem)
+                if sb:
+                    _LAST_CONTEXT_SUB_BATCH = sb
+                    if isinstance(plan, dict):
+                        plan["current_sub_batch"] = sb
+                        plan["context_read_sub_batch"] = sb
+            elif not s1_cand.is_file() and not s2_cand.is_file():
                 LOG.warning(
                     "H3 Auto Director: [提示] 当前设置准备生成【第 %d 段】（接续上下文序号=%d），"
                     "但在工程缓存目录下未找到第 %d 段的潜空间文件（候选路径：%s）。"
@@ -6773,12 +6875,42 @@ class H3AutoDirectorContext:
         empty_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
         empty_latent = {"samples": [torch.zeros((1, 24, 2, 1, 1)), torch.zeros((1, 32, 2, 1))]}
         if int(segment_index) <= 0 or not (video_enabled or audio_enabled):
+            global _LAST_CONTEXT_SUB_BATCH
+            _LAST_CONTEXT_SUB_BATCH = None
+            if isinstance(plan, dict):
+                plan.pop("context_read_sub_batch", None)
+                plan.pop("current_sub_batch", None)
             LOG.info("H3 Auto Director: 上下文序号 %d 未启用视频/音频上下文，返回空上下文", int(segment_index))
             return (empty_image, empty_latent, empty_latent)
 
         # 1. Resolve Stage 1 & Stage 2 paths
         _, stage1_latent_path = _paths(plan, int(segment_index), for_context=True, context_stage=1)
         video_path, stage2_latent_path = _paths(plan, int(segment_index), for_context=True, context_stage=2)
+
+        # Lock sub_batch from read context cache
+        base = Path(plan["project_dir"]) if isinstance(plan, dict) and "project_dir" in plan else None
+        stem = _output_filename(plan.get("output_filename", "H3")) if isinstance(plan, dict) else "H3"
+        resolved_context_file = None
+        if stage2_latent_path.is_file():
+            resolved_context_file = stage2_latent_path
+        elif stage1_latent_path.is_file():
+            resolved_context_file = stage1_latent_path
+        elif video_path.is_file():
+            resolved_context_file = video_path
+
+        if resolved_context_file is not None:
+            sub_batch = _extract_sub_batch_from_path(resolved_context_file, base, stem)
+            if sub_batch:
+                _LAST_CONTEXT_SUB_BATCH = sub_batch
+                if isinstance(plan, dict):
+                    plan["current_sub_batch"] = sub_batch
+                    plan["context_read_sub_batch"] = sub_batch
+                    state_p = _state_path(plan)
+                    if state_p:
+                        current_state = _load_json(state_p, {"version": 3, "segments": {}})
+                        current_state["current_sub_batch"] = sub_batch
+                        _atomic_json(state_p, current_state)
+                LOG.info("H3 Auto Director: 上下文缓存读取自批次【%s】，新片段将继续保存至该文件夹编号内，不再新增编号独立存储", sub_batch)
 
         # 2. Load Stage 1 Latent (一采接续潜空间)
         if stage1_latent_path.is_file():
@@ -6889,6 +7021,11 @@ class H3AutoDirectorResumeContext:
             raise FileNotFoundError("Resume latent must be an existing .safetensors file")
         if not video.is_file():
             raise FileNotFoundError("Resume video must be an existing video file")
+        sb = _extract_sub_batch_from_path(latent) or _extract_sub_batch_from_path(video)
+        if sb:
+            global _LAST_CONTEXT_SUB_BATCH
+            _LAST_CONTEXT_SUB_BATCH = sb
+            LOG.info("H3 Auto Director: 自选断点恢复潜空间位于批次【%s】，后续生成将继续写入该文件夹编号", sb)
         return (_load_context_video(video), _load_av_latent(latent))
 
 
