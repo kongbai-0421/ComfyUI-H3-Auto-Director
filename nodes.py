@@ -561,6 +561,67 @@ def _align_frames_nearest(frames: int) -> int:
     return lower if target - lower <= upper - target else upper
 
 
+def _calculate_segment_physical_frames(target: int, context_run: int, use_video: bool) -> int:
+    """Calculate physical frame count for generation, ensuring physical > context_run when video context is used."""
+    target = max(5, int(target))
+    if not use_video:
+        return _align_frames(target)
+    context_run = int(context_run)
+    needed = target + context_run
+    physical = _align_frames_nearest(needed)
+    if physical <= context_run:
+        physical = _align_frames(context_run + max(5, target))
+    return physical
+
+
+def _normalize_segment_duration(row: dict, default_duration: float = 5.0) -> float:
+    """Normalize and validate segment duration, supporting seconds (1.0-15.0) and 5-frame mode."""
+    mode_str = str(row.get("duration_mode", "")).strip().lower()
+    is_frames = mode_str in {"frames", "frame", "帧", "frame_count"} or row.get("frame_count") is not None
+
+    raw_val = row.get("duration")
+    if raw_val is None or (isinstance(raw_val, str) and not raw_val.strip()):
+        raw_val = default_duration
+
+    try:
+        dur = float(raw_val)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"片段时长必须是有效数字：{raw_val}") from exc
+
+    if is_frames:
+        fc = row.get("frame_count")
+        if fc is not None:
+            try:
+                frame_count = max(5, int(fc))
+            except (TypeError, ValueError):
+                frame_count = 5
+        else:
+            if dur >= 5.0 and dur == round(dur) and dur <= 60:
+                frame_count = int(dur)
+            else:
+                frame_count = max(5, int(round(dur * FPS)))
+        frame_count = _align_frames(frame_count)
+        row["duration_mode"] = "frames"
+        row["frame_count"] = frame_count
+        row["duration"] = frame_count / FPS
+        return row["duration"]
+
+    # Detect 5-frame mode by duration value (e.g. ~5/24 = 0.208333s or small duration close to 5 frames)
+    if abs(dur - 5.0 / FPS) < 1e-3 or (0.0 < dur < 1.0 and abs(round(dur * FPS) - 5) <= 1):
+        row["duration_mode"] = "frames"
+        row["frame_count"] = 5
+        row["duration"] = 5.0 / FPS
+        return row["duration"]
+
+    # Seconds mode: allow 1.0 to 15.0 seconds
+    if not (1.0 <= dur <= 15.0):
+        raise ValueError("H3 片段时长必须在 1 到 15 秒之间，或选择 5 帧模式（实际：%.2f 秒）" % dur)
+
+    row["duration_mode"] = "seconds"
+    row["duration"] = dur
+    return dur
+
+
 def _segment(plan, index: int):
     segs = plan.get("segments", [])
     if index < 1 or index > len(segs):
@@ -2875,7 +2936,7 @@ class H3AutoDirectorPlan:
         return {"required": {
             "project_id": ("STRING", {"default": "h3_project"}),
             "segments_json": ("STRING", {"default": '[{"prompt":"","duration":5,"audio_restart":false}]', "multiline": True}),
-            "duration": ("FLOAT", {"default": 5.0, "min": 4.0, "max": 15.0, "step": 0.1}),
+            "duration": ("FLOAT", {"default": 5.0, "min": 0.2, "max": 15.0, "step": 0.1}),
             "global_reference_set": ("BOOLEAN", {"default": True}),
             "auto_run": ("BOOLEAN", {"default": True}),
             "continuation_mode": ("BOOLEAN", {"default": True, "tooltip": "默认允许后续片段使用视频上下文；每段可单独关闭"}),
@@ -2954,9 +3015,7 @@ class H3AutoDirectorPlan:
                 raise ValueError("Each segment must be an object")
             row = dict(item)
             row["prompt"] = str(row.get("prompt", "")).strip()
-            row["duration"] = float(row.get("duration", duration))
-            if not 4.0 <= row["duration"] <= 15.0:
-                raise ValueError("H3 segment duration must be between 4 and 15 seconds")
+            row["duration"] = _normalize_segment_duration(row, duration)
             row["audio_restart"] = bool(row.get("audio_restart", False))
             row["continue_audio"] = bool(row.get("continue_audio", True))
             row["continue_video"] = bool(row.get("continue_video", bool(continuation_mode) and len(normalized) > 0))
@@ -3127,9 +3186,7 @@ class H3AutoDirectorTTSPlan:
         for index, item in enumerate(rows, start=1):
             if not isinstance(item, dict):
                 raise ValueError("每个 TTS 片段必须是对象")
-            duration = float(item.get("duration", 5.0))
-            if not 4.0 <= duration <= 15.0:
-                raise ValueError("TTS 片段时长必须在 4 到 15 秒之间")
+            duration = _normalize_segment_duration(item, 5.0)
             audio_filename = _audio_filename(item.get("audio_filename", ""), index)
             if audio_filename.casefold() in filenames:
                 raise ValueError("TTS 每段音频文件名不能重复：%s" % audio_filename)
@@ -3210,7 +3267,7 @@ class H3AutoDirectorVideoTransferPlan:
             "prompt": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": True}),
             "reference_video_json": ("STRING", {"default": "{}", "multiline": True}),
             "reference_assets_json": ("STRING", {"default": "[]", "multiline": True}),
-            "segment_seconds": ("FLOAT", {"default": 5.0, "min": 4.0, "max": 15.0, "step": 0.1}),
+            "segment_seconds": ("FLOAT", {"default": 5.0, "min": 0.2, "max": 15.0, "step": 0.1}),
             "pass_reference_video_audio": ("BOOLEAN", {"default": False}),
             "enable_audio_continuation": ("BOOLEAN", {"default": True}),
             "audio_restart_segments": ("STRING", {"default": "", "tooltip": "片段编号，从 1 开始；支持中英文逗号，例如 3，6,9"}),
@@ -3301,8 +3358,10 @@ class H3AutoDirectorVideoTransferPlan:
         # only after the generated video has been assembled.  Selecting the
         # latter must not force source audio into the H3 conditioning path.
         seconds = float(segment_seconds)
-        if not 4.0 <= seconds <= 15.0:
-            raise ValueError("单段秒数必须在 4 到 15 秒之间")
+        if abs(seconds - 5.0 / FPS) < 1e-3 or (0.0 < seconds < 1.0 and abs(round(seconds * FPS) - 5) <= 1):
+            seconds = 5.0 / FPS
+        elif not 1.0 <= seconds <= 15.0:
+            raise ValueError("单段秒数必须在 1 到 15 秒之间（或 5 帧模式：约 0.21 秒）")
         # Imported/older plans may not contain frame metadata (or may contain
         # stale values after replacing a file). Probe the resolved file so the
         # segment count always reflects the actual uploaded video.
@@ -5225,8 +5284,7 @@ class H3AutoDirectorSegment:
         # only the context window; SaveSegment removes that same window so the
         # predecessor tail is not duplicated at the join.
         context_run = _h3_context_run(context_length)
-        physical = (_align_frames_nearest(target + context_run)
-                    if use_video else _align_frames(target))
+        physical = _calculate_segment_physical_frames(target, context_run, use_video)
         refs = _segment_reference_specs(plan, generation_index)
         LOG.info(
             "H3 Auto Director: 第 %d 段解析：视频上下文=%s，音频上下文=%s，"
@@ -5676,8 +5734,8 @@ def _cache_frame_count(plan, generation_index, context_length):
                  and _video_context_enabled(plan)
                  and bool(seg.get("continue_video", generation_index > 1))
                  and generation_index > 1)
-    return (_align_frames_nearest(target + _h3_context_run(context_length))
-            if use_video else _align_frames(target))
+    context_run = _h3_context_run(context_length)
+    return _calculate_segment_physical_frames(target, context_run, use_video)
 
 
 def _prompt_cache_key(plan, clip, vae, audio_vae, width, height, ref_image_size, context_length,

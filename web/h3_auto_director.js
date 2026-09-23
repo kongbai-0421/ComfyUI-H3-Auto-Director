@@ -996,8 +996,8 @@ function openTransferEditor(node) {
   };
   const row = (label, control) => { const wrap = document.createElement("label"); wrap.style.cssText = "display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;min-width:0;margin:8px 0;line-height:1.4"; const text = document.createElement("span"); text.textContent = label; text.style.cssText = "flex:1 1 240px;min-width:150px;white-space:normal;overflow-wrap:anywhere"; control.style.maxWidth = "100%"; control.style.boxSizing = "border-box"; wrap.append(text, control); panel.appendChild(wrap); return control; };
   const prompt = document.createElement("textarea"); prompt.value = get("prompt", ""); prompt.style.cssText = "width:100%;min-height:100px;box-sizing:border-box;background:#15191d;color:#eee;border:1px solid #59636e;padding:8px"; prompt.placeholder = "所有片段复用的 H3 完整提示词"; panel.appendChild(prompt);
-  const lengthMode = document.createElement("select"); lengthMode.innerHTML = "<option value=\"seconds\">秒数</option><option value=\"frames\">5 帧</option>"; lengthMode.value = get("segment_length_mode", "秒数") === "5帧" ? "frames" : "seconds";
-  const seconds = document.createElement("input"); seconds.type = "number"; seconds.min = "1"; seconds.max = "15"; seconds.step = "0.1"; seconds.value = get("segment_seconds", 5); seconds.style.width = "110px"; seconds.disabled = lengthMode.value === "frames"; seconds.oninput = refreshSummary; lengthMode.onchange = () => { seconds.disabled = lengthMode.value === "frames"; refreshSummary(); }; const lengthWrap = document.createElement("label"); lengthWrap.style.cssText = "display:flex;align-items:center;gap:8px;margin:8px 0"; lengthWrap.append("片段长度", lengthMode, seconds, "秒"); panel.appendChild(lengthWrap);
+  const lengthMode = document.createElement("select"); lengthMode.innerHTML = "<option value=\"seconds\">秒数</option><option value=\"frames\">5 帧</option>"; lengthMode.value = (get("segment_length_mode", "秒数") === "5帧" || Math.abs((Number(get("segment_seconds", 5)) || 5) - 5 / 24) < 1e-3) ? "frames" : "seconds";
+  const seconds = document.createElement("input"); seconds.type = "number"; seconds.min = "0.2"; seconds.max = "15"; seconds.step = "0.1"; seconds.value = get("segment_seconds", 5); seconds.style.width = "110px"; seconds.disabled = lengthMode.value === "frames"; seconds.oninput = refreshSummary; lengthMode.onchange = () => { seconds.disabled = lengthMode.value === "frames"; refreshSummary(); }; const lengthWrap = document.createElement("label"); lengthWrap.style.cssText = "display:flex;align-items:center;gap:8px;margin:8px 0"; lengthWrap.append("片段长度", lengthMode, seconds, "秒"); panel.appendChild(lengthWrap);
   const checkbox = (label, name, checked) => { const input = document.createElement("input"); input.type = "checkbox"; input.checked = !!get(name, checked); row(label, input); return input; };
   const useVideoMaterial = checkbox("将上传视频作为多模态参考素材", "use_reference_video_material", true);
   const passAudio = checkbox("传递参考视频音频", "pass_reference_video_audio", false);
@@ -1105,7 +1105,7 @@ function openTransferEditor(node) {
   const actions = document.createElement("div"); actions.style.cssText = "display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;min-width:0;margin-top:16px";
   actions.append(makeButton("取消", () => shade.remove()), makeButton("保存", () => {
     if (!video.path) { notice.textContent = "请先上传参考视频。"; return; }
-    set("prompt", prompt.value); set("segment_seconds", Number(seconds.value) || 5); set("segment_length_mode", lengthMode.value === "frames" ? "5帧" : "秒数"); set("use_reference_video_material", useVideoMaterial.checked); set("pass_reference_video_audio", passAudio.checked); set("enable_audio_continuation", audioCont.checked); set("cache_prompt_embeddings", cachePrompts.checked); set("cache_prompt_embeddings_to_disk", diskCachePrompts.checked); set("auto_run", autoRun.checked); set("skip_h3_audio_decode", skipDecode.checked); set("final_audio_source", audioMode.value); set("audio_restart_segments", restart.value); set("previous_video_reference_segments", previous.value); set("reference_video_json", JSON.stringify(video, null, 2)); set("reference_assets_json", JSON.stringify(assets, null, 2)); syncSerializedWidgets(node); node.setDirtyCanvas(true, true); node.graph?.setDirtyCanvas?.(true, true); shade.remove();
+    set("prompt", prompt.value); set("segment_seconds", lengthMode.value === "frames" ? 5 / 24 : (Number(seconds.value) || 5)); set("segment_length_mode", lengthMode.value === "frames" ? "5帧" : "秒数"); set("use_reference_video_material", useVideoMaterial.checked); set("pass_reference_video_audio", passAudio.checked); set("enable_audio_continuation", audioCont.checked); set("cache_prompt_embeddings", cachePrompts.checked); set("cache_prompt_embeddings_to_disk", diskCachePrompts.checked); set("auto_run", autoRun.checked); set("skip_h3_audio_decode", skipDecode.checked); set("final_audio_source", audioMode.value); set("audio_restart_segments", restart.value); set("previous_video_reference_segments", previous.value); set("reference_video_json", JSON.stringify(video, null, 2)); set("reference_assets_json", JSON.stringify(assets, null, 2)); syncSerializedWidgets(node); node.setDirtyCanvas(true, true); node.graph?.setDirtyCanvas?.(true, true); shade.remove();
   }));
   panel.appendChild(actions); shade.appendChild(panel); document.body.appendChild(shade); renderAssets(); renderVideoCard(); refreshSummary();
 }
@@ -1443,6 +1443,12 @@ function openEditor(node) {
     directInput.value = JSON.stringify(segments, null, 2);
     render();
     notice.textContent = `已将全部片段的秒数设置为 ${value}。`;
+  }));
+  segmentDurationPanel.appendChild(makeButton("全部设为 5 帧", () => {
+    segments.forEach((seg) => setSegmentLengthMode(seg, "frames"));
+    directInput.value = JSON.stringify(segments, null, 2);
+    render();
+    notice.textContent = "已将全部片段设置为 5 帧模式。";
   }));
   panel.appendChild(segmentDurationPanel);
 
