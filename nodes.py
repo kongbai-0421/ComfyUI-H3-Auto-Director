@@ -27,6 +27,9 @@ import wave
 from collections import deque
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+
 import folder_paths
 import nodes
 import torch
@@ -622,6 +625,41 @@ def _normalize_segment_duration(row: dict, default_duration: float = 5.0) -> flo
     return dur
 
 
+def _is_five_frame_segment(plan: dict, index: int) -> bool:
+    """Check if the segment at index (1-based) is configured for 5-frame mode."""
+    if not plan or not isinstance(plan, dict):
+        return False
+    segs = plan.get("segments", [])
+    if not isinstance(segs, list) or int(index) < 1 or int(index) > len(segs):
+        return False
+    seg = segs[int(index) - 1]
+    if not isinstance(seg, dict):
+        return False
+    mode_str = str(seg.get("duration_mode", "")).strip().lower()
+    if mode_str in {"frames", "frame", "帧", "frame_count"}:
+        fc = seg.get("frame_count")
+        if fc is not None and int(fc) == 5:
+            return True
+        dur = float(seg.get("duration", 0) or 0)
+        if abs(dur - 5.0 / FPS) < 1e-3 or int(round(dur * FPS)) == 5:
+            return True
+    dur = float(seg.get("duration", 0) or 0)
+    if abs(dur - 5.0 / FPS) < 1e-3 or (0.0 < dur < 0.25):
+        return True
+    return False
+
+
+def _is_five_frame_plan(plan: dict) -> bool:
+    """Check if the plan or its segments are configured for 5-frame mode."""
+    if not plan or not isinstance(plan, dict):
+        return False
+    segments = plan.get("segments", [])
+    if segments:
+        return any(_is_five_frame_segment(plan, i) for i in range(1, len(segments) + 1))
+    dur = float(plan.get("duration", 0) or 0)
+    return abs(dur - 5.0 / FPS) < 1e-3 or (0.0 < dur < 0.25)
+
+
 def _segment(plan, index: int):
     segs = plan.get("segments", [])
     if index < 1 or index > len(segs):
@@ -890,7 +928,7 @@ def _resolve_sub_batch_dir(base_dir: Path, sub_type: str, base_stem: str, index:
             # the predecessor segment (index - 1) is located on disk, and lock to that folder!
             if not active and int(index) > 1:
                 prev_idx = int(index) - 1
-                for check_type in ("cache", "cache_stage1", "clips", CONTEXT_DIR_NAME, CONTEXT_STAGE1_DIR_NAME):
+                for check_type in ("cache", "cache_stage1", "clips", "images", CONTEXT_DIR_NAME, CONTEXT_STAGE1_DIR_NAME):
                     check_parent = base_dir / check_type
                     for _, folder_name, folder_path in _find_sub_batch_dirs(check_parent, base_stem):
                         if (folder_path / f"{base_stem}_{prev_idx:05d}.safetensors").is_file() or any(folder_path.glob(f"*_{prev_idx:05d}.*")):
@@ -902,8 +940,9 @@ def _resolve_sub_batch_dir(base_dir: Path, sub_type: str, base_stem: str, index:
             if not active:
                 clips_dirs = _find_sub_batch_dirs(base_dir / "clips", base_stem)
                 cache_dirs = _find_sub_batch_dirs(base_dir / "cache", base_stem)
+                images_dirs = _find_sub_batch_dirs(base_dir / "images", base_stem)
                 existing_nums = set()
-                for num, name, path in clips_dirs + cache_dirs:
+                for num, name, path in clips_dirs + cache_dirs + images_dirs:
                     try:
                         if path.is_dir() and any(path.iterdir()):
                             existing_nums.add(num)
@@ -915,7 +954,8 @@ def _resolve_sub_batch_dir(base_dir: Path, sub_type: str, base_stem: str, index:
                     max_n = max(existing_nums)
                     next_n = (max_n + 1) if max_n >= 1 else 1
                     while ((base_dir / "clips" / f"{base_stem}_{next_n}").exists()
-                           or (base_dir / "cache" / f"{base_stem}_{next_n}").exists()):
+                           or (base_dir / "cache" / f"{base_stem}_{next_n}").exists()
+                           or (base_dir / "images" / f"{base_stem}_{next_n}").exists()):
                         next_n += 1
                     sub_name = f"{base_stem}_{next_n}"
 
@@ -956,7 +996,7 @@ def _resolve_sub_batch_dir(base_dir: Path, sub_type: str, base_stem: str, index:
             if path.is_dir():
                 return path
 
-        for sibling_type in ("clips", "cache", "cache_stage1", CONTEXT_DIR_NAME, CONTEXT_STAGE1_DIR_NAME):
+        for sibling_type in ("clips", "cache", "images", "cache_stage1", CONTEXT_DIR_NAME, CONTEXT_STAGE1_DIR_NAME):
             if sibling_type != sub_type:
                 sibling_matches = _find_sub_batch_dirs(base_dir / sibling_type, base_stem)
                 if sibling_matches:
@@ -1086,6 +1126,22 @@ def _paths(plan, index: int, output_name="", video_format="mp4", for_write=False
                     plan["current_sub_batch"] = sb
                     plan["context_read_sub_batch"] = sb
     return video, latent
+
+
+def _image_dir(plan, index: int = 1, output_name="", for_write=False) -> Path:
+    """Resolve the dedicated directory for 5-frame PNG images."""
+    base = Path(plan["project_dir"])
+    effective_output_name = output_name or (plan.get("output_filename") if isinstance(plan, dict) else "") or "H3"
+    stem = _output_filename(effective_output_name)
+    overwrite = _bool_setting(plan.get("overwrite_existing", False), False) if isinstance(plan, dict) else False
+    return _resolve_sub_batch_dir(base, "images", stem, int(index), for_write, overwrite, plan)
+
+
+def _image_paths(plan, index: int, output_name="", frame_count: int = 5, for_write=False) -> list[Path]:
+    """Return the list of image file paths for a segment in 5-frame mode."""
+    dir_path = _image_dir(plan, index, output_name, for_write=for_write)
+    stem = _output_filename(output_name or (plan.get("output_filename") if isinstance(plan, dict) else "") or "H3")
+    return [dir_path / f"{stem}_{int(index):05d}_{f + 1:03d}.png" for f in range(max(1, int(frame_count)))]
 
 
 def _json_path(plan, name):
@@ -3092,6 +3148,7 @@ class H3AutoDirectorPlan:
         (project_dir / CONTEXT_DIR_NAME).mkdir(exist_ok=True)
         (project_dir / "clips").mkdir(exist_ok=True)
         (project_dir / "final").mkdir(exist_ok=True)
+        (project_dir / "images").mkdir(exist_ok=True)
         _atomic_json(project_dir / "json" / "project.json", {k: v for k, v in plan.items() if k != "project_dir"})
         state = _load_json(_state_path(plan), {"version": 2, "segments": {}})
         state.setdefault("segments", {})
@@ -3429,7 +3486,7 @@ class H3AutoDirectorVideoTransferPlan:
         if requested_dir and _output_root() not in directory.parents:
             raise ValueError("项目目录必须位于 ComfyUI output 内")
         directory.mkdir(parents=True, exist_ok=True)
-        for name in ("json", "cache", CONTEXT_DIR_NAME, "clips", "final"):
+        for name in ("json", "cache", CONTEXT_DIR_NAME, "clips", "final", "images"):
             (directory / name).mkdir(exist_ok=True)
         # Keep encoded pose/depth preview videos separate from their tensor
         # caches; the preprocess node creates per-segment subdirectories.
@@ -5594,9 +5651,23 @@ def _resolve_reference_groups(refs, plan=None):
                 raise ValueError("上片段视频参考需要连接项目计划，以定位上下文视频缓存")
             previous_index = int(ref.get("segment_index", 0))
             video_path, _ = _paths(plan, previous_index, for_context=True)
-            if not video_path.is_file():
-                raise FileNotFoundError("上片段视频参考缓存不存在：%s" % video_path)
-            videos.append(_load_context_video(video_path))
+            if video_path.is_file():
+                videos.append(_load_context_video(video_path))
+            else:
+                img_dir = _image_dir(plan, previous_index, for_write=False)
+                stem = _output_filename(plan.get("output_filename", "H3")) if isinstance(plan, dict) else "H3"
+                seg_imgs = sorted(img_dir.glob(f"{stem}_{previous_index:05d}_*.png"))
+                if not seg_imgs:
+                    seg_imgs = sorted(img_dir.glob("*.png"))
+                if seg_imgs:
+                    frame_list = []
+                    for p in seg_imgs:
+                        with Image.open(p) as img:
+                            arr = np.array(img.convert("RGB")).astype(np.float32) / 255.0
+                            frame_list.append(torch.from_numpy(arr))
+                    videos.append(torch.stack(frame_list, dim=0))
+                else:
+                    raise FileNotFoundError("上片段视频/图片参考缓存不存在：%s" % video_path)
             # Deliberately do not append a soundtrack: this mode passes only video frames.
             video_audios.append(None)
         elif kind == "audio":
@@ -6284,7 +6355,10 @@ class H3AutoDirectorCachedReferenceToVideo:
             previous_index = int(ref.get("segment_index", 0))
             video_path, _ = _paths(plan, previous_index, for_context=True)
             if not video_path.is_file():
-                return False
+                img_dir = _image_dir(plan, previous_index, for_write=False)
+                stem = _output_filename(plan.get("output_filename", "H3")) if isinstance(plan, dict) else "H3"
+                if not (any(img_dir.glob(f"{stem}_{previous_index:05d}_*.png")) or any(img_dir.glob("*.png"))):
+                    return False
         return True
 
     @classmethod
@@ -7041,8 +7115,31 @@ class H3AutoDirectorContext:
         stage1_latent = dict(stage1_latent)
         stage1_latent["h3_stage2_context_latent"] = stage2_latent
 
-        frames = (_load_context_video(video_path) if video_enabled and video_path.exists() and not deferred_decode
-                  else empty_image)
+        if video_enabled and not deferred_decode:
+            if video_path.exists():
+                frames = _load_context_video(video_path)
+            else:
+                # In 5-frame mode, frames are saved as PNG images in images_dir
+                img_dir = _image_dir(plan, int(segment_index), for_write=False)
+                stem = _output_filename(plan.get("output_filename", "H3")) if isinstance(plan, dict) else "H3"
+                seg_imgs = sorted(img_dir.glob(f"{stem}_{int(segment_index):05d}_*.png"))
+                if not seg_imgs:
+                    seg_imgs = sorted(img_dir.glob("*.png"))
+                if seg_imgs:
+                    try:
+                        frame_list = []
+                        for p in seg_imgs:
+                            with Image.open(p) as img:
+                                arr = np.array(img.convert("RGB")).astype(np.float32) / 255.0
+                                frame_list.append(torch.from_numpy(arr))
+                        frames = torch.stack(frame_list, dim=0) if frame_list else empty_image
+                    except Exception as e:
+                        LOG.warning("H3 Auto Director: 读取 5 帧图片作为上下文帧失败：%s", e)
+                        frames = empty_image
+                else:
+                    frames = empty_image
+        else:
+            frames = empty_image
 
         LOG.info(
             "H3 Auto Director: 加载上下文序号 %d：视频=%s，音频=%s，一采latent=%s，二采latent=%s",
@@ -8059,7 +8156,29 @@ class H3AutoDirectorSaveSegment:
                         LOG.info("H3 Auto Director: matched segment %d colors to %s", segment_number, anchor_path)
                 except Exception as exc:
                     LOG.warning("H3 Auto Director: color correction skipped for segment %d: %s", segment_number, exc)
-        if deferred_decode:
+        is_5f = _is_five_frame_segment(plan, int(segment_index))
+        saved_images = []
+        images_dir = None
+        if is_5f:
+            stem = _output_filename(effective_output_root)
+            images_dir = _image_dir(plan, int(segment_index), effective_output_root, for_write=True)
+            images_dir.mkdir(parents=True, exist_ok=True)
+            context_path = Path("")
+            video_path = Path("")
+            if deferred_decode:
+                LOG.info("H3 Auto Director: 5 帧统一解码模式跳过保存节点图片写入，等待统一解码")
+            else:
+                if torch.is_tensor(images_to_save) and images_to_save.ndim == 4:
+                    num_frames = int(images_to_save.shape[0])
+                    for frame_idx in range(num_frames):
+                        img_np = (images_to_save[frame_idx].detach().cpu().clamp(0, 1).numpy() * 255.0).round().astype(np.uint8)
+                        pil_img = Image.fromarray(img_np)
+                        img_name = f"{stem}_{int(segment_index):05d}_{frame_idx + 1:03d}.png"
+                        img_path = images_dir / img_name
+                        pil_img.save(img_path, format="PNG", compress_level=4)
+                        saved_images.append(str(img_path))
+                    LOG.info("H3 Auto Director: 5 帧模式第 %d 段保存 %d 张图片至专用目录：%s", int(segment_index), len(saved_images), images_dir)
+        elif deferred_decode:
             # In unified-decode mode, latent is the only per-segment durable
             # source. This prevents repeated VAE encode/decode and keeps GPU
             # memory bounded to one segment at final assembly.
@@ -8092,7 +8211,7 @@ class H3AutoDirectorSaveSegment:
                 # Older graphs keep ``stage1_images`` connected, so checking
                 # only the main ``deferred_decode`` branch above was not
                 # sufficient and still wrote context_stage1/*.mp4 midway.
-                if (not deferred_decode and stage1_images is not None
+                if (not deferred_decode and not is_5f and stage1_images is not None
                         and torch.is_tensor(stage1_images) and stage1_images.numel()):
                     stage1_images, _ = _trim_context_prefix(stage1_images, None, requested_trim, FPS)
                     stage1_video, _ = _paths(plan, int(segment_index), effective_output_root, video_format,
@@ -8100,26 +8219,34 @@ class H3AutoDirectorSaveSegment:
                     stage1_video.parent.mkdir(parents=True, exist_ok=True)
                     _write_segment_video(stage1_video, stage1_images, audio, fps,
                                          video_format, video_codec, encoder_device, quality)
-                elif deferred_decode and stage1_images is not None:
-                    LOG.info("H3 Auto Director: 统一解码模式跳过第 %d 段一采预览视频写入", int(segment_index))
+                elif (deferred_decode or is_5f) and stage1_images is not None:
+                    LOG.info("H3 Auto Director: %s模式跳过第 %d 段一采预览视频写入", "5 帧" if is_5f else "统一解码", int(segment_index))
                 LOG.info("H3 Auto Director: 已保存第 %d 段一采上下文 latent 与二采上下文 latent", int(segment_index))
         state_path = _state_path(plan)
         state = _load_json(state_path, {"version": 3, "segments": {}})
         segment_state = state.setdefault("segments", {}).setdefault(str(int(segment_index)), {})
         segment_state.update({
             "status": "completed",
-            "video": str(video_path) if not deferred_decode else "",
-            "context_video": str(context_path) if not deferred_decode else "",
+            "video": str(video_path) if not deferred_decode and not is_5f else "",
+            "context_video": str(context_path) if not deferred_decode and not is_5f else "",
             "latent": str(latent_path),
             "stage1_latent": str(stage1_cache_path) if stage1_cache_path is not None else "",
             "context_trim_frames": int(requested_trim),
             "fps": float(fps),
+            "saved_type": "images" if is_5f else "video",
+            "images_dir": str(images_dir) if is_5f else "",
+            "images": saved_images if is_5f else [],
         })
         state["last_completed"] = int(segment_index)
         _atomic_json(state_path, state)
         _LAST_STAGE1_CONTEXT = None
         _LAST_MOTION_CONTEXT_TRIM = None
-        saved_video = "已缓存最终潜空间（等待统一解码）" if deferred_decode else str(video_path)
+        if is_5f:
+            saved_video = "已缓存最终潜空间（等待统一解码）" if deferred_decode else str(images_dir)
+        elif deferred_decode:
+            saved_video = "已缓存最终潜空间（等待统一解码）"
+        else:
+            saved_video = str(video_path)
         return (saved_video, str(latent_path))
 
 
@@ -8174,6 +8301,60 @@ class H3AutoDirectorController:
 
     @staticmethod
     def _assemble(plan, output_name="", video_format="mp4", video_codec="h264", encoder_device="CPU", quality="最高质量", video_vae=None, audio_vae=None):
+        if _is_five_frame_plan(plan):
+            project_dir = Path(plan["project_dir"])
+            effective_output_name = (plan.get("output_filename") if isinstance(plan, dict) and plan.get("output_filename") else "") or output_name or "H3"
+            stem = _output_filename(effective_output_name)
+            images_dir = _image_dir(plan, 1, effective_output_name, for_write=False)
+            if not images_dir.exists():
+                images_dir = _image_dir(plan, 1, effective_output_name, for_write=True)
+            images_dir.mkdir(parents=True, exist_ok=True)
+            deferred_decode = bool(plan.get("decode_after_all_segments", False))
+            state = _load_json(_state_path(plan), {"segments": {}})
+            total_segments = len(plan.get("segments", []))
+            all_saved_images = []
+
+            for index in range(1, total_segments + 1):
+                _, latent_path = _paths(plan, index, effective_output_name)
+                if not latent_path.is_file():
+                    raise FileNotFoundError("Cannot assemble; missing final AV latent cache for segment %d: %s" % (index, latent_path))
+                entry = (state.get("segments") or {}).get(str(index), {})
+                trim = max(0, int(entry.get("context_trim_frames", 0) or 0))
+
+                if deferred_decode:
+                    if video_vae is None:
+                        raise RuntimeError("开启“所有片段采样完成后统一解码”时，拼接节点必须连接视频 VAE")
+                    LOG.info("H3 Auto Director: 5 帧统一解码正在处理第 %d/%d 段（潜变量：%s）...", index, total_segments, latent_path.name)
+                    parts = _av_latent_parts(_load_av_latent(latent_path))
+                    if parts is None:
+                        raise ValueError("第 %d 段缓存不是 H3 联合 AV latent" % index)
+                    decoded_images = _decode_h3_video(video_vae, parts[0])
+                    if trim > 0 and torch.is_tensor(decoded_images) and decoded_images.ndim == 4:
+                        decoded_images, _ = _trim_context_prefix(decoded_images, None, trim, FPS)
+                    num_frames = int(decoded_images.shape[0]) if (torch.is_tensor(decoded_images) and decoded_images.ndim == 4) else 0
+                    for frame_idx in range(num_frames):
+                        img_np = (decoded_images[frame_idx].detach().cpu().clamp(0, 1).numpy() * 255.0).round().astype(np.uint8)
+                        pil_img = Image.fromarray(img_np)
+                        img_name = f"{stem}_{index:05d}_{frame_idx + 1:03d}.png"
+                        img_file = images_dir / img_name
+                        pil_img.save(img_file, format="PNG", compress_level=4)
+                        all_saved_images.append(str(img_file))
+                    del decoded_images, parts
+                    if torch.cuda.is_available():
+                        try:
+                            model_management.soft_empty_cache()
+                        except Exception:
+                            pass
+                else:
+                    seg_pattern = f"{stem}_{index:05d}_*.png"
+                    seg_imgs = sorted(str(p) for p in images_dir.glob(seg_pattern))
+                    if not seg_imgs:
+                        seg_imgs = sorted(str(p) for p in images_dir.glob("*.png"))
+                    all_saved_images.extend(seg_imgs)
+
+            LOG.info("H3 Auto Director: 5 帧模式所有图片处理完成，专用保存目录：%s（共 %d 张图片）", images_dir, len(all_saved_images))
+            return str(images_dir)
+
         ffmpeg = _find_ffmpeg()
         if not ffmpeg:
             raise RuntimeError("未找到 ffmpeg，无法拼接 H3 片段。请重启 ComfyUI，或设置环境变量 FFMPEG_PATH 指向 ffmpeg.exe。")
@@ -8321,9 +8502,15 @@ class H3AutoDirectorController:
                     final_path = self._assemble(runtime, effective_output_root, video_format, video_codec, encoder_device, quality,
                                                  video_vae=video_vae, audio_vae=audio_vae)
                     final_file = Path(final_path)
-                    if not final_file.is_file() or final_file.stat().st_size <= 0:
-                        raise RuntimeError("最终输出拼接返回了空文件，已保留显存与运行状态供排查")
-                    state["final_video" if str(plan.get("mode", "")) != "tts" else "final_audio"] = final_path
+                    if _is_five_frame_plan(runtime):
+                        if not final_file.exists() or (final_file.is_dir() and not any(final_file.glob("*.png"))):
+                            raise RuntimeError("5 帧模式图片输出保存目录无效或为空：%s" % final_path)
+                        state["final_images"] = final_path
+                        state["final_video"] = final_path
+                    else:
+                        if not final_file.is_file() or final_file.stat().st_size <= 0:
+                            raise RuntimeError("最终输出拼接返回了空文件，已保留显存与运行状态供排查")
+                        state["final_video" if str(plan.get("mode", "")) != "tts" else "final_audio"] = final_path
                 state["status"] = "complete"
                 state.pop("next_segment", None)
                 if cleanup_after_final:
